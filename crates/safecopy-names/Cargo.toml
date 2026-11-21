@@ -11,6 +11,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+# Names that differ only in composed and decomposed accents collide.
+unicode-normalization = "0.1.26"
 
 [lints]
 workspace = true

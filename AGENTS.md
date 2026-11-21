@@ -35,7 +35,9 @@ cargo +nightly fuzz run <target> -- -max_total_time=60 -rss_limit_mb=2048   # Li
 ```
 
 fmt, clippy, test and the minimum Rust version run on Linux, Windows and
-macOS; the rest on Linux.
+macOS; the rest on Linux. On Windows the tests run with
+`SAFECOPY_REQUIRE_JUNCTIONS=1`, so a link test that cannot make its
+junction fails instead of skipping; set it locally too.
 The fuzz nightly is pinned by date in the workflow. Run the same before
 every push.
 

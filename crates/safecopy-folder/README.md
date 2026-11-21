@@ -2,11 +2,59 @@
 
 Writing through a held folder.
 
-Writes files into a folder the caller holds open. Links and junctions are never followed, a file already there is never replaced, a finished file is published under its final name only when that name is free, and removal goes through a handle checked to be the same file. It can also read and set a file's modified time and execute bit, within rules the caller gives.
+A `Directory` is a folder held open by handle; everything below it is
+opened relative to that handle, one name at a time:
+
+- links and junctions are never followed below it (`is_link` tells the
+  refusal apart);
+- files are only created new, never opened over one already there;
+- `Directory::publish` gives a finished file its name without replacing a
+  file that took the name meanwhile, and takes `name (2).ext` instead;
+- removal never goes through a link or outside the folder; on Windows it
+  goes through a handle checked to be the file meant, and on Unix a name
+  is removed for an open file only while its device and inode are still
+  that file's;
+- the downloaded-file mark (Windows' Mark of the Web) goes on before the
+  name, when the caller turns it on in `PublishRules`.
+
+Linux and Android publish by linking the open file through procfs, macOS
+with its own no-replace rename (`RENAME_EXCL`), Windows by renaming the
+open handle; disks that can do none of these get a copy from the open
+handle into a name created new. The crate docs say what each system does.
+
+## Differences from the code this came from
+
+This crate was ported from code written for one program. Where the
+original code behaved as below, this crate does not:
+
+- Where linking through procfs is denied (Android apps, some
+  containers), the original code tried and waited out its retries again
+  for every name, 250 ms each with the default rules. A folder handle
+  here remembers the failure and goes straight to the rename after it.
+- The original code took error code 32 as "file in use" on every system.
+  That is Windows' code; on Unix 32 is `EPIPE`, which is now reported at
+  once instead of retried.
+- The original code removed the staging name after linking, and in
+  `discard`, whatever file had the name then, and removed the final name
+  when a no-replace rename found a swapped file there. Here a name is
+  removed only while it is still the open file; another file is left
+  (the swapped one given its old name back) and the call fails with
+  `Refusal::Replaced`. `publish` counts a file named before that refusal
+  as published. On Unix `publish_path` removes a staging file or an empty
+  claim only while it is still the file linked or created; on Windows it
+  still removes them by path.
+- On Unix, opening a folder whose own name is a symbolic link gave the
+  system's raw `ENOTDIR`; it is now refused with `Refusal::Link`.
+- `Directory::mark` took any name; it now refuses one that is not one
+  part, as every other call does.
+- `Directory::finish` checked only the final name, not the staging name
+  it removes after linking, so a staging name such as `../x` could remove
+  a file outside the folder. It now refuses both with
+  `Refusal::LeavesFolder`, before touching anything.
+
+Planned next: a file's modified time and execute bit, and finding a file
+already at the destination.
 
 Uses `safecopy-names`.
-
-**Status:** nothing is built yet. This crate is a placeholder in the
-[safecopy](../../README.md) workspace; its API will come in a later change.
 
 Licence: MIT.
