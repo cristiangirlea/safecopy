@@ -32,6 +32,11 @@ Notes:
   `cargo install cargo-fuzz`, `rustup toolchain install 1.89`,
   `rustup target add aarch64-linux-android`,
   `rustup toolchain install <FUZZ_NIGHTLY>`.
+- The Android check compiles `ring`'s C, so it needs the Android NDK:
+  set `CC_aarch64_linux_android` to the NDK's
+  `toolchains/llvm/prebuilt/<host>/bin/aarch64-linux-android24-clang`
+  (`.cmd` on Windows) and `AR_aarch64_linux_android` to `llvm-ar` there.
+  Without an NDK, report it as not run.
 - CI runs fuzz on Linux only. Elsewhere, at least build the targets:
   `cargo check --manifest-path fuzz/Cargo.toml`.
 - CI runs fmt, clippy and test on Linux, Windows and macOS; locally they

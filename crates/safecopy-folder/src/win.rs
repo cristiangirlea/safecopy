@@ -468,6 +468,26 @@ pub fn discard(_: &File, file: &File, _: &OsStr) -> io::Result<()> {
     .map_err(io::Error::from)
 }
 
+/// The folder `name` in `parent`, never through a link, with the rights to
+/// add files and folders: the open is refused without them.
+pub fn open_existing(parent: &File, name: &OsStr) -> io::Result<File> {
+    relative(
+        parent,
+        name,
+        (FILE_GENERIC_READ | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY).0,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+        SHARE_ALL,
+    )
+}
+
+/// Whether `file`, opened as `name` in `parent`, has exactly that name.
+/// Names open whatever their case, and a short name opens its long one;
+/// the handle's path has the name as the disk keeps it.
+pub fn exact_name(_: &File, file: &File, name: &OsStr) -> io::Result<bool> {
+    Ok(final_path(file)?.file_name() == Some(name))
+}
+
 pub fn writable(path: &Path, folders: bool) -> io::Result<File> {
     let add = FILE_ADD_FILE.0 | if folders { FILE_ADD_SUBDIRECTORY.0 } else { 0 };
     std::fs::OpenOptions::new()

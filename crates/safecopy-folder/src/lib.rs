@@ -47,6 +47,14 @@
 //!   [`Directory::removed`] is always false there, and
 //!   [`Directory::unfit`] finds a folder inside a kept-out one by that
 //!   path.
+//! - **Modified times** are set by handle ([`Directory::apply`]); a time
+//!   the disk cannot hold leaves the arrival time. The **execute bit**
+//!   exists only on Linux and macOS, where only the owner's is ever set,
+//!   and only when the caller asks; Windows ignores it.
+//! - A file's **exact name** ([`Directory::candidate`],
+//!   [`Directory::existing`]) is read back from the handle on Windows; on
+//!   Unix the folder is read for an entry of exactly those bytes, since
+//!   macOS and casefolded Linux folders open other spellings of a name.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -55,6 +63,8 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod candidate;
+mod meta;
 mod publish;
 #[cfg(unix)]
 mod unix;
@@ -65,8 +75,10 @@ mod win;
 #[cfg(windows)]
 use win as platform;
 
+pub use candidate::Candidate;
+pub use meta::{Applied, BitApplied, Meta, MetaRules, Time, TimeApplied};
 pub use publish::{
-    Marked, PublishError, PublishRules, Published, mark_path, part, publish_path, unique,
+    Finish, Marked, PublishError, PublishRules, Published, mark_path, part, publish_path, unique,
 };
 
 /// Why this crate refused to open, create or name something.
@@ -501,6 +513,12 @@ mod seams {
         pub static NO_RENAME: Cell<bool> = const { Cell::new(false) };
         pub static FINISH_ERRORS: RefCell<VecDeque<i32>> = const { RefCell::new(VecDeque::new()) };
         pub static REMOVE_ERRORS: RefCell<VecDeque<i32>> = const { RefCell::new(VecDeque::new()) };
+        pub static SET_TIMES_ERROR: Cell<Option<i32>> = const { Cell::new(None) };
+        pub static CHMOD_ERROR: Cell<Option<i32>> = const { Cell::new(None) };
+        /// One entry per `apply`: `Some` fails that call with the error.
+        pub static APPLY_ERRORS: RefCell<VecDeque<Option<i32>>> = const { RefCell::new(VecDeque::new()) };
+        /// How many times a copy was flushed to the disk.
+        pub static SYNCS: Cell<u32> = const { Cell::new(0) };
         static HOOKS: RefCell<Vec<(&'static str, Hook)>> = const { RefCell::new(Vec::new()) };
     }
 
@@ -523,5 +541,7 @@ mod seams {
     }
 }
 
+#[cfg(test)]
+mod meta_tests;
 #[cfg(test)]
 mod tests;

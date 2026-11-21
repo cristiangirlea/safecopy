@@ -10,7 +10,7 @@ use std::time::Duration;
 use safecopy_names::candidates;
 use tokio::io::AsyncWriteExt;
 
-use crate::{Directory, Refusal, refusal};
+use crate::{Applied, Directory, Meta, MetaRules, Refusal, refusal};
 
 /// How a finished file is published.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +33,47 @@ impl Default for PublishRules {
             retries: 5,
             retry_wait: Duration::from_millis(50),
         }
+    }
+}
+
+/// What [`Directory::publish_with`] does to a file besides naming it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Finish {
+    /// The sender's modified time and execute bit.
+    pub meta: Meta,
+    /// Which of them are set.
+    pub meta_rules: MetaRules,
+    /// Flush a copy's bytes to the disk before it is final, where the disk
+    /// makes the file be copied into its name. The file itself is the
+    /// caller's to flush before publishing. On by default.
+    pub sync: bool,
+}
+
+impl Default for Finish {
+    fn default() -> Self {
+        Self {
+            meta: Meta::default(),
+            meta_rules: MetaRules::default(),
+            sync: true,
+        }
+    }
+}
+
+/// Flushes `file`'s bytes to the disk on the blocking pool, through a
+/// handle of its own: a cancel leaves the flush running and the caller's
+/// handle free.
+async fn sync_data(file: &File, cancel: impl Future<Output = ()>) -> Result<(), PublishError> {
+    #[cfg(test)]
+    crate::seams::SYNCS.set(crate::seams::SYNCS.get() + 1);
+    let handle = file.try_clone()?;
+    let syncing = tokio::task::spawn_blocking(move || handle.sync_data());
+    tokio::select! {
+        biased;
+        () = cancel => Err(PublishError::Cancelled),
+        synced = syncing => match synced {
+            Ok(synced) => synced.map_err(PublishError::Io),
+            Err(_) => Err(PublishError::Io(io::ErrorKind::Other.into())),
+        },
     }
 }
 
@@ -213,6 +254,12 @@ impl Directory {
     /// took `partial`'s name meanwhile is never removed.
     /// `cancel` is checked before each step and while waiting. After an
     /// error or a cancel, `partial` is left for the caller to discard.
+    ///
+    /// Once the file has its name, the publish succeeds: when Linux or
+    /// Android linked the name but could not remove `partial` (the system
+    /// refused), the file is published and `partial` is left behind, a
+    /// second name of the same file, for the caller's crash cleanup (the
+    /// journal) to remove.
     pub async fn publish(
         &self,
         file: &File,
@@ -221,17 +268,56 @@ impl Directory {
         rules: &PublishRules,
         cancel: impl Future<Output = ()>,
     ) -> Result<Published, PublishError> {
+        let nothing = Finish {
+            meta: Meta::default(),
+            meta_rules: MetaRules {
+                times: false,
+                executable: false,
+            },
+            sync: false,
+        };
+        let (published, _) = self
+            .publish_with(file, partial, name, rules, &nothing, cancel)
+            .await?;
+        Ok(published)
+    }
+
+    /// [`Self::publish`], setting `finish.meta` as `finish.meta_rules`
+    /// allow ([`Self::apply`]) after the mark and before the name: the file
+    /// has its time and execute bit before anyone can see it. When the disk
+    /// makes the file be copied into its name, the copy gets them too, and
+    /// with [`Finish::sync`] its bytes are flushed to the disk before the
+    /// publish succeeds; a copy that fails any of that is removed.
+    pub async fn publish_with(
+        &self,
+        file: &File,
+        partial: &OsStr,
+        name: &str,
+        rules: &PublishRules,
+        finish: &Finish,
+        cancel: impl Future<Output = ()>,
+    ) -> Result<(Published, Applied), PublishError> {
+        let Finish {
+            meta, meta_rules, ..
+        } = finish;
         tokio::pin!(cancel);
         let mut marked = if rules.mark {
             self.mark(partial)
         } else {
             Marked::NotAsked
         };
+        // After the mark: writing it changes the time on Windows.
+        let mut applied = self.apply(file, meta, meta_rules)?;
         for target in candidates(name) {
             let leaf = OsStr::new(&target);
-            let published = |marked| Published {
-                path: self.path.join(&target),
-                marked,
+            let published = |marked, applied| {
+                (
+                    Published {
+                        path: self.path.join(&target),
+                        marked,
+                    },
+                    applied,
+                )
             };
             let mut tries = 0;
             let finished = loop {
@@ -253,9 +339,11 @@ impl Directory {
                 }
             };
             match finished {
-                Ok(()) => return Ok(published(marked)),
+                Ok(()) => return Ok(published(marked, applied)),
                 // Named all the same; the file that took `partial` is not ours to remove.
-                Err(e) if refusal(&e) == Some(Refusal::Replaced) => return Ok(published(marked)),
+                Err(e) if refusal(&e) == Some(Refusal::Replaced) => {
+                    return Ok(published(marked, applied));
+                }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) if no_hard_links(&e) => {
                     // Retrying every name for a folder that cannot link costs the waits again.
@@ -267,7 +355,7 @@ impl Directory {
                 Err(e) => return Err(e.into()),
             }
             match self.rename(file, partial, leaf) {
-                Ok(()) => return Ok(published(marked)),
+                Ok(()) => return Ok(published(marked, applied)),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e)
                     if no_hard_links(&e)
@@ -299,13 +387,23 @@ impl Directory {
                 () = &mut cancel => Err(PublishError::Cancelled),
                 copied = copying => copied.map_err(PublishError::Io),
             };
+            let output = output.into_std().await;
+            // A new file: the time and the bit are set on it again, after its last byte.
+            let copied = copied.and_then(|()| {
+                applied = self.apply(&output, meta, meta_rules)?;
+                Ok(())
+            });
+            // The copy is a file of its own: the caller's flush of `file` did not reach it.
+            let copied = match copied {
+                Ok(()) if finish.sync => sync_data(&output, &mut cancel).await,
+                copied => copied,
+            };
             if let Err(e) = copied {
-                let output = output.into_std().await;
                 let _ = self.discard(&output, leaf);
                 return Err(e);
             }
             let _ = self.discard(file, partial);
-            return Ok(published(marked));
+            return Ok(published(marked, applied));
         }
         unreachable!("the numbers never run out")
     }

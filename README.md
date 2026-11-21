@@ -4,8 +4,9 @@ A Rust library for safe, resumable, verified file transfer, for use in your
 own software. It moves files over any async byte stream (tokio's
 `AsyncRead` and `AsyncWrite`), so it works with any transport.
 
-**Status:** `safecopy-names`, `safecopy-folder`, `safecopy-manifest` and
-`safecopy-journal` are built; the other crates are empty and come next.
+**Status:** `safecopy-names`, `safecopy-folder`, `safecopy-manifest`,
+`safecopy-chunks` and `safecopy-journal` are built; `safecopy-resume` and
+`safecopy-bundle` are empty and come next.
 
 ## What it is for
 

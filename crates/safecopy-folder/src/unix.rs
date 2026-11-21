@@ -319,6 +319,100 @@ pub fn mark(_: &File, _: &OsStr) -> Marked {
     Marked::NotOnThisSystem
 }
 
+/// The folder `name` in `parent`, never through a link, when this user may
+/// add to it (write and search permission).
+pub fn open_existing(parent: &File, name: &OsStr) -> io::Result<File> {
+    let file = open(parent, name, true, false)?;
+    // SAFETY: "." is a valid C string.
+    if unsafe { libc::faccessat(file.as_raw_fd(), c".".as_ptr(), libc::W_OK | libc::X_OK, 0) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+/// Whether a name in `dir` opens only a file of exactly its bytes: a file
+/// system that never folds case or the form of characters, and a folder
+/// not casefolded. Unsure is false, and the folder is read instead.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn names_are_bytes(dir: &File) -> bool {
+    // ext2/3/4, Btrfs, tmpfs, F2FS, whose only folding is the flag below.
+    // Not XFS (ASCII case folding at mkfs), ZFS (casesensitivity per
+    // dataset), overlayfs (its layers' rules), nor FAT, exFAT, NTFS, SMB or
+    // FUSE (Android's shared storage): their folders are read.
+    const EXACT: [u64; 4] = [0xef53, 0x9123_683e, 0x0102_1994, 0xf2f5_2010];
+    // ext4, F2FS and tmpfs fold case in a folder with this flag.
+    const FS_CASEFOLD_FL: libc::c_int = 0x4000_0000;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `stat` is written before it is read.
+    if unsafe { libc::fstatfs(dir.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: fstatfs filled it. Its type's width differs between systems.
+    #[allow(clippy::unnecessary_cast)]
+    let kind = unsafe { stat.assume_init() }.f_type as u64 & 0xffff_ffff;
+    if !EXACT.contains(&kind) {
+        return false;
+    }
+    let mut flags: libc::c_int = 0;
+    // SAFETY: the call writes one int of flags into `flags`.
+    if unsafe { libc::ioctl(dir.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) } != 0 {
+        // A file system without flags has no casefolding either.
+        return io::Error::last_os_error().raw_os_error() == Some(libc::ENOTTY);
+    }
+    flags & FS_CASEFOLD_FL == 0
+}
+
+/// macOS folds case and the form of characters on most disks; the folder
+/// is always read.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn names_are_bytes(_: &File) -> bool {
+    false
+}
+
+/// Whether `file`, opened as `name` in `parent`, has exactly that name. A
+/// folder that ignores case or the form of characters (macOS by default,
+/// casefolded folders and FAT or FUSE disks on Linux and Android) opens
+/// another spelling too, so unless the folder is known to match bytes
+/// only, it is read for an entry of exactly these bytes, which must then
+/// be `file`.
+pub fn exact_name(parent: &File, file: &File, name: &OsStr) -> io::Result<bool> {
+    if names_are_bytes(parent) {
+        // `openat` found exactly these bytes.
+        return Ok(true);
+    }
+    let fd = open(parent, OsStr::new("."), true, false)?.into_raw_fd();
+    // SAFETY: `fd` is an open directory; on success the stream owns it.
+    let dir = unsafe { libc::fdopendir(fd) };
+    if dir.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: the stream did not take `fd`.
+        unsafe { libc::close(fd) };
+        return Err(error);
+    }
+    let wanted = name.as_bytes();
+    let found = loop {
+        clear_errno();
+        // SAFETY: `dir` is an open stream.
+        let entry = unsafe { libc::readdir(dir) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            break if error.raw_os_error() == Some(0) {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+        // SAFETY: `d_name` is a NUL-terminated name valid until the next readdir.
+        if unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes() == wanted {
+            break Ok(true);
+        }
+    };
+    // SAFETY: `dir` is open and closed once.
+    unsafe { libc::closedir(dir) };
+    Ok(found? && matches_file(parent, file, &c_name(name)?)?)
+}
+
 pub fn writable(path: &Path, _folders: bool) -> io::Result<File> {
     let file = root(path, true)?;
     // SAFETY: "." is a valid C string.

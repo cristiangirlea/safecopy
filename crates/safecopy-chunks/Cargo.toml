@@ -12,6 +12,12 @@ categories.workspace = true
 
 [dependencies]
 safecopy-folder.workspace = true
+# SHA-256: the crate's one cryptographic dependency (Apache-2.0 AND ISC).
+ring = { version = "0.17.14", default-features = false }
+tokio = { version = "1.53.3", features = ["fs", "io-util", "macros", "rt"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.3", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "test-util"] }
 
 [lints]
 workspace = true
