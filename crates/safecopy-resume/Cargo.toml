@@ -1,0 +1,19 @@
+[package]
+name = "safecopy-resume"
+description = "Resume records and the checks that let an interrupted transfer continue where it stopped."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+safecopy-chunks.workspace = true
+safecopy-journal.workspace = true
+safecopy-manifest.workspace = true
+
+[lints]
+workspace = true

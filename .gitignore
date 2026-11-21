@@ -1,0 +1,7 @@
+/target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+CLAUDE.local.md
+.claude/settings.local.json

@@ -1,0 +1,17 @@
+[package]
+name = "safecopy-folder"
+description = "Writing into a held folder: no links followed, nothing replaced, publish under a new name."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+safecopy-names.workspace = true
+
+[lints]
+workspace = true

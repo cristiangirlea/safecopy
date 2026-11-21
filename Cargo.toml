@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# The fuzz crate has its own workspace and needs nightly; keep it out of this one.
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/cristiangirlea/safecopy"
+keywords = ["file-transfer", "resume", "copy", "integrity"]
+categories = ["filesystem"]
+
+[workspace.dependencies]
+safecopy-names = { path = "crates/safecopy-names", version = "0.1.0" }
+safecopy-folder = { path = "crates/safecopy-folder", version = "0.1.0" }
+safecopy-manifest = { path = "crates/safecopy-manifest", version = "0.1.0" }
+safecopy-chunks = { path = "crates/safecopy-chunks", version = "0.1.0" }
+safecopy-journal = { path = "crates/safecopy-journal", version = "0.1.0" }
+safecopy-resume = { path = "crates/safecopy-resume", version = "0.1.0" }
+safecopy-bundle = { path = "crates/safecopy-bundle", version = "0.1.0" }
+
+[workspace.lints.rust]
+missing_docs = "warn"
