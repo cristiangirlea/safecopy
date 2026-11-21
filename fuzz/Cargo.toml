@@ -66,3 +66,10 @@ path = "fuzz_targets/journal_log.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "bundle_table"
+path = "fuzz_targets/bundle_table.rs"
+test = false
+doc = false
+bench = false

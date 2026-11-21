@@ -12,8 +12,12 @@ failure. Report each command and whether it passed.
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
+cargo clippy --locked --workspace --all-targets --features quic -- -D warnings
+cargo test --locked --workspace --features quic
+cargo check --locked -p safecopy-bundle --features quic
 cargo deny check
 cargo +1.89 check --locked --workspace --all-targets
+cargo +1.89 check --locked --workspace --all-targets --features quic
 cargo check --locked --target aarch64-linux-android --workspace
 ```
 
@@ -39,6 +43,8 @@ Notes:
   Without an NDK, report it as not run.
 - CI runs fuzz on Linux only. Elsewhere, at least build the targets:
   `cargo check --manifest-path fuzz/Cargo.toml`.
+- CI runs the three `--features quic` lines on Linux only; run them
+  locally on any system (the tests use a loopback QUIC pair).
 - CI runs fmt, clippy and test on Linux, Windows and macOS; locally they
   cover only the system you are on. Say which. On Windows, run the tests
   with `SAFECOPY_REQUIRE_JUNCTIONS=1`, as CI does, and add

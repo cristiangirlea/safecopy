@@ -148,7 +148,9 @@ name = "safecopy-bundle"
 version = "0.1.0"
 dependencies = [
  "safecopy-chunks",
+ "safecopy-folder",
  "safecopy-resume",
+ "tokio",
 ]
 
 [[package]]
@@ -214,7 +216,6 @@ dependencies = [
  "safecopy-chunks",
  "safecopy-folder",
  "safecopy-journal",
- "safecopy-manifest",
  "tokio",
  "windows",
 ]

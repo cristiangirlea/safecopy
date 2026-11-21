@@ -28,14 +28,20 @@ On every pull request, and on pushes to `main`:
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
+cargo clippy --locked --workspace --all-targets --features quic -- -D warnings  # Linux
+cargo test --locked --workspace --features quic                                 # Linux
+cargo check --locked -p safecopy-bundle --features quic                         # Linux, the library alone
 cargo deny check
 cargo +1.89 check --locked --workspace --all-targets        # minimum Rust version
+cargo +1.89 check --locked --workspace --all-targets --features quic
 cargo check --locked --target aarch64-linux-android --workspace
 cargo +nightly fuzz run <target> -- -max_total_time=60 -rss_limit_mb=2048   # Linux, per target
 ```
 
 fmt, clippy, test and the minimum Rust version run on Linux, Windows and
-macOS; the rest on Linux. On Windows the tests run with
+macOS; the rest on Linux. The `quic` feature (quinn, off by default) is
+linted and tested once, on Linux; its minimum Rust version check runs on
+all three. On Windows the tests run with
 `SAFECOPY_REQUIRE_JUNCTIONS=1` and `SAFECOPY_REQUIRE_SYMLINKS=1`, so a
 link test that cannot make its link fails instead of skipping. Set the
 first locally too; set the second only where file symbolic links can be

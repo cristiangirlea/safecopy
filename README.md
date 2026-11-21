@@ -4,9 +4,9 @@ A Rust library for safe, resumable, verified file transfer, for use in your
 own software. It moves files over any async byte stream (tokio's
 `AsyncRead` and `AsyncWrite`), so it works with any transport.
 
-**Status:** `safecopy-names`, `safecopy-folder`, `safecopy-manifest`,
-`safecopy-chunks`, `safecopy-journal` and `safecopy-resume` are built;
-`safecopy-bundle` is empty and comes next.
+**Status:** every crate is built: `safecopy-names`, `safecopy-folder`,
+`safecopy-manifest`, `safecopy-chunks`, `safecopy-journal`,
+`safecopy-resume` and `safecopy-bundle`.
 
 ## What it is for
 
@@ -37,11 +37,15 @@ you need.
 Dependencies run one way: `names` needs no other crate; `folder` uses
 `names`; `manifest` and `chunks` use `folder`; `journal` uses `folder`
 and `manifest` (for its progress); `resume` uses `chunks` and
-`journal`; `bundle` uses `chunks` and `resume`.
+`journal`; `bundle` uses `folder`, `chunks` and `resume`.
+
+The optional `quic` feature (off by default) adds helpers for quinn's
+streams in `safecopy-bundle`; nothing else needs a transport.
 
 ## Design rules
 
-- Any byte stream; no transport built in.
+- Any byte stream; no transport built in (QUIC helpers only behind the
+  optional `quic` feature).
 - Limits are settings with defaults, not constants.
 - Errors are typed enums with the numbers they need, never sentences; your
   program words them.

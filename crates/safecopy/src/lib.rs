@@ -3,8 +3,8 @@
 //! Re-exports the safecopy crates, each under a short name. Use this crate
 //! for all of them, or depend on the one crate you need.
 //!
-//! [`names`], [`folder`], [`manifest`], [`chunks`], [`journal`] and
-//! [`resume`] are built; [`bundle`] is still empty.
+//! The `quic` feature (off by default) adds `bundle::quic`, helpers for
+//! quinn's streams.
 
 pub use safecopy_bundle as bundle;
 pub use safecopy_chunks as chunks;
@@ -16,7 +16,10 @@ pub use safecopy_resume as resume;
 
 #[cfg(test)]
 mod tests {
-    // Keeps the test job running for this crate until it has real tests.
     #[test]
-    fn crate_builds() {}
+    fn every_crate_is_reexported() {
+        let limits = crate::bundle::BundleLimits::default();
+        assert_eq!(limits.files, 64);
+        assert_eq!(crate::chunks::CHUNK, 4 << 20);
+    }
 }

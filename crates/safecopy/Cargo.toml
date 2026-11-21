@@ -10,6 +10,10 @@ readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# QUIC helpers (quinn), off by default.
+quic = ["safecopy-bundle/quic"]
+
 [dependencies]
 safecopy-names.workspace = true
 safecopy-folder.workspace = true
