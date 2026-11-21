@@ -307,6 +307,20 @@ impl Directory {
         platform::open(&self.file, name, false, true)
     }
 
+    /// The regular file `name` here, already there, opened for reading and
+    /// writing: a kept partial file a transfer appends to. A link, a
+    /// junction, a folder, a device or a pipe is refused; it is never
+    /// created. On Windows it is open without delete sharing, as
+    /// [`Self::create`] opens a new one.
+    pub fn reopen(&self, name: &OsStr) -> io::Result<File> {
+        component(name)?;
+        let file = platform::reopen(&self.file, name)?;
+        if !file.metadata()?.is_file() {
+            return Err(refused(Refusal::NotFileOrFolder));
+        }
+        Ok(file)
+    }
+
     /// Gives `file`, created here as `partial`, the name `name` too, in one
     /// step that fails with [`io::ErrorKind::AlreadyExists`] when the name
     /// is taken. The content comes from the open `file`, never from

@@ -75,6 +75,14 @@ original code behaved as below, this crate does not:
   through a link or junction, opened only when this user may add files and
   folders to it.
 
+## Changes
+
+- `Directory::reopen(name)`: a regular file already in the folder, opened
+  for reading and writing with no link followed and nothing created, so a
+  kept partial file can be appended to after a drop; a folder, a device, a
+  link or a junction is refused
+  (`reopen_opens_only_a_regular_file_already_there_and_never_a_link`).
+
 Uses `safecopy-names`.
 
 Licence: MIT.

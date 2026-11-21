@@ -1561,3 +1561,46 @@ fn a_refusal_is_read_back_from_the_error() {
     assert_eq!(refusal(&io::ErrorKind::NotFound.into()), None);
     assert!(!is_link(&refused(Refusal::NotFileOrFolder)));
 }
+
+#[test]
+fn reopen_opens_only_a_regular_file_already_there_and_never_a_link() {
+    use std::io::{Read, Seek, SeekFrom};
+    let base = temp("reopen");
+    let dir = Directory::open(&base).unwrap();
+    // Nothing is created.
+    let missing = dir.reopen(os("none.part")).unwrap_err();
+    assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+    assert!(!base.join("none.part").exists());
+    // A file there opens for reading and writing.
+    std::fs::write(base.join("a.part"), b"abc").unwrap();
+    let mut file = dir.reopen(os("a.part")).unwrap();
+    file.seek(SeekFrom::End(0)).unwrap();
+    file.write_all(b"d").unwrap();
+    let mut read = String::new();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.read_to_string(&mut read).unwrap();
+    assert_eq!(read, "abcd");
+    drop(file);
+    // A folder, a name leaving the folder, and a link are refused.
+    std::fs::create_dir(base.join("Sub")).unwrap();
+    assert!(dir.reopen(os("Sub")).is_err());
+    assert_eq!(
+        refusal(&dir.reopen(os("../a.part")).unwrap_err()),
+        Some(Refusal::LeavesFolder)
+    );
+    let link = base.join("link.part");
+    if link_folder(&base.join("Sub"), &link) {
+        let error = dir.reopen(os("link.part")).unwrap_err();
+        assert!(is_link(&error), "{error:?}");
+        remove_link(&link);
+    } else {
+        no_link_here(junctions_required(), "a link named as a partial");
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(base.join("a.part"), &link).unwrap();
+        assert!(is_link(&dir.reopen(os("link.part")).unwrap_err()));
+        assert_eq!(std::fs::read(base.join("a.part")).unwrap(), b"abcd");
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}

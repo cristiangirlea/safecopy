@@ -5,8 +5,8 @@ own software. It moves files over any async byte stream (tokio's
 `AsyncRead` and `AsyncWrite`), so it works with any transport.
 
 **Status:** `safecopy-names`, `safecopy-folder`, `safecopy-manifest`,
-`safecopy-chunks` and `safecopy-journal` are built; `safecopy-resume` and
-`safecopy-bundle` are empty and come next.
+`safecopy-chunks`, `safecopy-journal` and `safecopy-resume` are built;
+`safecopy-bundle` is empty and comes next.
 
 ## What it is for
 
@@ -36,8 +36,8 @@ you need.
 
 Dependencies run one way: `names` needs no other crate; `folder` uses
 `names`; `manifest` and `chunks` use `folder`; `journal` uses `folder`
-(and `manifest` once it keeps progress); `resume` uses `chunks`, `journal`
-and `manifest`; `bundle` uses `chunks` and `resume`.
+and `manifest` (for its progress); `resume` uses `chunks` and
+`journal`; `bundle` uses `chunks` and `resume`.
 
 ## Design rules
 

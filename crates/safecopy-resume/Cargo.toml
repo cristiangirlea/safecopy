@@ -11,9 +11,23 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+safecopy-folder.workspace = true
 safecopy-chunks.workspace = true
 safecopy-journal.workspace = true
+# SHA-256 of a record's slot and the transfer key's random bytes, as safecopy-chunks uses it.
+ring = { version = "0.17.14", default-features = false }
+tokio = { version = "1.53.3", features = ["fs", "io-util"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62.2"
+features = ["Win32_Foundation", "Win32_Storage_FileSystem"]
+
+[dev-dependencies]
 safecopy-manifest.workspace = true
+tokio = { version = "1.53.3", features = ["rt", "rt-multi-thread", "macros", "io-util", "fs"] }
 
 [lints]
 workspace = true

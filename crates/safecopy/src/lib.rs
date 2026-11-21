@@ -3,8 +3,8 @@
 //! Re-exports the safecopy crates, each under a short name. Use this crate
 //! for all of them, or depend on the one crate you need.
 //!
-//! [`names`], [`folder`], [`manifest`], [`chunks`] and [`journal`] are
-//! built; the others are still empty.
+//! [`names`], [`folder`], [`manifest`], [`chunks`], [`journal`] and
+//! [`resume`] are built; [`bundle`] is still empty.
 
 pub use safecopy_bundle as bundle;
 pub use safecopy_chunks as chunks;
