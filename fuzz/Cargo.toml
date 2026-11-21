@@ -1,0 +1,25 @@
+[package]
+name = "safecopy-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Fuzz targets for safecopy's parsers (cargo-fuzz, nightly)."
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+safecopy = { path = "../crates/safecopy" }
+
+# Its own workspace: cargo-fuzz needs nightly, the library stays on stable.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "smoke"
+path = "fuzz_targets/smoke.rs"
+test = false
+doc = false
+bench = false

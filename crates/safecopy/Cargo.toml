@@ -1,0 +1,23 @@
+[package]
+name = "safecopy"
+description = "Safe, resumable, verified file transfer over any byte stream. Re-exports the safecopy crates."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+safecopy-names.workspace = true
+safecopy-folder.workspace = true
+safecopy-manifest.workspace = true
+safecopy-chunks.workspace = true
+safecopy-journal.workspace = true
+safecopy-resume.workspace = true
+safecopy-bundle.workspace = true
+
+[lints]
+workspace = true

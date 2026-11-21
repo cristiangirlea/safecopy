@@ -1,0 +1,17 @@
+[package]
+name = "safecopy-chunks"
+description = "Verified copying: SHA-256 while reading and writing, exact sizes, verify before publish."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+safecopy-folder.workspace = true
+
+[lints]
+workspace = true

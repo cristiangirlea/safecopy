@@ -1,0 +1,18 @@
+[package]
+name = "safecopy-journal"
+description = "Crash records for partial files, and cleanup that removes only the file it recorded."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+safecopy-folder.workspace = true
+safecopy-manifest.workspace = true
+
+[lints]
+workspace = true

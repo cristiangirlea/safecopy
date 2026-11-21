@@ -1,0 +1,16 @@
+[package]
+name = "safecopy-names"
+description = "Safe file names: unsafe and reserved names refused, numbered names, collisions within one folder."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
