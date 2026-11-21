@@ -12,6 +12,21 @@ categories.workspace = true
 
 [dependencies]
 safecopy-names.workspace = true
+tokio = { version = "1.53.3", features = ["fs", "io-util", "macros", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+]
+
+[dev-dependencies]
+tokio = { version = "1.53.3", features = ["rt", "macros", "test-util"] }
 
 [lints]
 workspace = true

@@ -35,4 +35,5 @@ Notes:
 - CI runs fuzz on Linux only. Elsewhere, at least build the targets:
   `cargo check --manifest-path fuzz/Cargo.toml`.
 - CI runs fmt, clippy and test on Linux, Windows and macOS; locally they
-  cover only the system you are on. Say which.
+  cover only the system you are on. Say which. On Windows, run the tests
+  with `SAFECOPY_REQUIRE_JUNCTIONS=1`, as CI does.
