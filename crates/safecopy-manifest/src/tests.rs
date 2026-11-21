@@ -897,6 +897,8 @@ fn a_list_nested_too_deep_is_refused_whole() {
 }
 
 #[test]
+// macOS cannot hold a whole path past 1,024 bytes, so the default limit is checked elsewhere.
+#[cfg(not(target_os = "macos"))]
 fn a_list_with_a_path_too_long_in_characters_is_refused_whole() {
     let (_scratch, dir) = scratch("long");
     let mut inner = dir.join("r");
@@ -910,6 +912,30 @@ fn a_list_with_a_path_too_long_in_characters_is_refused_whole() {
     assert!(matches!(
         why(list(&[dir.join("r")])),
         ManifestError::PathTooLong { most: 1024, .. }
+    ));
+}
+
+/// The character limit is a setting: a path at it lists, one past it refuses
+/// the list whole. Short enough for every system's own path limit.
+#[test]
+fn a_path_past_the_character_setting_refuses_the_list_whole() {
+    let (_scratch, dir) = scratch("long-setting");
+    let short = Limits {
+        path_chars: 400,
+        ..limits()
+    };
+    let mut inner = dir.join("r");
+    for _ in 0..2 {
+        inner.push("x".repeat(150));
+    }
+    // "r/" + two 150-character folders with their slashes is 304 characters.
+    write(&inner.join("y".repeat(96)), b"x");
+    let (manifest, _) = Sources::list(1, &[dir.join("r")], &short).unwrap();
+    assert_eq!(manifest.entries()[3].path.chars().count(), 400);
+    write(&inner.join("y".repeat(97)), b"x");
+    assert!(matches!(
+        why(Sources::list(1, &[dir.join("r")], &short)),
+        ManifestError::PathTooLong { most: 400, .. }
     ));
 }
 
