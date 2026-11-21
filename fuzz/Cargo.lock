@@ -176,13 +176,17 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "safecopy",
+ "tokio",
 ]
 
 [[package]]
 name = "safecopy-journal"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "safecopy-folder",
+ "safecopy-manifest",
+ "safecopy-names",
  "windows",
 ]
 
@@ -205,9 +209,14 @@ dependencies = [
 name = "safecopy-resume"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "ring",
  "safecopy-chunks",
+ "safecopy-folder",
  "safecopy-journal",
  "safecopy-manifest",
+ "tokio",
+ "windows",
 ]
 
 [[package]]

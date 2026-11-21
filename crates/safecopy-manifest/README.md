@@ -21,6 +21,18 @@ A bounded list of files to send.
   it skips (links, what cannot be read, what is too deep). `open_entry`
   opens a listed file again from the held folder and refuses one that grew.
 
+- `groups` cuts a list into groups, in order, as a pure function of the
+  list, so both sides compute the same: a group ends where the parent
+  folder changes once it holds at least 64 entries or 64 MiB, and never
+  holds more than 256 entries or 256 MiB (a larger file is a group of its
+  own). `Progress` counts what is done of it: the mark (groups settled from
+  the first), the open groups' settled entries, one bit each, and the
+  places being written. `Groups::may_start(place, &Progress)` applies the
+  open-groups rule: the next group opens once every entry of the newest
+  open one has started, and at most two are open, so a slow file holds up
+  new work by at most one group and the progress stays bounded whatever
+  the list's length. The values are `GroupLimits`' defaults.
+
 Every limit is a field of `Limits`, whose `Default` is: 10,000 entries,
 32 parts deep, 1,024 characters a path, 1 TiB of files, 16 MiB encoded,
 256 source folders, 10,000 entries walked in the kept-out folders, and
@@ -56,6 +68,16 @@ original code behaved as below, this crate does not:
 - A picked device, pipe or socket was refused as a link; it is now
   `ManifestError::NotFileOrFolder`
   (`a_picked_special_file_is_refused_as_one`).
+
+## Changes
+
+- New: `groups`, `Groups`, `GroupLimits`, `Progress` and `ProgressError`
+  (`a_flat_folder_of_10000_entries_is_cut_into_groups_of_at_most_256_entries_or_256_mib`,
+  `a_nested_tree_is_cut_where_the_parent_changes_and_small_folders_share_a_group`,
+  `the_mark_moves_only_when_the_oldest_open_group_is_settled`,
+  `a_slow_file_holds_up_new_work_by_at_most_one_group`,
+  `a_progress_read_back_must_be_one_the_calls_could_make`). Nothing that
+  was there changed.
 
 Uses `safecopy-names` and `safecopy-folder`.
 

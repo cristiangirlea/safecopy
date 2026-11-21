@@ -51,7 +51,7 @@ pub(crate) fn decode(bytes: &[u8], settings: &Settings) -> Result<Record, Journa
     })
 }
 
-fn varint(bytes: &mut Vec<u8>, mut n: u128) {
+pub(crate) fn varint(bytes: &mut Vec<u8>, mut n: u128) {
     loop {
         let low = (n & 0x7F) as u8;
         n >>= 7;
@@ -63,18 +63,18 @@ fn varint(bytes: &mut Vec<u8>, mut n: u128) {
     }
 }
 
-fn text(bytes: &mut Vec<u8>, text: &str) {
+pub(crate) fn text(bytes: &mut Vec<u8>, text: &str) {
     varint(bytes, text.len() as u128);
     bytes.extend_from_slice(text.as_bytes());
 }
 
-struct Reader<'a>(&'a [u8]);
+pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
 
 impl Reader<'_> {
     /// A varint of a `bits`-wide number. As `postcard` reads it: at most
     /// as many bytes as the width needs, the last of them within the bits
     /// left; a longer form than needed is taken.
-    fn varint(&mut self, bits: u32) -> Result<u128, JournalError> {
+    pub(crate) fn varint(&mut self, bits: u32) -> Result<u128, JournalError> {
         let longest = bits.div_ceil(7);
         let last_most = (1u8 << (bits % 7)) - 1;
         let mut n = 0u128;
@@ -92,7 +92,7 @@ impl Reader<'_> {
         Err(JournalError::Damaged)
     }
 
-    fn text(&mut self) -> Result<String, JournalError> {
+    pub(crate) fn text(&mut self) -> Result<String, JournalError> {
         let len = self.varint(usize::BITS)?;
         let len = usize::try_from(len).map_err(|_| JournalError::Damaged)?;
         if len > self.0.len() {

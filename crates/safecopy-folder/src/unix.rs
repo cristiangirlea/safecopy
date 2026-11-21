@@ -88,6 +88,33 @@ pub fn open(parent: &File, name: &OsStr, directory: bool, create: bool) -> io::R
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+pub fn reopen(parent: &File, name: &OsStr) -> io::Result<File> {
+    let c = c_name(name)?;
+    // Non-blocking, so a pipe put under the name never holds the open.
+    let flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    // SAFETY: `c` is a valid C string; the descriptor is owned below.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), c.as_ptr(), flags) };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return Err(if error.raw_os_error() == Some(libc::ELOOP) {
+            refused(Refusal::Link)
+        } else {
+            error
+        });
+    }
+    // SAFETY: `fd` is a new descriptor nothing else owns.
+    let file = unsafe { File::from_raw_fd(fd) };
+    // Back to blocking I/O for the file's bytes.
+    // SAFETY: plain fcntl calls on a descriptor this function owns.
+    unsafe {
+        let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
+    Ok(file)
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn inspect(parent: &File, name: &OsStr) -> io::Result<File> {
     // A path handle: nothing is opened for reading, not a device nor a FUSE file.

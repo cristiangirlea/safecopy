@@ -13,6 +13,9 @@
 //!   was listed is [`ManifestError::Changed`], never read.
 //! - [`Listing`] walks one folder by handle for sending it whole, skipping
 //!   (and saying so) what it cannot send.
+//! - [`groups`] cuts a list into groups, which a transfer goes through in
+//!   order, at most [`GroupLimits::open`] at once; [`Progress`] counts what
+//!   is done in them, bounded whatever the list's length.
 //!
 //! A list that cannot be offered whole is refused whole: nothing is left
 //! out quietly. Nothing here reads a setting, a path or an environment
@@ -30,10 +33,12 @@
 //!   inside a kept-out folder is found by the identity of everything in the
 //!   kept-out folders, and by the path the folder was opened at.
 
+mod groups;
 mod listing;
 mod sources;
 mod wire;
 
+pub use groups::{Group, GroupLimits, Groups, OpenGroup, Progress, ProgressError, groups};
 pub use listing::{Listed, Listing, Skip, Skipped};
 pub use sources::{Opened, Sources};
 
@@ -414,5 +419,7 @@ mod seams {
     }
 }
 
+#[cfg(test)]
+mod groups_tests;
 #[cfg(test)]
 mod tests;

@@ -324,6 +324,18 @@ pub fn open(parent: &File, name: &OsStr, directory: bool, create: bool) -> io::R
     )
 }
 
+pub fn reopen(parent: &File, name: &OsStr) -> io::Result<File> {
+    relative(
+        parent,
+        name,
+        (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+        FILE_OPEN,
+        // No non-directory flag: a junction is then refused as a link, and a folder by the caller.
+        0,
+        SHARE_READ_WRITE,
+    )
+}
+
 pub fn inspect(parent: &File, name: &OsStr) -> io::Result<File> {
     // The reparse point itself: a cloud file's provider is not asked for its contents.
     let file = relative_open(

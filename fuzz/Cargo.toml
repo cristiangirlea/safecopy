@@ -12,6 +12,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4.13"
 safecopy = { path = "../crates/safecopy" }
+tokio = { version = "1.53.3", features = ["rt", "io-util"] }
 
 # Its own workspace: cargo-fuzz needs nightly, the library stays on stable.
 [workspace]
@@ -48,6 +49,20 @@ bench = false
 [[bin]]
 name = "framing"
 path = "fuzz_targets/framing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resume_handshake"
+path = "fuzz_targets/resume_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_log"
+path = "fuzz_targets/journal_log.rs"
 test = false
 doc = false
 bench = false
