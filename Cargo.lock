@@ -89,6 +89,7 @@ name = "safecopy-manifest"
 version = "0.1.0"
 dependencies = [
  "safecopy-folder",
+ "safecopy-names",
 ]
 
 [[package]]

@@ -30,3 +30,10 @@ path = "fuzz_targets/names.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
