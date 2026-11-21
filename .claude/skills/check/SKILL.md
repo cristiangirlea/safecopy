@@ -36,4 +36,5 @@ Notes:
   `cargo check --manifest-path fuzz/Cargo.toml`.
 - CI runs fmt, clippy and test on Linux, Windows and macOS; locally they
   cover only the system you are on. Say which. On Windows, run the tests
-  with `SAFECOPY_REQUIRE_JUNCTIONS=1`, as CI does.
+  with `SAFECOPY_REQUIRE_JUNCTIONS=1`, as CI does, and add
+  `SAFECOPY_REQUIRE_SYMLINKS=1` only where file symbolic links can be made.

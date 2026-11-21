@@ -44,6 +44,8 @@ jobs:
         env:
           # Windows' runners can make junctions: a link test that cannot fails instead of skipping.
           SAFECOPY_REQUIRE_JUNCTIONS: ${{ runner.os == 'Windows' && '1' || '' }}
+          # They run as administrators, so file symbolic links can be made there too.
+          SAFECOPY_REQUIRE_SYMLINKS: ${{ runner.os == 'Windows' && '1' || '' }}
 
   deny:
     name: cargo deny
@@ -98,7 +100,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [smoke, names, manifest]
+        target: [smoke, names, manifest, journal]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
