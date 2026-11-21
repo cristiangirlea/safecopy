@@ -82,6 +82,10 @@ original code behaved as below, this crate does not:
   kept partial file can be appended to after a drop; a folder, a device, a
   link or a junction is refused
   (`reopen_opens_only_a_regular_file_already_there_and_never_a_link`).
+- A publish dropped while it copies the file into its name (a disk with
+  neither hard links nor renames) removes that copy, as a cancel already
+  did: nothing is left under the final name
+  (`a_publish_dropped_during_a_folder_copy_fallback_leaves_no_copy`).
 
 Uses `safecopy-names`.
 

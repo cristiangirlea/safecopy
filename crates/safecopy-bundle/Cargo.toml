@@ -10,9 +10,26 @@ readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# Helpers for quinn streams: stopping one with a program's code, reading the code back.
+quic = ["dep:quinn"]
+
 [dependencies]
+safecopy-folder.workspace = true
 safecopy-chunks.workspace = true
 safecopy-resume.workspace = true
+tokio = { version = "1.53.3", features = ["fs", "io-util", "macros", "rt", "sync"] }
+# Bare: the program picks quinn's runtime and crypto provider, so one on
+# another provider never gets two.
+quinn = { version = "0.11.12", default-features = false, optional = true }
+
+[dev-dependencies]
+ring = { version = "0.17.14", default-features = false }
+tokio = { version = "1.53.3", features = ["rt", "rt-multi-thread", "macros", "io-util", "fs", "time"] }
+# The local QUIC pair in the tests: tokio, and rustls on ring as the workspace uses.
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# A self-signed certificate for that pair.
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
 
 [lints]
 workspace = true

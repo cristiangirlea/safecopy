@@ -77,6 +77,28 @@ async fn sync_data(file: &File, cancel: impl Future<Output = ()>) -> Result<(), 
     }
 }
 
+/// A copy created under its final name, removed on drop unless kept.
+struct Claim<'a> {
+    dir: &'a Directory,
+    file: File,
+    leaf: &'a OsStr,
+    kept: bool,
+}
+
+impl Claim<'_> {
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        if !self.kept {
+            let _ = self.dir.discard(&self.file, self.leaf);
+        }
+    }
+}
+
 /// Whether a file was marked as downloaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -369,6 +391,14 @@ impl Directory {
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e.into()),
             };
+            // Until the publish succeeds the copy goes, even with a future dropped midway.
+            let claim = Claim {
+                dir: self,
+                file: output,
+                leaf,
+                kept: false,
+            };
+            let output = claim.file.try_clone()?;
             // Copied from the open file, not from what `partial` names now.
             if rules.mark {
                 marked = self.mark(leaf);
@@ -398,10 +428,8 @@ impl Directory {
                 Ok(()) if finish.sync => sync_data(&output, &mut cancel).await,
                 copied => copied,
             };
-            if let Err(e) = copied {
-                let _ = self.discard(&output, leaf);
-                return Err(e);
-            }
+            copied?;
+            claim.keep();
             let _ = self.discard(file, partial);
             return Ok(published(marked, applied));
         }

@@ -712,6 +712,55 @@ async fn a_cancel_during_a_folder_copy_fallback_removes_both_open_files() {
 }
 
 #[tokio::test]
+async fn a_publish_dropped_during_a_folder_copy_fallback_leaves_no_copy() {
+    use std::task::Poll;
+    let to = temp("folder-copy-drop");
+    let dir = Directory::open(&to).unwrap();
+    // Large enough that the copy takes many steps on the blocking pool.
+    let file = partial(&dir, "a.txt.part", &vec![7; 8 << 20]);
+    NO_HARD_LINKS.set(true);
+    NO_RENAME.set(true);
+    let rules = PublishRules::default();
+    let finish = Finish::default();
+    // Never cancelled: only the drop ends it.
+    let mut publishing = Box::pin(dir.publish_with(
+        &file,
+        os("a.txt.part"),
+        "a.txt",
+        &rules,
+        &finish,
+        std::future::pending(),
+    ));
+    // Driven by hand and dropped at the first pause after the copy has its name.
+    loop {
+        let polled = std::future::poll_fn(|cx| Poll::Ready(publishing.as_mut().poll(cx))).await;
+        assert!(
+            polled.is_pending(),
+            "the copy finished before it could be dropped"
+        );
+        if to.join("a.txt").exists() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    drop(publishing);
+    NO_RENAME.set(false);
+    NO_HARD_LINKS.set(false);
+    // A step still on the blocking pool holds the copy open; it goes when that ends.
+    for _ in 0..500 {
+        if files_in(&to) == ["a.txt.part"] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(files_in(&to), ["a.txt.part"]);
+    dir.discard(&file, os("a.txt.part")).unwrap();
+    drop(file);
+    drop(dir);
+    std::fs::remove_dir_all(to).unwrap();
+}
+
+#[tokio::test]
 async fn a_cancel_before_publishing_names_nothing() {
     let to = temp("cancel-first");
     let dir = Directory::open(&to).unwrap();
