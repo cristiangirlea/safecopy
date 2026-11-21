@@ -541,7 +541,14 @@ pub fn open_for_delete(parent: &File, name: &OsStr) -> io::Result<File> {
 }
 
 pub fn volume_path(file: &File) -> io::Result<String> {
-    let path = final_path_as(file, VOLUME_NAME_GUID)?;
+    let path = final_path_as(file, VOLUME_NAME_GUID).map_err(|e| {
+        // A share's handle has no volume to name: the system says no path.
+        if e.kind() == io::ErrorKind::NotFound {
+            refused(Refusal::NoVolume)
+        } else {
+            e
+        }
+    })?;
     let path = path.to_string_lossy();
     let end = path
         .find("}\\")
