@@ -90,8 +90,13 @@ jobs:
           toolchain: stable
           targets: aarch64-linux-android
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      # A check needs no linker; crates that compile C will need the runner's NDK here.
-      - run: cargo check --locked --target aarch64-linux-android --workspace
+      # A check needs no linker, but ring's build script compiles C: the runner's NDK compiles it.
+      - name: cargo check --locked --target aarch64-linux-android --workspace
+        run: |
+          ndk="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$ndk/aarch64-linux-android24-clang"
+          export AR_aarch64_linux_android="$ndk/llvm-ar"
+          cargo check --locked --target aarch64-linux-android --workspace
 
   fuzz:
     name: fuzz (${{ matrix.target }})
@@ -100,7 +105,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [smoke, names, manifest, journal]
+        target: [smoke, names, manifest, journal, framing]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

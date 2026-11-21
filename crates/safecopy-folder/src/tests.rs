@@ -17,13 +17,13 @@ pub(crate) fn temp(name: &str) -> PathBuf {
     dir
 }
 
-fn os(name: &str) -> &OsStr {
+pub(crate) fn os(name: &str) -> &OsStr {
     OsStr::new(name)
 }
 
 /// Makes `link` a junction (Windows) or symbolic link to the folder
 /// `target`; false where this computer cannot.
-fn link_folder(target: &Path, link: &Path) -> bool {
+pub(crate) fn link_folder(target: &Path, link: &Path) -> bool {
     #[cfg(windows)]
     {
         // mklink takes backslashes only.
@@ -42,7 +42,7 @@ fn link_folder(target: &Path, link: &Path) -> bool {
     }
 }
 
-fn remove_link(path: &Path) {
+pub(crate) fn remove_link(path: &Path) {
     #[cfg(windows)]
     std::fs::remove_dir(path).unwrap();
     #[cfg(unix)]
@@ -51,13 +51,13 @@ fn remove_link(path: &Path) {
 
 /// Whether a link that cannot be made fails its test: CI sets
 /// `SAFECOPY_REQUIRE_JUNCTIONS` where it must make them.
-fn junctions_required() -> bool {
+pub(crate) fn junctions_required() -> bool {
     std::env::var_os("SAFECOPY_REQUIRE_JUNCTIONS").is_some_and(|v| !v.is_empty())
 }
 
 /// Reports a part that needs a link this computer cannot make: a failure
 /// where links are required, otherwise a skip that says so.
-fn no_link_here(required: bool, part: &str) {
+pub(crate) fn no_link_here(required: bool, part: &str) {
     assert!(
         !required,
         "SAFECOPY_REQUIRE_JUNCTIONS is set, but no junction or link can be made for {part}"
@@ -76,7 +76,7 @@ fn a_missing_junction_is_skipped_where_not_required() {
     no_link_here(false, "the junction part");
 }
 
-fn files_in(dir: &Path) -> Vec<String> {
+pub(crate) fn files_in(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())

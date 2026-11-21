@@ -40,6 +40,9 @@ macOS; the rest on Linux. On Windows the tests run with
 link test that cannot make its link fails instead of skipping. Set the
 first locally too; set the second only where file symbolic links can be
 made (Developer Mode or an administrator).
+The Android check compiles `ring`'s C with the NDK: point
+`CC_aarch64_linux_android` and `AR_aarch64_linux_android` at the NDK's
+`aarch64-linux-android24-clang` and `llvm-ar` (CI uses the runner's NDK).
 The fuzz nightly is pinned by date in the workflow. Run the same before
 every push.
 

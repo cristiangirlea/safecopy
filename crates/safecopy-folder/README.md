@@ -52,8 +52,28 @@ original code behaved as below, this crate does not:
   a file outside the folder. It now refuses both with
   `Refusal::LeavesFolder`, before touching anything.
 
-Planned next: a file's modified time and execute bit, and finding a file
-already at the destination.
+## What is already there, and what a file keeps
+
+- `Meta { modified, executable }`, read at the source with `Meta::read`,
+  and `Directory::apply` on the partial file: the modified time by handle
+  (a time the disk cannot hold leaves the arrival time and says so), and
+  the owner's execute bit, only when the caller's `MetaRules` turn it on
+  and only on Linux and macOS. Both are best effort: a disk that refuses
+  them (exFAT keeps no Unix permissions) still takes the file, and
+  `Applied` says what was set. `Meta::read` on Windows never says
+  executable. `Directory::publish_with` takes them in a `Finish`, marks
+  the file, then applies these, then names it; when the disk makes it copy
+  the file into its name, the copy gets them too, and with `Finish::sync`
+  its bytes are flushed to the disk before the publish succeeds.
+- `Directory::candidate(name, size)`: a regular file of exactly that name
+  (not another case or form of it), no link followed, of exactly that
+  size, opened for reading by handle (on Linux and Android, only after a
+  path handle showed it is one). `Candidate::unchanged` says whether
+  its size, time and the file its name leads to are still the same;
+  `safecopy-chunks` hashes it that way.
+- `Directory::existing(name)`: a folder of exactly that name, never
+  through a link or junction, opened only when this user may add files and
+  folders to it.
 
 Uses `safecopy-names`.
 
