@@ -17,6 +17,53 @@
 //! gone, is left alone. A journal still held by a running transfer, in this
 //! process or another, is left alone too.
 //!
+//! # A folder renamed while its transfer runs
+//!
+//! A folder is recorded as its levels below the root, each by name and
+//! identity, walked from the root's handle with no link followed. When the
+//! path a held folder was opened at no longer reaches it (renamed, moved,
+//! or another folder or a link put under its name), the journal reads where
+//! the handle is now and walks that instead: the folder is recorded under
+//! its present names, and the transfer carries on. One that is no longer
+//! below the root is refused ([`JournalError::NotBelow`]), as is one never
+//! below it. A folder opened through a link below the root's path is judged
+//! the same way, by where it really is: recorded under its real names when
+//! that is below the root, refused when the link leads outside.
+//!
+//! What happens when the present place is not read depends on why:
+//!
+//! - **Windows, Linux and Android read it.** When a reading fails (a file
+//!   system or a volume that gives a handle no path, a Linux folder whose
+//!   name ends in " (deleted)", procfs mounted and refusing), nothing
+//!   shows the folder is still below the root: it is refused with
+//!   [`JournalError::NotBelow`], renamed inside the root or moved out of
+//!   it alike. An error of the first walk that is no sign of a rename (a
+//!   link under the name, say) stands as it is.
+//! - **macOS and the BSDs cannot read it, nor Linux and Android with no
+//!   procfs mounted.** There a folder whose name is gone, or names a file
+//!   or another folder now, is recorded by its identity alone: one level
+//!   with an empty name, directly below the root. One moved out of the
+//!   root cannot be told from one renamed inside it, and is recorded so
+//!   too; cleanup never finds such a folder on these systems, so nothing
+//!   is removed there. A link under its name is refused
+//!   ([`Refusal::Link`]): it could be how the folder was opened.
+//!
+//! After a crash, [`clean_up`] removes a partial recorded after the rename
+//! on Windows, Linux and Android: its folder is found under its present
+//! names. A partial recorded before the rename is removed on Windows and
+//! left on Unix. Windows opens the root and the folder by their IDs, which
+//! open them anywhere on the volume, and so checks the folder is still
+//! below the root before it touches anything: by its recorded names, or by
+//! where both are now, walked from the root with no link followed. A
+//! folder moved out of the root since is left as one that is gone, and its
+//! record ends with the journal's; one whose place cannot be read then is
+//! left and its journal kept for a later cleanup. A move in the moment
+//! between that check and the removal is not caught.
+//! Unix cannot open a folder by its ID: recorded names that no longer
+//! reach the folder, or an empty one, leave the partial. The partial's own
+//! name and ID are checked as ever, and a file of the same name where the
+//! folder used to be is another file in another folder: it is left.
+//!
 //! # The log
 //!
 //! Each segment starts with a header (the format, its sequence number, the
@@ -38,9 +85,10 @@
 //! # Systems
 //!
 //! - **Windows** finds a folder again by its volume (its
-//!   `\\?\Volume{...}\` path and serial number) and its file ID. A folder
-//!   on a network share has no volume path, and [`Journal::start`] refuses
-//!   it.
+//!   `\\?\Volume{...}\` path and serial number) and its file ID, and
+//!   only while it is still below the root, which is found the same way. A
+//!   folder on a network share has no volume path, and [`Journal::start`]
+//!   refuses it.
 //! - **Linux, macOS and Android** cannot open a folder by its ID: the
 //!   journal records the root's path, device and inode, and each folder
 //!   below it by name with its device and inode. Cleanup opens the root,
@@ -161,8 +209,8 @@ pub enum JournalError {
     /// The partial file, or its folder, is not on the volume the journal
     /// records: its file ID would mean another file there.
     OtherVolume,
-    /// The folder is not the one its path below the journal's root names,
-    /// or is not below it.
+    /// The folder is not below the journal's root: by the path it was
+    /// opened at, or by where it is now.
     NotBelow,
     /// The change does not follow the transfer's groups: see
     /// [`ProgressError`].
@@ -173,7 +221,13 @@ pub enum JournalError {
     /// network share), a name it would not open.
     Folder(Refusal),
     /// The system's error.
-    Io(io::ErrorKind),
+    Io {
+        /// Its kind.
+        kind: io::ErrorKind,
+        /// The system's own code for it (`errno`, a Windows error code),
+        /// when it has one.
+        raw: Option<i32>,
+    },
 }
 
 impl fmt::Display for JournalError {
@@ -189,7 +243,10 @@ impl From<io::Error> for JournalError {
     fn from(error: io::Error) -> Self {
         match safecopy_folder::refusal(&error) {
             Some(why) => Self::Folder(why),
-            None => Self::Io(error.kind()),
+            None => Self::Io {
+                kind: error.kind(),
+                raw: error.raw_os_error(),
+            },
         }
     }
 }
@@ -369,7 +426,9 @@ impl Journal {
     /// byte yet, for the entry at `place`, which is published as `name` and
     /// declared `size` bytes. Call it before writing to the file: one that
     /// cannot be recorded is not, and the caller removes it. `dir` must be
-    /// `root` or a folder opened below it by name.
+    /// `root` or a folder opened below it by name; one renamed or moved
+    /// since, and still below `root`, is recorded where it is now (see the
+    /// [crate] docs).
     pub fn started(
         &self,
         place: u32,
@@ -707,7 +766,7 @@ impl Open {
         let path = self.dir.join(segment_name(&self.name, state.seq));
         #[cfg(test)]
         if seams::FAIL_ROLL.replace(false) {
-            return Err(JournalError::Io(io::ErrorKind::Other));
+            return Err(io::Error::from(io::ErrorKind::Other).into());
         }
         #[cfg(test)]
         if seams::CRASH.get() == Some(seams::Crash::BeforeSnapshot) {
@@ -1156,6 +1215,19 @@ pub(crate) mod seams {
         pub static FAIL_ROLL: Cell<bool> = const { Cell::new(false) };
         /// A crash to act out at the next segment.
         pub static CRASH: Cell<Option<Crash>> = const { Cell::new(None) };
+        /// How this thread reads a held folder's present place.
+        pub static PLACE: Cell<Place> = const { Cell::new(Place::Read) };
+    }
+
+    /// A reading of a held folder's present place, acted out.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Place {
+        /// As the system reads it.
+        Read,
+        /// The system reads it and this reading fails.
+        Fails,
+        /// The system has no way to read it, as on macOS.
+        Unknown,
     }
 }
 

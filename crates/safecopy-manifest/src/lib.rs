@@ -10,9 +10,12 @@
 //!   keeps what it needs to open each again: the folders they are in,
 //!   held open, and the identity, size and modified time of every entry.
 //!   A source put in another's place, grown, shrunk or touched since it
-//!   was listed is [`ManifestError::Changed`], never read.
+//!   was listed is [`ManifestError::Changed`], never read; one that is no
+//!   longer a regular file is [`ManifestError::NotAFile`].
 //! - [`Listing`] walks one folder by handle for sending it whole, skipping
-//!   (and saying so) what it cannot send.
+//!   (and saying so) what it cannot send. An entry that does not open
+//!   again names the part of its path that failed: the folder on the way
+//!   that became a link ([`ManifestError::Link`]), or the entry itself.
 //! - [`groups`] cuts a list into groups, which a transfer goes through in
 //!   order, at most [`GroupLimits::open`] at once; [`Progress`] counts what
 //!   is done in them, bounded whatever the list's length.
@@ -178,9 +181,12 @@ pub enum ManifestError {
     KeptOut,
     /// A picked file or folder is in a network folder.
     Network,
-    /// A link or junction among what was picked, which is not followed.
+    /// A link or junction among what was picked, or on the way to a listed
+    /// entry opened again, which is not followed.
     Link {
-        /// Where it is.
+        /// The link itself, not what was being reached through it: for
+        /// [`Listing::open_entry`] the entry's own path when the entry
+        /// became a link, and a folder above it when that folder did.
         at: PathBuf,
     },
     /// Neither a file nor a folder: a device, a pipe or a socket.
@@ -190,10 +196,14 @@ pub enum ManifestError {
     },
     /// A file or folder that could not be read.
     Unreadable {
-        /// Where it is.
+        /// Where it is: for [`Listing::open_entry`], the part of the
+        /// entry's path that could not be opened.
         at: PathBuf,
         /// What the system said.
         kind: io::ErrorKind,
+        /// The system's own code for it (`errno`, a Windows error code),
+        /// when it has one.
+        raw: Option<i32>,
     },
     /// A file or folder more than [`Limits::depth`] parts deep.
     TooDeep {
@@ -228,9 +238,16 @@ pub enum ManifestError {
     },
     /// The list has no entry of that number.
     NotListed,
-    /// The source is no longer what was listed: another file or folder in
-    /// its place, gone, a link, or another size or modified time.
+    /// The source is no longer what was listed: another file in its place,
+    /// another folder in a folder's, gone, a link, or another size or
+    /// modified time.
     Changed,
+    /// A listed file is no longer a regular file: a folder is under its
+    /// name now, or a device, a pipe or a socket.
+    NotAFile {
+        /// Where it is.
+        at: PathBuf,
+    },
 }
 
 impl fmt::Display for ManifestError {

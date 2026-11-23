@@ -132,7 +132,10 @@ async fn the_modified_time_is_set_on_the_partial_after_the_mark_and_survives_pub
             std::future::pending(),
         )
         .await;
-    assert!(matches!(failed, Err(PublishError::Io(_))), "{failed:?}");
+    assert!(
+        matches!(failed, Err(PublishError::Name { .. })),
+        "{failed:?}"
+    );
     assert_eq!(modified(&to.join("a.exe.part")), SENT);
     #[cfg(windows)]
     assert_eq!(
@@ -690,9 +693,45 @@ async fn the_copy_fallback_gets_the_bit_is_flushed_and_is_removed_when_apply_fai
     NO_HARD_LINKS.set(false);
     NO_RENAME.set(false);
     assert!(crate::seams::APPLY_ERRORS.with_borrow(|errors| errors.is_empty()));
-    assert!(matches!(failed, Err(PublishError::Io(_))), "{failed:?}");
+    assert!(
+        matches!(&failed, Err(PublishError::Name { path, .. }) if *path == to.join("run")),
+        "{failed:?}"
+    );
     assert_eq!(files_in(&to), ["run.part"]);
     dir.discard(&file, os("run.part")).unwrap();
+    drop((file, dir));
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// Before any name is tried there is none to say: the error is `Io`.
+#[tokio::test]
+async fn a_publish_that_fails_before_any_name_is_tried_is_an_io_error() {
+    let to = temp("apply-fails-first");
+    let dir = Directory::open(&to).unwrap();
+    let file = dir.create(os("run.part")).unwrap();
+    // ERROR_ACCESS_DENIED, EIO.
+    crate::seams::APPLY_ERRORS.with_borrow_mut(|errors| errors.push_back(Some(5)));
+    let allowed = MetaRules {
+        times: true,
+        executable: true,
+    };
+    let failed = dir
+        .publish_with(
+            &file,
+            os("run.part"),
+            "run",
+            &PublishRules::default(),
+            &finish(true, allowed),
+            std::future::pending(),
+        )
+        .await;
+    assert!(crate::seams::APPLY_ERRORS.with_borrow(|errors| errors.is_empty()));
+    assert!(
+        matches!(&failed, Err(PublishError::Io(e)) if e.raw_os_error() == Some(5)),
+        "{failed:?}"
+    );
+    // Nothing was named: the partial is left for the caller.
+    assert_eq!(files_in(&to), ["run.part"]);
     drop((file, dir));
     std::fs::remove_dir_all(&to).unwrap();
 }

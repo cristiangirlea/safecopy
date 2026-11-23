@@ -11,15 +11,18 @@ A bounded list of files to send.
   folders by handle, and keeps the folders they are in open.
   `Sources::open` opens an entry again from those folders without
   following a link, and refuses anything not as it was listed (another
-  file or folder in its place, gone, another size or modified time) with
-  `ManifestError::Changed`; `Opened::unchanged` checks again while and
-  after it is read.
+  file in its place, gone, another size or modified time) with
+  `ManifestError::Changed`, and a file that is no longer a regular file
+  with `ManifestError::NotAFile`; `Opened::unchanged` checks again while
+  and after it is read.
 - `Sources::list_keeping_out` also refuses anything inside, holding or
   linked into folders the caller keeps out, judged by the identity of all
   they hold and by where the folders really are.
 - `Listing` walks one folder by handle for sending it whole, and says what
   it skips (links, what cannot be read, what is too deep). `open_entry`
-  opens a listed file again from the held folder and refuses one that grew.
+  opens a listed file again from the held folder and refuses one that grew
+  (`Changed`) or is no longer a regular file (`NotAFile`); an error's `at`
+  is the part of the path that failed.
 
 - `groups` cuts a list into groups, in order, as a pure function of the
   list, so both sides compute the same: a group ends where the parent
@@ -76,8 +79,27 @@ original code behaved as below, this crate does not:
   `a_nested_tree_is_cut_where_the_parent_changes_and_small_folders_share_a_group`,
   `the_mark_moves_only_when_the_oldest_open_group_is_settled`,
   `a_slow_file_holds_up_new_work_by_at_most_one_group`,
-  `a_progress_read_back_must_be_one_the_calls_could_make`). Nothing that
-  was there changed.
+  `a_progress_read_back_must_be_one_the_calls_could_make`).
+- **`ManifestError::NotAFile { at }`** is new: a listed file that is a
+  folder now, or a device, a pipe or a socket, from `Listing::open_entry`
+  and `Sources::open`. Both gave `Changed` for a folder before, and
+  `open_entry` gave `NotFileOrFolder` for the rest; `Changed` is now a
+  file or folder that is still one, but not the one listed
+  (`a_listed_file_that_became_a_folder_is_no_longer_a_file`,
+  `a_listed_file_that_became_a_special_file_is_no_longer_a_file`,
+  `a_source_changed_in_size_time_or_identity_is_changed`,
+  `a_source_that_became_a_special_file_is_no_longer_a_file`).
+- **`at` names the part that failed.** From `Listing::open_entry`,
+  `Link { at }` and `Unreadable { at, .. }` named the whole entry
+  whichever part of its path failed. `at` is now that part: the folder on
+  the way that became a link or is gone, or the entry itself. A link
+  whose `at` is the entry's own path is a swapped file; any shorter path
+  is a swapped folder above it
+  (`a_directory_replaced_by_a_link_after_listing_does_not_send_outside_content`,
+  `a_file_replaced_by_a_link_after_listing_is_refused_with_a_reason`).
+- **`ManifestError::Unreadable` has a `raw` field**: the system's own
+  error code (`errno`, a Windows error code) beside the kind, `None` for
+  an error that has none (`a_whole_drive_or_nothing_is_not_a_list`).
 
 Uses `safecopy-names` and `safecopy-folder`.
 

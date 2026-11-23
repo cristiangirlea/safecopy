@@ -626,7 +626,7 @@ async fn publish(
             digest,
         }),
         Err(PublishError::Cancelled) => Err(Err(BundleError::Cancelled)),
-        Err(PublishError::Io(e)) => failed(e.kind()),
+        Err(PublishError::Io(e) | PublishError::Name { error: e, .. }) => failed(e.kind()),
         Err(_) => failed(io::ErrorKind::Other),
     }
 }

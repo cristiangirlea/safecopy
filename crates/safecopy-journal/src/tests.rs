@@ -603,7 +603,7 @@ fn a_record_write_that_fails_keeps_the_partials_on_the_disk() {
     seams::FAIL_WRITES.set(1);
     assert!(matches!(
         journal.started(1, &root, &b, OsStr::new("b.part"), "b", 1),
-        Err(JournalError::Io(_))
+        Err(JournalError::Io { .. })
     ));
     root.discard(&b, OsStr::new("b.part")).unwrap();
     drop(b);
@@ -619,7 +619,7 @@ fn a_record_write_that_fails_keeps_the_partials_on_the_disk() {
     assert_eq!(names, ["a.part"]);
     // An end that cannot be written leaves the partial recorded.
     seams::FAIL_WRITES.set(1);
-    assert!(matches!(journal.ended(0), Err(JournalError::Io(_))));
+    assert!(matches!(journal.ended(0), Err(JournalError::Io { .. })));
     assert_eq!(journal.partials().len(), 1);
     journal.crash();
     drop(root);
@@ -699,7 +699,565 @@ fn a_folder_not_below_the_root_is_refused() {
         journal.started(0, &root, &file, OsStr::new("outside.part"), "o", 0),
         Err(JournalError::NotBelow)
     );
+    // Nor is it taken for a renamed folder where no place can be read.
+    seams::PLACE.set(seams::Place::Unknown);
+    let unread = journal.started(0, &root, &file, OsStr::new("outside.part"), "o", 0);
+    seams::PLACE.set(seams::Place::Read);
+    assert_eq!(unread, Err(JournalError::NotBelow));
+    // Nor where the place is read and the reading fails.
+    seams::PLACE.set(seams::Place::Fails);
+    let failed = journal.started(0, &root, &file, OsStr::new("outside.part"), "o", 0);
+    seams::PLACE.set(seams::Place::Read);
+    assert_eq!(failed, Err(JournalError::NotBelow));
+    assert!(journal.partials().is_empty());
     root.discard(&file, OsStr::new("outside.part")).unwrap();
+}
+
+/// Whether this system reads where a held folder is now (see the crate
+/// docs): elsewhere a renamed folder is known by its identity alone.
+fn place_known() -> bool {
+    cfg!(any(windows, target_os = "linux", target_os = "android"))
+}
+
+/// A link to the folder `target` at `link`: a junction on Windows, which
+/// needs no privilege.
+fn link_folder(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    {
+        let made = Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+    }
+}
+
+/// The names of the folders the journal records for its one live partial.
+fn recorded_levels(journal: &Journal) -> Vec<String> {
+    let bytes = std::fs::read(journal.segment_path()).unwrap();
+    let segment = read_segment(&bytes, &settings()).unwrap();
+    let [started] = segment.partials() else {
+        panic!("{:?}", segment.partials());
+    };
+    let chain = segment.chain(started.folder).unwrap();
+    chain.iter().map(|f| f.name.clone()).collect()
+}
+
+#[test]
+fn a_folder_renamed_during_a_transfer_does_not_stop_it() {
+    let (_scratch, place, journal_dir) = scratch("renamed");
+    let root = Directory::destination(&place).unwrap();
+    let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+    let sub = root.claim("Photos").unwrap();
+    // Closed before the rename: Windows renames no folder with a file open in it.
+    drop(partial(&sub, &journal, 0, "a.jpg.part", b"cut"));
+    std::fs::rename(place.join("Photos"), place.join("Album")).unwrap();
+    let file = partial(&sub, &journal, 1, "b.jpg.part", b"whole");
+    journal.ended(0).unwrap();
+    sub.remove(OsStr::new("a.jpg.part")).unwrap();
+    let expected = if place_known() { "Album" } else { "" };
+    assert_eq!(recorded_levels(&journal), [expected]);
+    let (from, to) = (OsStr::new("b.jpg.part"), OsStr::new("b.jpg"));
+    sub.finish(&file, from, to)
+        .or_else(|_| sub.rename(&file, from, to))
+        .unwrap();
+    journal.done(1).unwrap();
+    assert!(journal.partials().is_empty());
+    assert_eq!(std::fs::read(place.join("Album/b.jpg")).unwrap(), b"whole");
+    drop(file);
+    drop(journal);
+    assert_eq!(journals(&journal_dir), 0);
+}
+
+#[test]
+fn a_crash_after_a_folder_was_renamed_removes_only_its_own_partials() {
+    let (_scratch, place, journal_dir) = scratch("renamed-crash");
+    let root = Directory::destination(&place).unwrap();
+    let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+    let sub = root.claim("Photos").unwrap();
+    drop(partial(&sub, &journal, 0, "a.jpg.part", b"half"));
+    std::fs::rename(place.join("Photos"), place.join("Album")).unwrap();
+    drop(partial(&sub, &journal, 1, "b.jpg.part", b"half"));
+    journal.crash();
+    drop((root, sub));
+    // Another folder where the renamed one used to be, with files of the same names.
+    std::fs::create_dir(place.join("Photos")).unwrap();
+    for name in ["a.jpg.part", "b.jpg.part"] {
+        std::fs::write(place.join("Photos").join(name), b"theirs").unwrap();
+    }
+    let done = clean_up(&journal_dir, &settings()).unwrap();
+    for name in ["a.jpg.part", "b.jpg.part"] {
+        assert_eq!(
+            std::fs::read(place.join("Photos").join(name)).unwrap(),
+            b"theirs",
+            "{name}"
+        );
+    }
+    let before = place.join("Album/a.jpg.part");
+    let after = place.join("Album/b.jpg.part");
+    if cfg!(windows) {
+        // The folder's ID opens it under any name.
+        assert_eq!(done, cleaned(2, 0));
+        assert!(!before.exists() && !after.exists());
+    } else if place_known() {
+        // Recorded under its present names after the rename; the names
+        // recorded before no longer reach it.
+        assert_eq!(done, cleaned(1, 1));
+        assert!(before.exists() && !after.exists());
+    } else {
+        assert_eq!(done, cleaned(0, 2));
+        assert!(before.exists() && after.exists());
+    }
+    assert_eq!(journals(&journal_dir), 0);
+}
+
+#[test]
+fn a_renamed_folder_whose_place_cannot_be_read_is_recorded_by_identity_alone() {
+    let (_scratch, place, journal_dir) = scratch("renamed-no-place");
+    let root = Directory::destination(&place).unwrap();
+    let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+    let sub = root.claim("Photos").unwrap();
+    std::fs::rename(place.join("Photos"), place.join("Album")).unwrap();
+    seams::PLACE.set(seams::Place::Unknown);
+    drop(partial(&sub, &journal, 0, "a.jpg.part", b"half"));
+    seams::PLACE.set(seams::Place::Read);
+    assert_eq!(recorded_levels(&journal), [""]);
+    journal.crash();
+    drop((root, sub));
+    std::fs::create_dir(place.join("Photos")).unwrap();
+    std::fs::write(place.join("Photos/a.jpg.part"), b"theirs").unwrap();
+    let done = clean_up(&journal_dir, &settings()).unwrap();
+    assert_eq!(
+        std::fs::read(place.join("Photos/a.jpg.part")).unwrap(),
+        b"theirs"
+    );
+    // Windows opens the folder by its ID; Unix has no name to find it by.
+    let removed = usize::from(cfg!(windows));
+    assert_eq!(done, cleaned(removed, 1 - removed));
+    assert_eq!(place.join("Album/a.jpg.part").exists(), !cfg!(windows));
+    assert_eq!(journals(&journal_dir), 0);
+}
+
+#[test]
+fn a_folder_moved_out_of_the_root_is_refused() {
+    let (_scratch, place, journal_dir) = scratch("moved-out");
+    let root = Directory::destination(&place).unwrap();
+    let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+    let sub = root.claim("Photos").unwrap();
+    let elsewhere = place.parent().unwrap().join("Elsewhere");
+    std::fs::rename(place.join("Photos"), &elsewhere).unwrap();
+    let file = sub.create(OsStr::new("a.jpg.part")).unwrap();
+    let started = journal.started(0, &sub, &file, OsStr::new("a.jpg.part"), "a.jpg", 0);
+    if place_known() {
+        assert_eq!(started, Err(JournalError::NotBelow));
+        assert!(journal.partials().is_empty());
+    } else {
+        // Nothing says where it went: recorded by its identity, never found by cleanup.
+        assert_eq!(started, Ok(()));
+        assert_eq!(recorded_levels(&journal), [""]);
+        journal.ended(0).unwrap();
+    }
+    sub.discard(&file, OsStr::new("a.jpg.part")).unwrap();
+}
+
+#[test]
+fn a_folder_reached_through_a_link_that_leads_outside_the_root_is_refused() {
+    let (_scratch, place, journal_dir) = scratch("through-link");
+    let outside = place.parent().unwrap().join("Outside");
+    std::fs::create_dir_all(outside.join("Inner")).unwrap();
+    link_folder(&outside, &place.join("Link"));
+    let root = Directory::destination(&place).unwrap();
+    let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+    // Below the root by its path, outside it in fact.
+    let dir = Directory::open(&place.join("Link").join("Inner")).unwrap();
+    let file = dir.create(OsStr::new("a.part")).unwrap();
+    let started = || journal.started(0, &dir, &file, OsStr::new("a.part"), "a", 0);
+    let link = Err(JournalError::Folder(Refusal::Link));
+    assert_eq!(
+        started(),
+        if place_known() {
+            Err(JournalError::NotBelow)
+        } else {
+            link
+        }
+    );
+    // With no place to read, a link on the way is not taken for a rename.
+    seams::PLACE.set(seams::Place::Unknown);
+    let unread = started();
+    seams::PLACE.set(seams::Place::Read);
+    assert_eq!(unread, link);
+    // Nor is a reading that fails: the walk's own refusal stands.
+    seams::PLACE.set(seams::Place::Fails);
+    let failed = started();
+    seams::PLACE.set(seams::Place::Read);
+    assert_eq!(failed, link);
+    assert!(journal.partials().is_empty());
+    dir.discard(&file, OsStr::new("a.part")).unwrap();
+}
+
+#[test]
+fn a_link_put_under_a_renamed_folders_name_is_not_followed() {
+    let (_scratch, place, journal_dir) = scratch("renamed-link");
+    let outside = place.parent().unwrap().join("Outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("a.jpg.part"), b"theirs").unwrap();
+    let root = Directory::destination(&place).unwrap();
+    let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+    let sub = root.claim("Photos").unwrap();
+    std::fs::rename(place.join("Photos"), place.join("Album")).unwrap();
+    link_folder(&outside, &place.join("Photos"));
+    let file = sub.create(OsStr::new("a.jpg.part")).unwrap();
+    let started = journal.started(0, &sub, &file, OsStr::new("a.jpg.part"), "a.jpg", 0);
+    drop(file);
+    if !place_known() {
+        // The link could be how the folder was opened: refused.
+        assert_eq!(started, Err(JournalError::Folder(Refusal::Link)));
+        return;
+    }
+    assert_eq!(started, Ok(()));
+    assert_eq!(recorded_levels(&journal), ["Album"]);
+    journal.crash();
+    drop((root, sub));
+    assert_eq!(clean_up(&journal_dir, &settings()).unwrap(), cleaned(1, 0));
+    assert!(!place.join("Album/a.jpg.part").exists());
+    assert_eq!(
+        std::fs::read(outside.join("a.jpg.part")).unwrap(),
+        b"theirs"
+    );
+}
+
+/// A link that leads to a folder really below the root: recorded under
+/// its real names where they can be read, refused where they cannot.
+#[test]
+fn a_folder_reached_through_a_link_inside_the_root_is_recorded_where_it_is() {
+    let (_scratch, place, journal_dir) = scratch("link-inside");
+    std::fs::create_dir_all(place.join("Real/Inner")).unwrap();
+    link_folder(&place.join("Real"), &place.join("Link"));
+    let root = Directory::destination(&place).unwrap();
+    let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+    let dir = Directory::open(&place.join("Link").join("Inner")).unwrap();
+    let file = dir.create(OsStr::new("a.part")).unwrap();
+    let started = journal.started(0, &dir, &file, OsStr::new("a.part"), "a", 0);
+    drop(file);
+    if !place_known() {
+        assert_eq!(started, Err(JournalError::Folder(Refusal::Link)));
+        return;
+    }
+    assert_eq!(started, Ok(()));
+    assert_eq!(recorded_levels(&journal), ["Real", "Inner"]);
+    journal.crash();
+    drop((root, dir));
+    assert_eq!(clean_up(&journal_dir, &settings()).unwrap(), cleaned(1, 0));
+    assert!(!place.join("Real/Inner/a.part").exists());
+}
+
+#[test]
+fn a_file_put_under_a_renamed_folders_name_does_not_stop_it() {
+    for no_place in [false, true] {
+        let (_scratch, place, journal_dir) = scratch("renamed-file");
+        let root = Directory::destination(&place).unwrap();
+        let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+        let sub = root.claim("Photos").unwrap();
+        std::fs::rename(place.join("Photos"), place.join("Album")).unwrap();
+        std::fs::write(place.join("Photos"), b"a file now").unwrap();
+        seams::PLACE.set(if no_place {
+            seams::Place::Unknown
+        } else {
+            seams::Place::Read
+        });
+        drop(partial(&sub, &journal, 0, "a.jpg.part", b"half"));
+        seams::PLACE.set(seams::Place::Read);
+        let expected = if place_known() && !no_place {
+            "Album"
+        } else {
+            ""
+        };
+        assert_eq!(recorded_levels(&journal), [expected], "{no_place}");
+        journal.ended(0).unwrap();
+        sub.remove(OsStr::new("a.jpg.part")).unwrap();
+    }
+}
+
+/// Where the system reads a folder's place and the reading fails, nothing
+/// shows the folder is below the root: renamed inside it, a file put under
+/// its name, or moved out, it is refused.
+#[test]
+fn a_folder_whose_place_cannot_be_read_is_not_taken_on_trust() {
+    let (_scratch, place, journal_dir) = scratch("place-fails");
+    let root = Directory::destination(&place).unwrap();
+    let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+    let sub = root.claim("Photos").unwrap();
+    let file = sub.create(OsStr::new("a.jpg.part")).unwrap();
+    drop(file);
+    let started = || {
+        let file = sub.reopen(OsStr::new("a.jpg.part")).unwrap();
+        seams::PLACE.set(seams::Place::Fails);
+        let started = journal.started(0, &sub, &file, OsStr::new("a.jpg.part"), "a.jpg", 0);
+        seams::PLACE.set(seams::Place::Read);
+        started
+    };
+    // Where it was opened, no place is read at all.
+    assert_eq!(started(), Ok(()));
+    journal.ended(0).unwrap();
+    std::fs::rename(place.join("Photos"), place.join("Album")).unwrap();
+    assert_eq!(started(), Err(JournalError::NotBelow));
+    std::fs::write(place.join("Photos"), b"a file now").unwrap();
+    assert_eq!(started(), Err(JournalError::NotBelow));
+    let elsewhere = place.parent().unwrap().join("Elsewhere");
+    std::fs::rename(place.join("Album"), &elsewhere).unwrap();
+    assert_eq!(started(), Err(JournalError::NotBelow));
+    assert!(journal.partials().is_empty());
+    assert!(elsewhere.join("a.jpg.part").exists());
+}
+
+/// Names are compared whole: a folder moved beside the root, into one whose
+/// name starts with the root's, is not below it.
+#[test]
+fn a_folder_moved_beside_the_root_under_a_longer_name_is_not_below_it() {
+    let (_scratch, place, journal_dir) = scratch("beside-root");
+    let root = Directory::destination(&place).unwrap();
+    let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+    let sub = root.claim("Photos").unwrap();
+    drop(partial(&sub, &journal, 0, "a.jpg.part", b"half"));
+    let beside = place.with_file_name("Work2");
+    std::fs::create_dir(&beside).unwrap();
+    std::fs::rename(place.join("Photos"), beside.join("Photos")).unwrap();
+    if place_known() {
+        let file = sub.create(OsStr::new("b.jpg.part")).unwrap();
+        let started = journal.started(1, &sub, &file, OsStr::new("b.jpg.part"), "b.jpg", 0);
+        assert_eq!(started, Err(JournalError::NotBelow));
+    }
+    journal.crash();
+    drop((root, sub));
+    clean_up(&journal_dir, &settings()).unwrap();
+    assert!(beside.join("Photos/a.jpg.part").exists());
+    assert_eq!(journals(&journal_dir), 0);
+}
+
+/// Linux shows a deleted folder's place as its name and " (deleted)", so a
+/// folder really named so reads as no place: a failed reading, not a rename.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn a_folder_named_as_deleted_and_moved_out_of_the_root_is_refused() {
+    let (_scratch, place, journal_dir) = scratch("named-deleted");
+    let root = Directory::destination(&place).unwrap();
+    let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+    let sub = root.claim("Photos (deleted)").unwrap();
+    let file = sub.create(OsStr::new("a.jpg.part")).unwrap();
+    let started = || journal.started(0, &sub, &file, OsStr::new("a.jpg.part"), "a.jpg", 0);
+    assert_eq!(started(), Ok(()));
+    journal.ended(0).unwrap();
+    let elsewhere = place.parent().unwrap().join("Gone (deleted)");
+    std::fs::rename(place.join("Photos (deleted)"), &elsewhere).unwrap();
+    assert_eq!(started(), Err(JournalError::NotBelow));
+    assert!(journal.partials().is_empty());
+}
+
+/// A folder's ID opens it anywhere on its volume: cleanup removes nothing
+/// in one that left the root after the crash, however it was recorded.
+#[test]
+fn cleanup_leaves_a_partial_whose_folder_was_moved_out_of_the_root() {
+    let (_scratch, place, journal_dir) = scratch("moved-out-crash");
+    let root = Directory::destination(&place).unwrap();
+    let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+    let moved = root.claim("Photos").unwrap();
+    let renamed = root.claim("Music").unwrap();
+    let alone = root.claim("Notes").unwrap();
+    drop(partial(&moved, &journal, 0, "a.jpg.part", b"half"));
+    drop(partial(&renamed, &journal, 1, "b.mp3.part", b"half"));
+    // Recorded by its identity alone, as where no place can be read.
+    std::fs::rename(place.join("Notes"), place.join("Letters")).unwrap();
+    seams::PLACE.set(seams::Place::Unknown);
+    drop(partial(&alone, &journal, 2, "c.txt.part", b"half"));
+    seams::PLACE.set(seams::Place::Read);
+    journal.crash();
+    drop((root, moved, renamed, alone));
+    let outside = place.parent().unwrap().join("Outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::rename(place.join("Photos"), outside.join("Photos")).unwrap();
+    std::fs::rename(place.join("Letters"), outside.join("Letters")).unwrap();
+    std::fs::rename(place.join("Music"), place.join("Songs")).unwrap();
+    let done = clean_up(&journal_dir, &settings()).unwrap();
+    assert!(outside.join("Photos/a.jpg.part").exists());
+    assert!(outside.join("Letters/c.txt.part").exists());
+    // Renamed and still below the root: Windows finds it by its ID, Unix
+    // has only the names recorded.
+    let removed = usize::from(cfg!(windows));
+    assert_eq!(done, cleaned(removed, 3 - removed));
+    assert_eq!(place.join("Songs/b.mp3.part").exists(), !cfg!(windows));
+    assert_eq!(journals(&journal_dir), 0);
+}
+
+#[test]
+fn cleanup_leaves_a_partial_whose_folders_place_cannot_be_read() {
+    let (_scratch, place, journal_dir) = scratch("place-fails-crash");
+    let root = Directory::destination(&place).unwrap();
+    let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+    let stays = root.claim("Photos").unwrap();
+    let renamed = root.claim("Music").unwrap();
+    drop(partial(&stays, &journal, 0, "a.jpg.part", b"half"));
+    drop(partial(&renamed, &journal, 1, "b.mp3.part", b"half"));
+    journal.crash();
+    drop((root, stays, renamed));
+    std::fs::rename(place.join("Music"), place.join("Songs")).unwrap();
+    seams::PLACE.set(seams::Place::Fails);
+    let done = clean_up(&journal_dir, &settings());
+    seams::PLACE.set(seams::Place::Read);
+    // Its recorded names still reach the first: no place is read for it.
+    let done = done.unwrap();
+    assert_eq!((done.removed, done.left), (1, 1));
+    assert!(!place.join("Photos/a.jpg.part").exists());
+    assert!(place.join("Songs/b.mp3.part").exists());
+    // Only Windows reads a place at cleanup: the reading may succeed later.
+    if cfg!(windows) {
+        assert_eq!(done.kept, 1);
+        assert_eq!(journals(&journal_dir), 1);
+        let later = clean_up(&journal_dir, &settings()).unwrap();
+        assert_eq!((later.removed, later.kept), (1, 0));
+        assert!(!place.join("Songs/b.mp3.part").exists());
+    }
+    assert_eq!(journals(&journal_dir), 0);
+}
+
+/// A segment as a damaged or crafted journal could hold it: the folders
+/// `levels` name, each below the one before, the first below the root, all
+/// with the identity of `folder`, and one partial in the last.
+fn crafted_segment(
+    root: &Directory,
+    folder: &Directory,
+    levels: [&str; 2],
+    file: &File,
+) -> Vec<u8> {
+    use crate::log::{Entry, State, frame};
+    let id = folder.identity().unwrap();
+    let state = State::new(location::root_of(root).unwrap(), &settings());
+    let mut bytes = frame(&state.header());
+    for (n, name) in (1u32..).zip(levels) {
+        let entry = Entry::Folder(Folder {
+            n,
+            parent: n - 1,
+            name: name.to_string(),
+            device: id.volume,
+            id: id.file,
+        });
+        bytes.extend(frame(&entry.encode()));
+    }
+    let started = Entry::Started(Started {
+        place: 0,
+        folder: 2,
+        name: "a.jpg".to_string(),
+        partial: "a.jpg.part".to_string(),
+        size: 4,
+        file: identity(file).unwrap().file,
+    });
+    bytes.extend(frame(&started.encode()));
+    bytes
+}
+
+#[test]
+fn an_empty_folder_name_that_is_not_the_only_level_is_damaged() {
+    let (_scratch, place, _) = scratch("empty-name");
+    let root = Directory::destination(&place).unwrap();
+    let sub = root.claim("Photos").unwrap();
+    let file = sub.create(OsStr::new("a.jpg.part")).unwrap();
+    for levels in [["Photos", ""], ["", "Photos"]] {
+        let bytes = crafted_segment(&root, &sub, levels, &file);
+        let segment = read_segment(&bytes, &settings()).unwrap();
+        // Read up to the level out of place: its partial is never reached.
+        assert_eq!(segment.entries, 1, "{levels:?}");
+        assert_eq!(segment.folders().count(), 1, "{levels:?}");
+        assert!(segment.partials().is_empty(), "{levels:?}");
+        // In a header, the whole segment is damaged.
+        let mut state = segment.state.clone();
+        let second = Folder {
+            n: 2,
+            parent: 1,
+            name: levels[1].to_string(),
+            device: 0,
+            id: 0,
+        };
+        state.folders.insert(2, second);
+        state.live.push(Started {
+            place: 0,
+            folder: 2,
+            name: "a.jpg".to_string(),
+            partial: "a.jpg.part".to_string(),
+            size: 4,
+            file: 1,
+        });
+        let header = crate::log::frame(&state.header());
+        assert_eq!(
+            read_segment(&header, &settings()),
+            Err(JournalError::Damaged),
+            "{levels:?}"
+        );
+    }
+    // Alone and directly below the root, it reads.
+    let mut alone = crate::log::State::new(location::root_of(&root).unwrap(), &settings());
+    let level = Folder {
+        n: 1,
+        parent: 0,
+        name: String::new(),
+        device: 0,
+        id: 0,
+    };
+    alone.folders.insert(1, level);
+    alone.live.push(Started {
+        place: 0,
+        folder: 1,
+        name: "a.jpg".to_string(),
+        partial: "a.jpg.part".to_string(),
+        size: 4,
+        file: 1,
+    });
+    let read = read_segment(&crate::log::frame(&alone.header()), &settings()).unwrap();
+    assert_eq!(read.partials().len(), 1);
+}
+
+#[test]
+fn cleanup_removes_nothing_for_an_empty_folder_name_out_of_place() {
+    for levels in [["Photos", ""], ["", "Photos"]] {
+        let (_scratch, place, journal_dir) = scratch("empty-name-cleanup");
+        let root = Directory::destination(&place).unwrap();
+        let sub = root.claim("Photos").unwrap();
+        let file = sub.create(OsStr::new("a.jpg.part")).unwrap();
+        let bytes = crafted_segment(&root, &sub, levels, &file);
+        drop((root, sub, file));
+        std::fs::write(journal_dir.join("1-1.1.jlog"), bytes).unwrap();
+        assert_eq!(
+            clean_up(&journal_dir, &settings()).unwrap(),
+            Cleaned::default(),
+            "{levels:?}"
+        );
+        assert!(place.join("Photos/a.jpg.part").exists(), "{levels:?}");
+        assert_eq!(journals(&journal_dir), 0);
+    }
+}
+
+#[test]
+fn a_system_error_keeps_its_raw_code() {
+    let (_scratch, place, journal_dir) = scratch("raw-code");
+    let root = Directory::destination(&place).unwrap();
+    let missing = journal_dir.join("missing");
+    let started = Journal::start(&missing, &root, &settings());
+    let Err(JournalError::Io { kind, raw }) = started else {
+        panic!("{started:?}");
+    };
+    assert_eq!(kind, io::ErrorKind::NotFound);
+    // ERROR_PATH_NOT_FOUND, ENOENT.
+    assert_eq!(raw, Some(if cfg!(windows) { 3 } else { 2 }));
+    // An error that is no system's has no code.
+    assert_eq!(
+        JournalError::from(io::Error::other("none")),
+        JournalError::Io {
+            kind: io::ErrorKind::Other,
+            raw: None
+        }
+    );
 }
 
 #[cfg(unix)]

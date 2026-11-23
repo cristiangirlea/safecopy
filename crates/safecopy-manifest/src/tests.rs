@@ -1429,7 +1429,8 @@ fn a_file_of_another_size_is_changed_though_its_time_is_put_back() {
 }
 
 /// The source check: another size, another modified time, another file in
-/// its place (same size and time), gone, or a folder in its place.
+/// its place (same size and time) or gone is changed; a folder in a file's
+/// place is no longer a file.
 #[test]
 fn a_source_changed_in_size_time_or_identity_is_changed() {
     let (_scratch, dir) = scratch("changed");
@@ -1469,9 +1470,32 @@ fn a_source_changed_in_size_time_or_identity_is_changed() {
     std::fs::remove_file(dir.join("r/gone")).unwrap();
     std::fs::remove_file(dir.join("r/folder")).unwrap();
     std::fs::create_dir(dir.join("r/folder")).unwrap();
-    for name in ["size", "time", "other", "gone", "folder"] {
+    for name in ["size", "time", "other", "gone"] {
         assert_eq!(why(sources.open(n(name))), ManifestError::Changed, "{name}");
     }
+    assert_eq!(
+        why(sources.open(n("folder"))),
+        ManifestError::NotAFile {
+            at: dir.join("r").join("folder")
+        }
+    );
+}
+
+/// A pipe under a listed file's name is no longer a file, and is not opened.
+#[cfg(unix)]
+#[test]
+fn a_source_that_became_a_special_file_is_no_longer_a_file() {
+    let (_scratch, dir) = scratch("source-fifo");
+    write(&dir.join("r/a.txt"), b"listed");
+    let (_, sources) = list(&[dir.join("r")]).unwrap();
+    std::fs::remove_file(dir.join("r/a.txt")).unwrap();
+    fifo(&dir.join("r/a.txt"));
+    assert_eq!(
+        why(sources.open(1)),
+        ManifestError::NotAFile {
+            at: dir.join("r").join("a.txt")
+        }
+    );
 }
 
 #[test]
@@ -1549,6 +1573,8 @@ fn a_whole_drive_or_nothing_is_not_a_list() {
         why(list(&[dir.join("missing")])),
         ManifestError::Unreadable {
             kind: io::ErrorKind::NotFound,
+            // ERROR_FILE_NOT_FOUND, ENOENT: the system's own code is kept.
+            raw: Some(2),
             ..
         }
     ));
@@ -1842,6 +1868,52 @@ fn a_folder_listed_by_handle_sends_nothing_that_grew() {
     assert_eq!(why(listing.open_entry(&unknown)), ManifestError::Changed);
 }
 
+/// A listed file that became a folder is told apart from one that changed,
+/// and an entry whose folder is gone names that folder, with the system's
+/// code.
+#[test]
+fn a_listed_file_that_became_a_folder_is_no_longer_a_file() {
+    let (_scratch, dir) = scratch("became-folder");
+    let root = dir.join("Photos");
+    write(&root.join("a.txt"), b"a");
+    write(&root.join("sub/b.txt"), b"b");
+    let listing = Listing::list(&root, &limits()).unwrap();
+    assert_eq!(names_of(&listing), ["Photos/a.txt", "Photos/sub/b.txt"]);
+    std::fs::remove_file(root.join("a.txt")).unwrap();
+    std::fs::create_dir(root.join("a.txt")).unwrap();
+    assert_eq!(
+        why(listing.open_entry(&listing.entries[0])),
+        ManifestError::NotAFile {
+            at: root.join("a.txt")
+        }
+    );
+    std::fs::remove_dir_all(root.join("sub")).unwrap();
+    let gone = why(listing.open_entry(&listing.entries[1]));
+    let ManifestError::Unreadable { at, kind, raw } = &gone else {
+        panic!("{gone:?}");
+    };
+    assert_eq!(at, &root.join("sub"), "the part that failed");
+    assert_eq!(*kind, io::ErrorKind::NotFound);
+    assert!(raw.is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_listed_file_that_became_a_special_file_is_no_longer_a_file() {
+    let (_scratch, dir) = scratch("became-fifo");
+    let root = dir.join("Photos");
+    write(&root.join("a.txt"), b"a");
+    let listing = Listing::list(&root, &limits()).unwrap();
+    std::fs::remove_file(root.join("a.txt")).unwrap();
+    fifo(&root.join("a.txt"));
+    assert_eq!(
+        why(listing.open_entry(&listing.entries[0])),
+        ManifestError::NotAFile {
+            at: root.join("a.txt")
+        }
+    );
+}
+
 /// A folder inside replaced by a link after listing opens nothing through
 /// it; the listed folder itself is held, so its replacement changes
 /// nothing that is read.
@@ -1875,7 +1947,13 @@ fn a_directory_replaced_by_a_link_after_listing_does_not_send_outside_content() 
             file.read_to_end(&mut bytes).unwrap();
             assert_eq!(bytes, b"inside!");
         } else {
-            assert!(is_link_error(&why(opened)));
+            // The folder that is a link now, not the file below it.
+            assert_eq!(
+                why(opened),
+                ManifestError::Link {
+                    at: replaced.clone()
+                }
+            );
         }
         drop(listing);
         remove_link(&replaced);
@@ -1900,7 +1978,11 @@ fn a_file_replaced_by_a_link_after_listing_is_refused_with_a_reason() {
         // File symbolic links need a privilege on Windows that junctions do not.
         return eprintln!("skipped: this computer cannot create file symbolic links");
     }
-    assert!(is_link_error(&why(listing.open_entry(&listing.entries[0]))));
+    // The entry itself is the link.
+    assert_eq!(
+        why(listing.open_entry(&listing.entries[0])),
+        ManifestError::Link { at: path }
+    );
 }
 
 #[cfg(windows)]
@@ -1916,7 +1998,10 @@ fn a_junction_replacing_a_listed_file_is_refused_without_elevation() {
     if !link_folder(&dir.join("outside"), &path) {
         return no_link_here("a junction replacing a listed file");
     }
-    assert!(is_link_error(&why(listing.open_entry(&listing.entries[0]))));
+    assert_eq!(
+        why(listing.open_entry(&listing.entries[0])),
+        ManifestError::Link { at: path.clone() }
+    );
     let again = Listing::list(&root, &limits()).unwrap();
     assert_eq!(again.files, 0);
     assert_eq!(again.skipped[0].why, Skip::Link);

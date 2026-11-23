@@ -637,7 +637,7 @@ async fn on_unix_a_broken_pipe_is_not_taken_for_a_held_file() {
             std::future::pending(),
         )
         .await;
-    let Err(PublishError::Io(error)) = result else {
+    let Err(PublishError::Name { error, .. }) = result else {
         panic!("{result:?}");
     };
     assert_eq!(error.raw_os_error(), Some(libc::EPIPE));
@@ -1099,7 +1099,10 @@ async fn the_mark_is_on_the_partial_before_it_gets_a_name() {
             std::future::pending(),
         )
         .await;
-    assert!(matches!(failed, Err(PublishError::Io(_))), "{failed:?}");
+    assert!(
+        matches!(&failed, Err(PublishError::Name { path, .. }) if *path == to.join("a.exe")),
+        "{failed:?}"
+    );
     assert_eq!(files_in(&to), ["a.exe.part"]);
     #[cfg(windows)]
     assert_eq!(
@@ -1146,6 +1149,77 @@ async fn nothing_is_marked_unless_asked() {
     assert_eq!(zone(&by_path.path), None);
     drop((file, dir));
     std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// The name a publish was trying when the system refused, and the error's
+/// kind.
+#[cfg(unix)]
+fn failed_at(result: Result<Published, PublishError>) -> (PathBuf, io::ErrorKind) {
+    match result {
+        Err(PublishError::Name { path, error }) => (path, error.kind()),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The caller knows only its first choice: a failure after numbering says
+/// which name it was at, with the system's error whole.
+#[tokio::test]
+async fn a_publish_that_fails_says_which_numbered_name_it_was_trying() {
+    let to = temp("names-its-try");
+    let dir = Directory::open(&to).unwrap();
+    let file = partial(&dir, "a.part", b"a");
+    // The first name is taken, the second refused.
+    #[cfg(windows)]
+    let (taken, error) = (183, 87);
+    #[cfg(unix)]
+    let (taken, error) = (libc::EEXIST, libc::EIO);
+    FINISH_ERRORS.with_borrow_mut(|errors| errors.extend([taken, error]));
+    let failed = dir
+        .publish(
+            &file,
+            os("a.part"),
+            "a.txt",
+            &PublishRules::default(),
+            std::future::pending(),
+        )
+        .await;
+    let second = safecopy_names::candidates("a.txt").nth(1).unwrap();
+    assert_eq!(second, "a (2).txt");
+    let Err(PublishError::Name { path, error: said }) = failed else {
+        panic!("{failed:?}");
+    };
+    assert_eq!(path, to.join(&second));
+    assert_eq!(said.raw_os_error(), Some(error));
+    assert_eq!(files_in(&to), ["a.part"]);
+    dir.discard(&file, os("a.part")).unwrap();
+    drop((file, dir));
+    std::fs::remove_dir_all(to).unwrap();
+}
+
+#[tokio::test]
+async fn by_path_a_publish_that_fails_says_which_numbered_name_it_was_trying() {
+    let to = temp("path-names-its-try");
+    std::fs::write(to.join("a.txt"), b"theirs").unwrap();
+    // No partial: the second name is claimed, and the rename has nothing to move.
+    NO_HARD_LINKS.set(true);
+    let failed = publish_path(
+        &to.join("a.txt.part"),
+        &to.join("a.txt"),
+        &to,
+        "a.txt",
+        &PublishRules::default(),
+    )
+    .await;
+    NO_HARD_LINKS.set(false);
+    let Err(PublishError::Name { path, error }) = failed else {
+        panic!("{failed:?}");
+    };
+    assert_eq!(path, to.join("a (2).txt"));
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    // ERROR_FILE_NOT_FOUND, ENOENT.
+    assert_eq!(error.raw_os_error(), Some(2));
+    assert_eq!(files_in(&to), ["a.txt"]);
+    std::fs::remove_dir_all(to).unwrap();
 }
 
 #[cfg(windows)]
@@ -1387,12 +1461,18 @@ async fn by_path_a_file_put_in_place_of_the_claim_stays() {
     NO_HARD_LINKS.set(true);
     let rules = PublishRules::default();
     let failed = publish_path(&to.join("a.part"), &to.join("a.txt"), &to, "a.txt", &rules).await;
-    assert_eq!(failed.unwrap_err().kind(), io::ErrorKind::NotFound);
+    assert_eq!(
+        failed_at(failed),
+        (to.join("a.txt"), io::ErrorKind::NotFound)
+    );
     assert_eq!(std::fs::read(to.join("a.txt")).unwrap(), b"theirs");
     // Unswapped, the claim goes.
     let failed = publish_path(&to.join("b.part"), &to.join("b.txt"), &to, "b.txt", &rules).await;
     NO_HARD_LINKS.set(false);
-    assert_eq!(failed.unwrap_err().kind(), io::ErrorKind::NotFound);
+    assert_eq!(
+        failed_at(failed),
+        (to.join("b.txt"), io::ErrorKind::NotFound)
+    );
     assert_eq!(files_in(&to), ["a.txt", "moved"]);
     std::fs::remove_dir_all(to).unwrap();
 }

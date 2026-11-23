@@ -275,7 +275,7 @@ async fn fill<R: AsyncRead + Unpin + ?Sized>(
         .await
         .map_err(|e| match e {
             PublishError::Cancelled => ChunkError::Cancelled,
-            PublishError::Io(e) => e.into(),
+            PublishError::Io(e) | PublishError::Name { error: e, .. } => e.into(),
             _ => ChunkError::Io(io::ErrorKind::Other),
         })?;
     Ok(Saved {

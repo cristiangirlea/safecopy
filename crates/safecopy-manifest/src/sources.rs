@@ -118,7 +118,9 @@ impl Sources {
     }
 
     /// Opens entry `n` from the held folders, following no link: a file to
-    /// read, or `None` for a folder that is still there. Anything not as it
+    /// read, or `None` for a folder that is still there. A file that is no
+    /// longer a regular file (a folder, a device, a pipe or a socket under
+    /// its name) is [`ManifestError::NotAFile`]; anything else not as it
     /// was listed is [`ManifestError::Changed`].
     pub fn open(&self, n: u32) -> Result<Option<Opened>, ManifestError> {
         let changed = |_| ManifestError::Changed;
@@ -143,9 +145,20 @@ impl Sources {
                 Ok(None)
             }
             Kind::File => {
-                let file = dir.entry(last).map_err(changed)?;
+                let not_a_file = || {
+                    let mut at = self.folders[source.folder].path().to_path_buf();
+                    at.extend(&source.names);
+                    ManifestError::NotAFile { at }
+                };
+                let file = dir.entry(last).map_err(|e| match refusal(&e) {
+                    Some(Refusal::NotFileOrFolder) => not_a_file(),
+                    _ => ManifestError::Changed,
+                })?;
                 let meta = file.metadata().map_err(changed)?;
-                if !meta.is_file() || identity(&file).ok() != Some(source.id) {
+                if !meta.is_file() {
+                    return Err(not_a_file());
+                }
+                if identity(&file).ok() != Some(source.id) {
                     return Err(ManifestError::Changed);
                 }
                 let opened = Opened {
@@ -361,7 +374,11 @@ pub(crate) fn unreadable(at: &Path, e: &io::Error) -> ManifestError {
     match refusal(e) {
         Some(Refusal::Link) => ManifestError::Link { at },
         Some(Refusal::NotFileOrFolder) => ManifestError::NotFileOrFolder { at },
-        _ => ManifestError::Unreadable { at, kind: e.kind() },
+        _ => ManifestError::Unreadable {
+            at,
+            kind: e.kind(),
+            raw: e.raw_os_error(),
+        },
     }
 }
 
