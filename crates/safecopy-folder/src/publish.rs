@@ -124,22 +124,34 @@ pub struct Published {
     pub marked: Marked,
 }
 
-/// Why [`Directory::publish`] did not publish.
+/// Why [`Directory::publish`] or [`publish_path`] did not publish.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum PublishError {
     /// The caller's cancel finished first. Nothing was published; the
     /// partial file is still there for the caller to discard.
     Cancelled,
-    /// The system refused.
+    /// The system refused before any name was tried: the file's time or
+    /// execute bit could not be set.
     Io(io::Error),
+    /// The system refused while the file was being given a name.
+    Name {
+        /// The name being tried, as [`Published::path`] would give it: the
+        /// name asked for, or the numbered one reached when that and the
+        /// ones before it were taken.
+        path: PathBuf,
+        /// What the system said, with its kind and its own code.
+        error: io::Error,
+    },
 }
 
 impl fmt::Display for PublishError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The kind alone: the caller words it, and names the file itself.
         match self {
             Self::Cancelled => f.write_str("Cancelled"),
             Self::Io(e) => write!(f, "Io({:?})", e.kind()),
+            Self::Name { error, .. } => write!(f, "Name({:?})", error.kind()),
         }
     }
 }
@@ -148,7 +160,7 @@ impl std::error::Error for PublishError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Cancelled => None,
-            Self::Io(e) => Some(e),
+            Self::Io(e) | Self::Name { error: e, .. } => Some(e),
         }
     }
 }
@@ -275,7 +287,8 @@ impl Directory {
     /// remembers it and later names go straight to the rename. A file that
     /// took `partial`'s name meanwhile is never removed.
     /// `cancel` is checked before each step and while waiting. After an
-    /// error or a cancel, `partial` is left for the caller to discard.
+    /// error or a cancel, `partial` is left for the caller to discard. An
+    /// error at a name says which ([`PublishError::Name`]).
     ///
     /// Once the file has its name, the publish succeeds: when Linux or
     /// Android linked the name but could not remove `partial` (the system
@@ -341,6 +354,11 @@ impl Directory {
                     applied,
                 )
             };
+            // The caller knows only its first choice: the error says which name this is.
+            let at_name = |error: io::Error| PublishError::Name {
+                path: self.path.join(&target),
+                error,
+            };
             let mut tries = 0;
             let finished = loop {
                 tokio::select! {
@@ -374,7 +392,7 @@ impl Directory {
                             .store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(at_name(e)),
             }
             match self.rename(file, partial, leaf) {
                 Ok(()) => return Ok(published(marked, applied)),
@@ -383,13 +401,13 @@ impl Directory {
                     if no_hard_links(&e)
                         || e.kind() == io::ErrorKind::InvalidInput
                         || refusal(&e) == Some(Refusal::Replaced) => {}
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(at_name(e)),
             }
-            let source = file.try_clone()?;
+            let source = file.try_clone().map_err(at_name)?;
             let output = match self.create(leaf) {
                 Ok(output) => output,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(at_name(e)),
             };
             // Until the publish succeeds the copy goes, even with a future dropped midway.
             let claim = Claim {
@@ -398,7 +416,7 @@ impl Directory {
                 leaf,
                 kept: false,
             };
-            let output = claim.file.try_clone()?;
+            let output = claim.file.try_clone().map_err(at_name)?;
             // Copied from the open file, not from what `partial` names now.
             if rules.mark {
                 marked = self.mark(leaf);
@@ -428,7 +446,10 @@ impl Directory {
                 Ok(()) if finish.sync => sync_data(&output, &mut cancel).await,
                 copied => copied,
             };
-            copied?;
+            copied.map_err(|e| match e {
+                PublishError::Io(e) => at_name(e),
+                other => other,
+            })?;
             claim.keep();
             let _ = self.discard(file, partial);
             return Ok(published(marked, applied));
@@ -450,13 +471,16 @@ impl Directory {
 /// that claim.
 ///
 /// By path, links on the way are followed: prefer [`Directory::publish`].
+///
+/// Every error is a [`PublishError::Name`]: the name being tried when the
+/// system refused, which is `wanted` or a numbered one after it.
 pub async fn publish_path(
     partial: &Path,
     wanted: &Path,
     dir: &Path,
     name: &str,
     rules: &PublishRules,
-) -> io::Result<Published> {
+) -> Result<Published, PublishError> {
     let marked = if rules.mark {
         mark_path(partial)
     } else {
@@ -467,6 +491,10 @@ pub async fn publish_path(
         .map(|name| dir.join(name))
         .filter(move |p| *p != own);
     for target in std::iter::once(wanted.to_path_buf()).chain(others) {
+        let at_name = |error: io::Error| PublishError::Name {
+            path: target.clone(),
+            error,
+        };
         match hard_link(partial, &target).await {
             Ok(()) => {
                 #[cfg(test)]
@@ -485,7 +513,7 @@ pub async fn publish_path(
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) if no_hard_links(&e) => {}
-            Err(e) => return Err(e),
+            Err(e) => return Err(at_name(e)),
         }
         let claimed = tokio::fs::OpenOptions::new()
             .write(true)
@@ -496,9 +524,9 @@ pub async fn publish_path(
             // Dropped here: Windows cannot rename over a file held open. Without
             // its identity the claim cannot be told from a file put in its
             // place, so it is left.
-            Ok(claim) => claim.metadata().await?,
+            Ok(claim) => claim.metadata().await.map_err(at_name)?,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
+            Err(e) => return Err(at_name(e)),
         };
         #[cfg(test)]
         crate::seams::at("claimed");
@@ -518,7 +546,7 @@ pub async fn publish_path(
             if still(&target, &claim) {
                 let _ = tokio::fs::remove_file(&target).await;
             }
-            return Err(e);
+            return Err(at_name(e));
         }
         return Ok(Published {
             path: target,

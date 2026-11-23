@@ -81,8 +81,9 @@ how long and how many journals cleanup keeps for a later try (30 days, 64).
 
 - **Windows** records the volume by its `\\?\Volume{...}\` path and serial
   number, and each folder by its file ID; cleanup opens the volume, checks
-  its serial, opens the folder by ID and the partial by its name in it,
-  compares the file ID and deletes through that handle. A folder on a
+  its serial, opens the folder by ID, checks it is still below the root,
+  opens the partial by its name in it, compares the file ID and deletes
+  through that handle. A folder on a
   network share has no volume path, and `Journal::start` refuses it.
 - **Linux, macOS and Android** record the root's path, device and inode,
   and each folder below it by name with its device and inode. Cleanup opens
@@ -95,6 +96,71 @@ how long and how many journals cleanup keeps for a later try (30 days, 64).
 
 `files` holds the helpers that create, hold, take and delete such files;
 `safecopy-resume` keeps its records with them.
+
+## A folder renamed while its transfer runs
+
+`started` walks from the root's handle down to the folder it is given, by
+the path that folder was opened at, no link followed. When that path no
+longer reaches the held folder (renamed, moved, another folder or a link
+put under its name), the journal reads where the handle is now, walks
+that instead, and records the folder under its present names: the
+transfer carries on. A folder no longer below the root, or never below
+it, is refused (`JournalError::NotBelow`). A folder opened through a link
+below the root's path is judged the same way, by where it really is:
+recorded under its real names when that is below the root, refused with
+`NotBelow` when the link leads outside.
+
+A folder on another volume than the root's is refused on Windows
+(`OtherVolume`), where a file ID means a file on one volume only. Unix
+does not check it today: a folder on a disk mounted below the root is
+walked and recorded like any other, each level with its own device, and
+cleanup finds it again by those names and devices.
+
+What the journal does when it does not read where a held folder is now
+depends on why:
+
+| | Renamed below the root | Moved out of the root | Place not read |
+|---|---|---|---|
+| Windows, Linux, Android (procfs mounted) | recorded under its present names | `NotBelow` | `NotBelow`, renamed or moved alike |
+| macOS, the BSDs; Linux and Android with no procfs | recorded by identity alone | recorded by identity alone | always: the system cannot say |
+
+- **Windows, Linux and Android read the place.** A reading that fails (a
+  file system or a volume that gives a handle no path, a Linux folder
+  whose name ends in " (deleted)", procfs mounted and refusing) shows
+  nothing, so the folder is not taken on trust: `NotBelow`. An error of
+  the first walk that is no sign of a rename stands as it is, a link
+  under the name for one (`Folder(Refusal::Link)`).
+- **macOS and the BSDs have no way to read it, nor Linux and Android
+  with no procfs mounted.** There a folder whose name is gone, or names
+  a file or another folder now, is recorded by its identity alone, as
+  one `Folder` with an empty name directly below the root. A folder
+  moved out of the root cannot be told from one renamed inside it and is
+  recorded the same way; cleanup never finds such a folder on these
+  systems, so nothing is removed there. A link under its name is refused
+  as before (`Folder(Refusal::Link)`), since the link could be how the
+  folder was opened.
+
+After a crash, cleanup:
+
+- removes a partial recorded after the rename on Windows, Linux and
+  Android, finding its folder under its present names;
+- removes a partial recorded before the rename on Windows, and leaves it
+  on Unix, which cannot open a folder by its ID: the recorded names no
+  longer reach the folder. The same goes for a folder recorded by
+  identity alone;
+- on Windows, where an ID opens a folder anywhere on its volume, checks
+  the folder is still below the root before touching anything: by its
+  recorded names, or by where the root and the folder are now, walked
+  from the root with no link followed. A folder moved out of the root
+  since the crash is left as one that is gone, and its record ends with
+  its journal; one whose place cannot be read then is left and its
+  journal kept for a later cleanup. A move in the moment between that
+  check and the removal is not caught. A
+  journal of the whole-record format of before names no root, and is
+  cleaned as it always was, by the folder's ID alone;
+- checks the partial's own name and ID as ever, so a file of the same
+  name where the folder used to be is left: it is another file, in
+  another folder.
 
 ## Changes
 
@@ -122,6 +188,50 @@ it was ported from):
   must be the root or a folder opened below it by name: anything else is
   `JournalError::NotBelow` (`a_folder_not_below_the_root_is_refused`). A
   change that does not follow the groups is `JournalError::Progress`.
+- **A folder renamed while its transfer runs no longer stops it.**
+  `started`, `started_many` and `PartialAt::of` failed for every later
+  file in a folder renamed, moved or replaced by name since it was
+  opened. They now record it where it is, as the section above says
+  (`a_folder_renamed_during_a_transfer_does_not_stop_it`,
+  `a_crash_after_a_folder_was_renamed_removes_only_its_own_partials`,
+  `a_renamed_folder_whose_place_cannot_be_read_is_recorded_by_identity_alone`,
+  `a_link_put_under_a_renamed_folders_name_is_not_followed`,
+  `a_file_put_under_a_renamed_folders_name_does_not_stop_it`). What was
+  refused still is (`a_folder_not_below_the_root_is_refused`,
+  `a_folder_moved_out_of_the_root_is_refused`,
+  `a_folder_reached_through_a_link_that_leads_outside_the_root_is_refused`,
+  and on Windows
+  `a_partial_on_another_volume_than_the_journal_s_is_refused`), with two
+  differences where a folder was opened through a link, on Windows, Linux
+  and Android: one that leads outside the root is now `NotBelow`, where
+  it was `Folder(Refusal::Link)`, and one that leads to a folder really
+  below the root is recorded under that folder's real names, where it was
+  refused (`a_folder_reached_through_a_link_inside_the_root_is_recorded_where_it_is`). A `Level`
+  or `Folder` with an empty name is new in what a segment may hold; the
+  format is the same, and a reader of before leaves such a partial on
+  Unix and removes it by the folder's ID on Windows. It is only ever one
+  level, directly below the root: a segment with an empty name anywhere
+  else is read as damaged from there on, and nothing it lists after is
+  removed (`an_empty_folder_name_that_is_not_the_only_level_is_damaged`,
+  `cleanup_removes_nothing_for_an_empty_folder_name_out_of_place`).
+- **A place that cannot be read is not taken for a rename.** Where the
+  system reads a held folder's place and the reading fails, `started`
+  refuses the folder with `NotBelow` instead of recording it by its
+  identity alone, which is kept for the systems that cannot read a place
+  at all (`a_folder_whose_place_cannot_be_read_is_not_taken_on_trust`,
+  and on Linux
+  `a_folder_named_as_deleted_and_moved_out_of_the_root_is_refused`).
+- **Cleanup on Windows stays below the root.** A recorded folder's ID
+  opened it anywhere on its volume, so a folder moved out of the root
+  between a crash and the cleanup had its partial removed there. The
+  folder must now still be below the root, or the partial is left
+  (`cleanup_leaves_a_partial_whose_folder_was_moved_out_of_the_root`,
+  `cleanup_leaves_a_partial_whose_folders_place_cannot_be_read`); one
+  renamed below the root is still cleaned
+  (`a_crash_after_a_folder_was_renamed_removes_only_its_own_partials`).
+- **`JournalError::Io { kind, raw }`** where it was `Io(kind)`: `raw` is
+  the system's own error code (`errno`, a Windows error code), `None` for
+  an error that has none (`a_system_error_keeps_its_raw_code`).
 - **The progress stays bounded:** two open groups' bits and 134 partials,
   a segment within its bound, one sync per start and per mark move
   (`the_progress_stays_bounded_for_10000_entries_flat_and_nested`,
@@ -204,8 +314,9 @@ original code behaved as below, this crate does not:
   a pipe included. It now opens only `\\?\Volume{GUID}\` and leaves the
   partials of any other
   (`a_recorded_volume_that_is_not_a_volume_guid_path_is_never_opened`).
-- A partial, or its folder, on another volume than the journal's is
-  refused with `JournalError::OtherVolume`
+- On Windows a partial, or its folder, on another volume than the
+  journal's is refused with `JournalError::OtherVolume`; a partial on
+  another volume than its own folder's is refused on every system
   (`a_partial_on_another_volume_than_the_journal_s_is_refused`).
 - A panic in another thread while it held the journal made every later
   call panic too; the journal now carries on

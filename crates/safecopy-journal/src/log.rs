@@ -50,7 +50,9 @@ pub enum Root {
 }
 
 /// A folder below the root, one level: its parent's number (0 is the
-/// root), its name there and its identity.
+/// root), its name there and its identity. An empty name is a folder known
+/// by its identity alone, directly below the root with nothing below it:
+/// anywhere else it makes its entry, or its header, damaged.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Folder {
     /// Its number in the journal, never 0.
@@ -527,6 +529,15 @@ impl State {
         let known_parent = folder.parent == 0
             || (folder.parent < folder.n && self.folders.contains_key(&folder.parent));
         if folder.n == 0 || !known_parent || self.folders.contains_key(&folder.n) {
+            return Err(JournalError::Damaged);
+        }
+        // A folder known by its identity alone has no name to be found
+        // under, nor to find another below it: it is the only level.
+        let below_unnamed = self
+            .folders
+            .get(&folder.parent)
+            .is_some_and(|parent| parent.name.is_empty());
+        if below_unnamed || (folder.name.is_empty() && folder.parent != 0) {
             return Err(JournalError::Damaged);
         }
         self.folders.insert(folder.n, folder);

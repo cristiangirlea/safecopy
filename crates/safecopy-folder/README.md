@@ -86,6 +86,18 @@ original code behaved as below, this crate does not:
   neither hard links nor renames) removes that copy, as a cancel already
   did: nothing is left under the final name
   (`a_publish_dropped_during_a_folder_copy_fallback_leaves_no_copy`).
+- **A publish that fails says which name it was trying.**
+  `PublishError::Name { path, error }` is new: the name being tried when
+  the system refused (the one asked for, or `name (2).ext` and so on once
+  those before it were taken), as `Published::path` would give it, with
+  the system's `io::Error` whole, its kind and raw code. `publish` and
+  `publish_with` gave `PublishError::Io` for it before, which is now only
+  a failure before any name is tried (the file's time or execute bit;
+  `a_publish_that_fails_before_any_name_is_tried_is_an_io_error`).
+  `publish_path` returns `Result<Published, PublishError>` where it
+  returned `io::Result<Published>`, and every error of its own is a
+  `Name` (`a_publish_that_fails_says_which_numbered_name_it_was_trying`,
+  `by_path_a_publish_that_fails_says_which_numbered_name_it_was_trying`).
 
 Uses `safecopy-names`.
 

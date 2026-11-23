@@ -112,10 +112,12 @@ impl Listing {
                 size: 0,
                 parts: parts.clone(),
             };
-            let read = open_directory(&listing.root, &parts).and_then(|directory| {
-                let read = directory.names(most.saturating_sub(found).saturating_add(1))?;
-                Ok((directory, read))
-            });
+            let read = open_directory(&listing.root, &parts)
+                .map_err(|(_, e)| e)
+                .and_then(|directory| {
+                    let read = directory.names(most.saturating_sub(found).saturating_add(1))?;
+                    Ok((directory, read))
+                });
             let (directory, read) = match read {
                 Ok(read) => read,
                 Err(e) if depth == 1 => return Err(unreadable(root, &e)),
@@ -192,19 +194,37 @@ impl Listing {
     /// opened parent and no link followed: a file to read with its size
     /// now, or `None` for a folder that is still there. A file larger than
     /// it was listed is [`ManifestError::Changed`], so nothing that grew is
-    /// sent; a smaller one opens, with its smaller size.
+    /// sent; a smaller one opens, with its smaller size. One that is no
+    /// longer a regular file (a folder, a device, a pipe or a socket under
+    /// its name) is [`ManifestError::NotAFile`].
+    ///
+    /// An error's `at` is the part of the path that failed, not the whole
+    /// entry: [`ManifestError::Link`] names the folder on the way that is
+    /// a link now, or the entry itself when it is the link, so the two are
+    /// told apart by comparing `at` with the entry's path (the listed
+    /// folder's and [`Listed::parts`]).
     pub fn open_entry(&self, entry: &Listed) -> Result<Option<(File, u64)>, ManifestError> {
-        let at = || self.root.path().join(source(Path::new(""), &entry.parts));
-        let failed = |e: io::Error| unreadable(&at(), &e);
+        // Where the entry's first `count` parts are.
+        let at = |count: usize| source(self.root.path(), &entry.parts[..count]);
+        let on_the_way = |(count, e): (usize, io::Error)| unreadable(&at(count), &e);
         if entry.folder {
-            open_directory(&self.root, &entry.parts).map_err(failed)?;
+            open_directory(&self.root, &entry.parts).map_err(on_the_way)?;
             return Ok(None);
         }
         let (last, within) = entry.parts.split_last().ok_or(ManifestError::Changed)?;
-        let parent = open_directory(&self.root, within).map_err(failed)?;
-        let file = parent.entry(last).map_err(failed)?;
-        let meta = file.metadata().map_err(failed)?;
-        if !meta.is_file() || meta.len() > entry.size {
+        let parent = open_directory(&self.root, within).map_err(on_the_way)?;
+        let whole = || at(entry.parts.len());
+        let file = parent.entry(last).map_err(|e| match refusal(&e) {
+            Some(safecopy_folder::Refusal::NotFileOrFolder) => {
+                ManifestError::NotAFile { at: whole() }
+            }
+            _ => unreadable(&whole(), &e),
+        })?;
+        let meta = file.metadata().map_err(|e| unreadable(&whole(), &e))?;
+        if !meta.is_file() {
+            return Err(ManifestError::NotAFile { at: whole() });
+        }
+        if meta.len() > entry.size {
             return Err(ManifestError::Changed);
         }
         Ok(Some((file, meta.len())))
@@ -235,11 +255,12 @@ fn skip_for(e: &io::Error) -> Skip {
 }
 
 /// The folder `parts` below `root`, each part opened from its opened
-/// parent, so a replacement on the way cannot redirect it.
-fn open_directory(root: &Directory, parts: &[OsString]) -> io::Result<Directory> {
-    let mut dir = root.try_clone()?;
-    for part in parts {
-        dir = dir.directory(part)?;
+/// parent, so a replacement on the way cannot redirect it. An error comes
+/// with how many parts lead to what failed: 0 is `root` itself.
+fn open_directory(root: &Directory, parts: &[OsString]) -> Result<Directory, (usize, io::Error)> {
+    let mut dir = root.try_clone().map_err(|e| (0, e))?;
+    for (n, part) in parts.iter().enumerate() {
+        dir = dir.directory(part).map_err(|e| (n + 1, e))?;
     }
     Ok(dir)
 }
