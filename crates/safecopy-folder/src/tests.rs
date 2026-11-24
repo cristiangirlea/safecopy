@@ -711,6 +711,47 @@ async fn a_cancel_during_a_folder_copy_fallback_removes_both_open_files() {
     std::fs::remove_dir_all(to).unwrap();
 }
 
+/// The caller checked the file's bytes before publishing, and may have
+/// given a clone of the file away (a save's hooks): where the file is
+/// copied into its name, that clone moved mid-copy changes no byte.
+#[tokio::test]
+async fn a_clone_moved_during_a_folder_copy_fallback_changes_no_byte() {
+    use std::io::{Seek, SeekFrom};
+    let to = temp("folder-copy-moved");
+    let dir = Directory::open(&to).unwrap();
+    // Several slices, no two alike.
+    let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let file = partial(&dir, "a.bin.part", &bytes);
+    let mut clone = file.try_clone().unwrap();
+    // Before the first slice nothing; before the second, the clone is
+    // moved back into what was copied already.
+    crate::seams::on("copy slice", || {});
+    crate::seams::on("copy slice", move || {
+        clone.seek(SeekFrom::Start(7)).unwrap();
+    });
+    NO_HARD_LINKS.set(true);
+    NO_RENAME.set(true);
+    let rules = PublishRules::default();
+    let published = dir
+        .publish(
+            &file,
+            os("a.bin.part"),
+            "a.bin",
+            &rules,
+            std::future::pending(),
+        )
+        .await;
+    NO_RENAME.set(false);
+    NO_HARD_LINKS.set(false);
+    published.unwrap();
+    assert!(std::fs::read(to.join("a.bin")).unwrap() == bytes);
+    // Windows lets the partial's name go with its last handle.
+    drop(file);
+    assert_eq!(files_in(&to), ["a.bin"]);
+    drop(dir);
+    std::fs::remove_dir_all(to).unwrap();
+}
+
 #[tokio::test]
 async fn a_publish_dropped_during_a_folder_copy_fallback_leaves_no_copy() {
     use std::task::Poll;
@@ -1709,7 +1750,19 @@ fn reopen_opens_only_a_regular_file_already_there_and_never_a_link() {
     file.seek(SeekFrom::Start(0)).unwrap();
     file.read_to_string(&mut read).unwrap();
     assert_eq!(read, "abcd");
+    // It gets its name, or is removed, through this handle as a new partial is.
+    if dir.finish(&file, os("a.part"), os("a.txt")).is_err() {
+        dir.rename(&file, os("a.part"), os("a.txt")).unwrap();
+    }
     drop(file);
+    assert_eq!(std::fs::read(base.join("a.txt")).unwrap(), b"abcd");
+    assert!(!base.join("a.part").exists());
+    std::fs::write(base.join("b.part"), b"abc").unwrap();
+    let file = dir.reopen(os("b.part")).unwrap();
+    dir.discard(&file, os("b.part")).unwrap();
+    drop(file);
+    assert!(!base.join("b.part").exists());
+    std::fs::write(base.join("a.part"), b"abcd").unwrap();
     // A folder, a name leaving the folder, and a link are refused.
     std::fs::create_dir(base.join("Sub")).unwrap();
     assert!(dir.reopen(os("Sub")).is_err());

@@ -35,14 +35,61 @@ file before it gets its name.
   (`PartialFate`): published, removed, never created, replaced by another
   file under its name, or left because the system refused to remove it,
   with the error's kind and raw code.
+- `save_resumable(reader, Target { dir, name, size }, start, keep,
+  options, hooks, cancel)`: the same save from `Start::New` or from a
+  partial file kept before (`Start::Resume(Box<Kept>)`: the open file,
+  its name and a `Hasher` standing after the bytes kept). A resumed save
+  cuts the partial to those bytes and appends the stream's from there,
+  wherever the handle's position stood; the stream carries the bytes
+  from there to the size, and the hash compared with the trailer is of
+  the whole file. The caller passes a rule, a closure over the error,
+  that says which errors keep the partial file: then it is not removed
+  but cut back to its last whole chunk, and `Stopped::kept` holds it,
+  open, with `Kept::have` and `Kept::prefix` (the running hash there). A
+  cancel and a wrong hash never keep, whatever the rule says, nor does a
+  save with no whole chunk written, nor one that failed after the hash
+  matched (the flush, the hook before publishing, the publish), nor a
+  resumed one whose partial is shorter than its hasher says or whose
+  hasher is off a chunk, nor one that cannot be cut back. A write that
+  fails within a chunk keeps the whole chunks before it.
+  `Hooks::whole(file, have, prefix)` hears of each whole chunk once it
+  is written and before the next byte is read, for a resume record kept
+  from the first chunk on; when it fails and the rule keeps a hook's
+  error, the chunk it was told of is kept too, written and hashed as it
+  is. `created` and `whole` get the save's own handle: reading or
+  seeking it, there or later through a clone kept, on any thread, moves
+  no byte, since every byte is written at its own offset in the file
+  (a positioned write) and never at the handle's position; where the
+  disk makes the file be copied into its name, that copy reads at its
+  own offsets too. A save whose future is dropped leaves no write to
+  its partial behind: when the drop returns, none is running and none
+  can start, and the handle it wrote through is closed; the drop waits
+  for a write already under way on the blocking pool, for as long as
+  that one write takes (one slice, 64 KiB, at most; on a disk that
+  stalls, as long as it stalls).
+  `save_verified` is this save from `Start::New`, keeping nothing. The
+  caller answers for a handed-in hasher matching the partial's bytes
+  (`safecopy-resume` gives one read from the disk and checked).
 - `CandidateHash::hash`: the hash of a file already at the destination
   (`Directory::candidate`), counted only when the file was unchanged before
   and after.
 
+**What a matching hash proves.** The hash is of the bytes as they came
+off the stream and were handed to the system to write; a save never
+reads its own file back, before or after it gets its name. A match says
+the stream was whole and unchanged and that those bytes were written,
+not what a disk that fails silently holds, nor what another program
+wrote into the partial file meanwhile. For a resumed file the kept bytes
+are covered through the hasher handed in, and the caller answers for it
+being the hash of what the partial holds then: `safecopy-resume`'s
+`Store::reopen_hashed` reads them from the disk through the handle the
+save then writes, so they are proven as read at that reopening and the
+rest as written.
+
 Errors are `ChunkError` kinds (`CutShort { got, size }` for the file's
 bytes, `TrailerCutShort { got }` for the trailer's, `TooLong`,
-`Damaged`, `Cancelled`, ...) and `CandidateError { Changed, Unreadable }`,
-never sentences.
+`Damaged`, `Cancelled`, `PartialShort { have, len }`, ...) and
+`CandidateError { Changed, Unreadable }`, never sentences.
 
 What both sides must agree on is fixed by the framing: the framing version
 (`FRAMING`), the trailer, and the chunk size (`CHUNK`, 4 MiB, a constant,
@@ -53,6 +100,59 @@ The framing is fuzzed: `fuzz/fuzz_targets/framing.rs`.
 
 ## Changes
 
+- **`save_resumable` takes a `Target { dir, name, size }`** where it took
+  the three as arguments: `save_resumable(reader, target, start, keep,
+  options, hooks, cancel)`. `save_verified` is as it was.
+- **A dropped save leaves no write behind.** Each write runs on the
+  blocking pool, and one handed there outlived the save's future: under
+  a busy pool it could start much later, and on Unix land in the partial
+  after a later save had reopened and hashed it, so a sender that sent
+  other bytes on the dropped connection and came back at once got them
+  written over checked bytes. The writer now shares a gate with each
+  write: a write takes it, writes nothing when it is shut, and holds it
+  while it writes; dropping the writer takes it and shuts it. Dropping a
+  save so waits for a write under way, one slice, where it never
+  waited before: on a disk that stalls, for as long as it stalls. Every other end (published,
+  cut and kept, failed) shuts the gate before the partial is cut back,
+  handed back or published
+  (`a_write_still_waiting_when_its_save_is_dropped_writes_nothing`,
+  `a_write_under_way_when_its_save_is_dropped_is_whole_when_the_drop_returns`).
+- **Every byte is written at its own offset**, by a positioned write
+  (`pwrite`, or a write with its offset on Windows). The writer shared
+  its position with the handle given to `Hooks::created` and
+  `Hooks::whole`, and with the one a `Kept` came with: a hook that read
+  or sought the file, a clone of it kept and moved on another thread
+  while a chunk was written, or a `Kept` with no byte kept whose handle
+  stood past the start, moved where the next bytes landed, under a hash
+  that still matched. Nothing done to the handle's position does now
+  (`a_hook_that_moves_the_files_position_moves_no_byte`,
+  `a_clone_of_the_file_moved_on_another_thread_moves_no_byte`,
+  `a_resumed_save_from_zero_writes_from_the_files_first_byte`). The
+  copy into the name, where a disk needs one, reads at its own offsets
+  as well (`safecopy-folder`).
+- **What is kept, pinned by tests:**
+  `a_write_that_fails_within_a_chunk_keeps_the_whole_chunks_before_it`,
+  `a_partial_that_cannot_be_cut_back_is_removed`,
+  `a_flush_or_a_publish_that_fails_after_the_hash_matched_keeps_nothing`,
+  `a_short_partial_and_a_wrong_offset_are_removed_whatever_the_rule_says`,
+  `an_error_from_whole_that_the_rule_keeps_keeps_the_chunk_it_was_told_of`.
+- **A save that starts new or resumes, and can keep its partial.** New:
+  `save_resumable(..) -> Result<Saved, Stopped>`,
+  `Start { New, Resume(Box<Kept>) }`,
+  `Kept { file, partial, hasher }` with `have()` and `prefix()`,
+  `Stopped { error, kept }`, `Hooks::whole(file, have, prefix)` (default:
+  nothing), `PartialFate::Kept { have }` and
+  `ChunkError::PartialShort { have, len }`. `save_verified` is unchanged
+  in what it does; it now calls `Hooks::whole` at each whole chunk too.
+  `Hooks::before_create` and `Hooks::created` are not called for a
+  resumed save, whose caller holds the file already.
+  Tests: `a_cut_stream_keeps_whole_chunks_and_a_later_save_appends_and_publishes`,
+  `a_cancel_and_a_damaged_hash_keep_nothing_whatever_the_rule_says`,
+  `a_cut_before_the_first_whole_chunk_keeps_nothing`,
+  `whole_fires_once_per_whole_chunk_and_its_error_fails_the_save`,
+  `a_resumed_save_checks_its_stream_and_its_partial_as_a_new_one_does`,
+  `a_resumed_save_keeps_nothing_after_a_cancel_a_wrong_hash_or_a_matched_one`,
+  `a_resumed_save_that_is_cut_keeps_its_partial_again`.
 - **`Hooks::ended` is told what became of the partial file.** It takes a
   second argument, `PartialFate`: `NotCreated`, `Published`, `Removed`,
   `Replaced` (Linux and macOS: another file had its name, and was left),

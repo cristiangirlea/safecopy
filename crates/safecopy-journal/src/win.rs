@@ -77,7 +77,7 @@ pub(crate) fn open_folder(volume: &File, id: u128) -> io::Result<Directory> {
 
 /// The system's error as its Win32 code, which `io::ErrorKind` reads: the
 /// `windows` crate gives it as an HRESULT, which it does not.
-fn win32(error: windows::core::Error) -> io::Error {
+pub(crate) fn win32(error: windows::core::Error) -> io::Error {
     let code = error.code().0 as u32;
     if code & 0xFFFF_0000 == 0x8007_0000 {
         io::Error::from_raw_os_error((code & 0xFFFF) as i32)

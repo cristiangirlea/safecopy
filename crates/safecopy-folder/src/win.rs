@@ -328,7 +328,8 @@ pub fn reopen(parent: &File, name: &OsStr) -> io::Result<File> {
     relative(
         parent,
         name,
-        (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+        // As a new partial is opened: its handle renames it into its name, or removes it.
+        (FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE).0,
         FILE_OPEN,
         // No non-directory flag: a junction is then refused as a link, and a folder by the caller.
         0,

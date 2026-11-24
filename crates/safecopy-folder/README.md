@@ -77,6 +77,15 @@ original code behaved as below, this crate does not:
 
 ## Changes
 
+- **The copy into a name reads at its own offsets.** Where a disk has
+  neither hard links nor renames, `publish` copies the open file into
+  its name; it did so through the file's position, set to the start
+  once and shared with every clone of the handle, so a clone read or
+  moved on another thread during the copy changed what was published,
+  after the caller had checked the bytes. Each slice is now read and
+  written at an explicit offset (`pread` and `pwrite`, or their Windows
+  forms), and no handle's position is relied on
+  (`a_clone_moved_during_a_folder_copy_fallback_changes_no_byte`).
 - `Meta::of(&Metadata)`: the `Meta` of metadata already read, as
   `Meta::read` gives it, for a caller that holds it from a listing and
   opens no file (`meta_read_gives_the_owners_execute_bit_on_unix`,
@@ -86,6 +95,9 @@ original code behaved as below, this crate does not:
   kept partial file can be appended to after a drop; a folder, a device, a
   link or a junction is refused
   (`reopen_opens_only_a_regular_file_already_there_and_never_a_link`).
+  On Windows it is now opened with the right to delete, as a new partial
+  is: a reopened partial is published and removed through its handle,
+  where both were refused before (the same test).
 - A publish dropped while it copies the file into its name (a disk with
   neither hard links nor renames) removes that copy, as a cancel already
   did: nothing is left under the final name

@@ -56,7 +56,8 @@ pub struct PartialAt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Left {
-    /// A recorded name that cleanup never removes.
+    /// A recorded name that is not a partial's
+    /// ([`PartialAt::is_partial`]): never removed, never opened.
     Name,
     /// A root recorded on another system, a volume path that is not a
     /// volume's, or another disk under it.
@@ -69,6 +70,9 @@ pub enum Left {
     /// The recorded volume or root could not be opened: a disk not plugged
     /// in, not mounted.
     Unreachable,
+    /// The file is there, open elsewhere in a way that shuts this open
+    /// out: a transfer is writing it. Only Windows says so.
+    Busy,
     /// Any other error of the system's: worth another try.
     Io,
 }
@@ -77,7 +81,7 @@ impl Left {
     /// Whether another cleanup could still remove the partial: its journal
     /// is kept for it.
     pub(crate) fn may_change(self) -> bool {
-        matches!(self, Self::Unreachable | Self::Io)
+        matches!(self, Self::Unreachable | Self::Busy | Self::Io)
     }
 }
 
@@ -86,6 +90,9 @@ pub(crate) fn left(error: &io::Error) -> Left {
     if safecopy_folder::refusal(error).is_some() {
         // A link or a folder under the name, a file under the folder's ID.
         return Left::Replaced;
+    }
+    if crate::files::busy(error) {
+        return Left::Busy;
     }
     match error.kind() {
         io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => Left::Gone,
@@ -429,6 +436,17 @@ impl PartialAt {
         })
     }
 
+    /// Whether the recorded name is a partial's under `settings`: it ends
+    /// in [`Settings::partial_ending`] and is more than the ending, one
+    /// part of a path, naming no stream of a file. Only such a name is
+    /// ever opened, cut or removed. A record read from a disk may name
+    /// any file: [`Self::remove`], [`Self::reopen`], [`Self::try_reopen`]
+    /// and [`Self::present`] each ask this first, and take the settings
+    /// so that no caller can leave it out.
+    pub fn is_partial(&self, settings: &Settings) -> bool {
+        removable(&self.partial, settings)
+    }
+
     /// Removes the partial file, only through a handle checked to be it:
     /// its folder found by identity, the name ending in
     /// [`Settings::partial_ending`], its file ID the recorded one. Windows
@@ -439,7 +457,7 @@ impl PartialAt {
     }
 
     pub(crate) fn remove_checked(&self, settings: &Settings) -> Result<(), Left> {
-        if !removable(&self.partial, settings) {
+        if !self.is_partial(settings) {
             return Err(Left::Name);
         }
         let dir = self.location.find()?;
@@ -466,12 +484,58 @@ impl PartialAt {
     }
 
     /// The partial file opened by identity for reading and writing, with
-    /// its folder: `None` when it is gone or another file has its name.
-    pub fn reopen(&self) -> Option<(Directory, std::fs::File)> {
+    /// its folder: `None` when its name is not a partial's under
+    /// `settings` ([`Self::is_partial`]), it is gone, another file has its
+    /// name, or it could not be opened. [`Self::try_reopen`] says which.
+    pub fn reopen(&self, settings: &Settings) -> Option<(Directory, std::fs::File)> {
+        self.try_reopen(settings).ok()
+    }
+
+    /// [`Self::reopen`], with why it failed: [`Left::Gone`] and
+    /// [`Left::Replaced`] say the recorded file is not under its name any
+    /// more; [`Left::Busy`] that it is there and open elsewhere (Windows,
+    /// where a file being written is not shared for this open); the rest
+    /// that nothing is known of it now. [`Left::Name`] is a recorded name
+    /// that is not a partial's under `settings`: nothing is opened for it,
+    /// not its folder either.
+    pub fn try_reopen(&self, settings: &Settings) -> Result<(Directory, std::fs::File), Left> {
+        // The caller may cut and write what this opens.
+        if !self.is_partial(settings) {
+            return Err(Left::Name);
+        }
+        let dir = self.location.find()?;
+        let file = dir
+            .reopen(OsStr::new(&self.partial))
+            .map_err(|e| left(&e))?;
+        let id = identity(&file).map_err(|_| Left::Io)?;
+        let volume = dir.identity().map_err(|_| Left::Io)?.volume;
+        if id.file != self.file || volume != id.volume {
+            return Err(Left::Replaced);
+        }
+        Ok((dir, file))
+    }
+
+    /// The partial file's length, when it is still under its name: its
+    /// folder found as [`Self::reopen`] finds it, the name inspected with
+    /// no link followed, and its identity and volume compared as there.
+    /// No byte of it is read, and the handle conflicts with no other, a
+    /// transfer writing the file included: Windows opens it for its
+    /// attributes alone, sharing everything, and Linux and Android as a
+    /// path only; macOS and the BSDs, which have neither, open it for
+    /// reading without waiting, and read nothing. `None` when its name is
+    /// not a partial's under `settings` ([`Self::is_partial`], nothing
+    /// opened), it is gone, another file has its name, or nothing is
+    /// known of it now.
+    pub fn present(&self, settings: &Settings) -> Option<u64> {
+        if !self.is_partial(settings) {
+            return None;
+        }
         let dir = self.location.find().ok()?;
-        let file = dir.reopen(OsStr::new(&self.partial)).ok()?;
+        let file = dir.inspect(OsStr::new(&self.partial)).ok()?;
+        let meta = file.metadata().ok()?;
         let id = identity(&file).ok()?;
-        (id.file == self.file && dir.identity().ok()?.volume == id.volume).then_some((dir, file))
+        let same = id.file == self.file && dir.identity().ok()?.volume == id.volume;
+        (same && meta.is_file()).then_some(meta.len())
     }
 }
 

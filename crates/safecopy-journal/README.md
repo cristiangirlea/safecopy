@@ -19,7 +19,41 @@ left alone. A journal still held by a running transfer, in this process or
 another, is left alone too, and so is one whose disk is not there: it is
 kept for a later cleanup, within the age and count `Settings` give.
 `clean_up_keeping` leaves the partials the caller still keeps (a valid
-resume record of `safecopy-resume`).
+resume record of `safecopy-resume`), and the journals that list them.
+
+## A partial kept to continue later
+
+A caller that keeps a partial file when its stream is cut calls nothing
+on the journal for it then, neither `done` nor `ended`: the journal goes
+on listing it and stays on the disk when it is dropped. `clean_up_keeping`
+leaves the partial while the caller's rule keeps it, and keeps the journal
+with it. Once the rule lets go (the resume record expired, was torn or is
+gone), the next cleanup still knows the file: it removes the partial, and
+then the journal. A transfer that continues the partial in a later run
+lists it in that run's journal: `started` takes a file that already has
+bytes. In the same run it is still listed and needs no second call. A
+caller that removes a kept partial itself calls `ended` if that journal
+still runs.
+
+Journals kept this way count toward `Settings::keep_most` and
+`Settings::keep_for` together with the ones kept for a disk that is away.
+Both bounds must fit what the caller keeps: at least as many journals as
+it keeps partials (each may be alone in its journal), for at least as
+long as it keeps one. A partial cut and continued in `n` runs is listed
+in `n` kept journals, one per run, so `keep_most` is reached with fewer
+partials than it counts; the oldest journals go first and the newest that
+lists the file stays, so the file is still known to a cleanup. The defaults (512 journals, 30 days) fit a
+`safecopy-resume` store's (256 files, 24 hours) with as many journals
+again to spare, and `Store::clean_up` raises the two to its own limits
+when they are set lower. A journal past either bound is removed and its
+partials left: cleanup removes only what a journal proves it wrote. On
+Linux and macOS, where an inode is reused once its file is deleted, a
+journal kept longer can meet a new partial of the same name and inode in
+the same folder; run a cleanup after forgetting kept files so such a
+journal does not outlast them. A journal that lists a kept partial now
+lives as long as that partial is kept (up to the caller's keep time, and
+512 journals by default) where it went at the next cleanup, so the time
+in which an old journal can meet such a new partial is that much longer.
 
 ```rust
 use std::ffi::OsStr;
@@ -75,7 +109,8 @@ and the entry is fetched again until then.
 groups and partials a journal holds (`GroupLimits::default()`, 134), the
 ending a name must have to be removed (`.part`), the name rules a numbered
 name was made by, how many names of a folder `recover` reads (10,000), and
-how long and how many journals cleanup keeps for a later try (30 days, 64).
+how long and how many journals cleanup keeps for a later try (30 days,
+512).
 
 ## Systems
 
@@ -95,7 +130,14 @@ how long and how many journals cleanup keeps for a later try (30 days, 64).
   by an exclusive `flock`, which other programs see only if they lock.
 
 `files` holds the helpers that create, hold, take and delete such files;
-`safecopy-resume` keeps its records with them.
+`safecopy-resume` keeps its records with them. A file held (`create`,
+`hold`) has one writer and is still read by other processes (`open_read`);
+`busy` tells the error of a file another holder has from any other.
+`hold` refuses a link and a file with more than one name (a hard link,
+counted through the open handle: `st_nlink`, or the number of links
+`GetFileInformationByHandle` gives): what it wrote would land in a file
+another name shows. `take`, which only reads and removes the name, takes
+such a file. `refused` tells those refusals from the system's errors.
 
 ## A folder renamed while its transfer runs
 
@@ -163,6 +205,62 @@ After a crash, cleanup:
   another folder.
 
 ## Changes
+
+- **Tested:** a file given a second name between `files::hold`'s open
+  and its count of names is not held: the count is read from the handle
+  after the open
+  (`a_file_given_a_second_name_while_it_is_being_held_is_not_held`).
+- **Only a name that is a partial's is opened.** `PartialAt::reopen`,
+  `try_reopen` and `present` opened whatever name was recorded, where
+  `remove` checked it first: a record read from a disk can name any file
+  of the person's, and a caller that cut or wrote what `reopen` gave it
+  did so to that file. All three now take the `Settings`, as `remove`
+  does, and open nothing for a name that does not end in
+  `Settings::partial_ending`, is the ending alone, has a separator or
+  would open a stream of a file (`name:stream`): `try_reopen` is
+  `Left::Name`, the other two `None`. They take the settings, and are
+  not left to a check the caller makes first, so that no caller can
+  leave it out. New: **`PartialAt::is_partial(&settings)`**, the same
+  rule for a caller that opens nothing
+  (`a_recorded_name_that_is_not_a_partials_is_never_opened`).
+- **`PartialAt::present(&settings)`** gives a kept partial's length when it is
+  still the recorded file under its name: no byte read, and no conflict
+  with a transfer writing the file. Windows opens it for its attributes
+  alone, Linux and Android as a path only; macOS, which has neither,
+  opens it for reading without waiting and reads nothing
+  (`a_partial_is_found_present_without_being_opened_for_its_bytes`).
+  **`PartialAt::try_reopen(&settings)`** is `reopen` with why it failed, and
+  `Left` has one more kind, `Busy`: the file is there and open elsewhere
+  (Windows), which `reopen` gave as `None`, the same as gone.
+- **Cleanup keeps a journal while a partial it lists is kept.**
+  `clean_up_keeping` counted a kept partial as left and removed the
+  journal, so nothing knew the file once its resume record was gone. The
+  journal now stays until the partial is removed, gone or replaced, within
+  `keep_for` and `keep_most`; `Cleaned::kept` counts it
+  (`cleanup_keeps_a_journal_while_a_partial_it_lists_is_kept`,
+  `a_journal_kept_for_the_caller_is_held_to_the_most_kept`).
+- **`Settings::keep_most` is 512** by default, where it was 64: room for
+  the 256 files a resume store keeps, each alone in its journal.
+- **`started` and `started_many` take a partial that has bytes**: one
+  kept and opened again is listed by the new run's journal
+  (`a_reopened_partial_with_bytes_is_listed_by_the_new_runs_journal`).
+  `ended` is for a partial that was removed, not for one kept.
+- **`files::hold` refuses a file with more than one name**, where it
+  held any regular file: a hard link put under a record's name is no
+  longer written through. New: **`files::refused(&error)`**, whether an
+  error says the name holds a link, something other than a regular file
+  or a file with a second name
+  (`a_file_with_a_second_name_is_not_held_and_is_still_taken`). A file
+  removed in the moment it was opened, with no name left, is `NotFound`
+  as before.
+- **Tested:** a junction and a file symbolic link under a partial's name
+  are not `present` on Windows
+  (`a_partial_is_found_present_without_being_opened_for_its_bytes`).
+- **`files::hold(path)`** holds a record file that is already there as
+  `files::create` holds a new one, and **`files::busy(&error)`** says
+  whether an error means another holder has it
+  (`a_held_record_file_is_read_by_others_and_written_by_one`, and on Unix
+  `a_record_file_removed_while_it_is_being_held_is_not_held`).
 
 From the first version of this crate (the format and behaviour of the code
 it was ported from):
@@ -258,7 +356,8 @@ it was ported from):
   and a longer segment is read only that far
   (`a_segment_longer_than_the_limit_is_read_only_that_far`).
 - `clean_up_keeping` leaves the partials the caller keeps; `PartialAt`
-  names where one is, removes it by identity and reopens it, and
+  names where one is, removes it by identity and reopens it (only under
+  a partial's name, by the settings each call takes), and
   `Location::open` finds a recorded folder again or says why not (`Left`).
 - Streams that start partials at once in new folders each get their own
   folder entry (`partials_started_at_once_in_new_folders_are_all_recorded`).
@@ -306,7 +405,7 @@ original code behaved as below, this crate does not:
   (`a_journal_whose_volume_cannot_be_opened_is_kept_until_it_can`,
   `a_partial_in_use_keeps_its_journal_for_a_later_cleanup`). A kept
   journal is removed, its partials left, once it is older than
-  `Settings::keep_for` (30 days) or past `Settings::keep_most` (64) kept
+  `Settings::keep_for` (30 days) or past `Settings::keep_most` (512) kept
   journals, the oldest first
   (`a_kept_journal_past_its_age_is_removed_and_leaves_its_partials`,
   `past_the_most_kept_journals_the_oldest_are_removed`).

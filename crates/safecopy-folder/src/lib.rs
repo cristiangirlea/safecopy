@@ -311,7 +311,9 @@ impl Directory {
     /// writing: a kept partial file a transfer appends to. A link, a
     /// junction, a folder, a device or a pipe is refused; it is never
     /// created. On Windows it is open without delete sharing, as
-    /// [`Self::create`] opens a new one.
+    /// [`Self::create`] opens a new one, and with the same rights: it is
+    /// published ([`Self::publish`], [`Self::finish`]) and removed
+    /// ([`Self::discard`]) through this handle as a new one is.
     pub fn reopen(&self, name: &OsStr) -> io::Result<File> {
         component(name)?;
         let file = platform::reopen(&self.file, name)?;
@@ -538,8 +540,6 @@ mod seams {
 
     /// Runs `hook` once, when the code reaches `point`: a swap acted out
     /// between two steps.
-    // Only the Unix tests swap files: Windows holds them without delete sharing.
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn on(point: &'static str, hook: impl FnOnce() + 'static) {
         HOOKS.with_borrow_mut(|hooks| hooks.push((point, Box::new(hook))));
     }

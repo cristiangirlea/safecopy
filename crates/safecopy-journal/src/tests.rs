@@ -282,6 +282,333 @@ pub(crate) fn partial(
     file
 }
 
+// Partials the caller keeps.
+
+#[test]
+fn cleanup_keeps_a_journal_while_a_partial_it_lists_is_kept() {
+    let (_scratch, place, journal_dir) = scratch("kept-by-caller");
+    let root = Directory::destination(&place).unwrap();
+    let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+    drop(partial(&root, &journal, 0, "a.part", b"half"));
+    drop(partial(&root, &journal, 1, "b.part", b"half"));
+    // The cut: `a.part` is kept, and nothing is called for it.
+    journal.crash();
+    drop(root);
+    let keep_a = |at: &PartialAt| at.partial == "a.part";
+    // The second time `b.part` is gone already, and counted as left.
+    for (removed, left) in [(1, 1), (0, 2)] {
+        let done = clean_up_keeping(&journal_dir, &settings(), &keep_a).unwrap();
+        assert_eq!(done.kept, 1, "the journal stays with what it lists");
+        assert_eq!((done.removed, done.left), (removed, left));
+        assert!(place.join("a.part").exists());
+        assert!(!place.join("b.part").exists());
+        assert_eq!(journals(&journal_dir), 1);
+    }
+    // Kept no more (its record torn or gone): the partial goes, then the journal.
+    assert_eq!(clean_up(&journal_dir, &settings()).unwrap(), cleaned(1, 1));
+    assert!(!place.join("a.part").exists(), "no orphan");
+    assert_eq!(journals(&journal_dir), 0);
+}
+
+#[test]
+fn a_journal_kept_for_the_caller_is_held_to_the_most_kept() {
+    let (_scratch, place, journal_dir) = scratch("kept-by-caller-most");
+    let root = Directory::destination(&place).unwrap();
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    for (n, ago) in [(1, 2), (2, 1)] {
+        let before: Vec<PathBuf> = std::fs::read_dir(&journal_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+        drop(partial(&root, &journal, 0, &format!("{n}.part"), b"half"));
+        journal.crash();
+        let path = std::fs::read_dir(&journal_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| !before.contains(p))
+            .unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - ago * day)
+            .unwrap();
+    }
+    drop(root);
+    // The defaults hold a store's 256 kept files, each alone in its journal.
+    assert!(settings().keep_most >= 256);
+    assert!(settings().keep_for >= day);
+    let one = Settings {
+        keep_most: 1,
+        ..settings()
+    };
+    let done = clean_up_keeping(&journal_dir, &one, &|_| true).unwrap();
+    assert_eq!((done.removed, done.left, done.kept), (0, 2, 1));
+    assert_eq!(journals(&journal_dir), 1, "the oldest journal goes");
+    // Past the limit a journal goes alone: its partial is not removed.
+    assert!(place.join("1.part").exists());
+    assert!(place.join("2.part").exists());
+}
+
+#[test]
+fn a_reopened_partial_with_bytes_is_listed_by_the_new_runs_journal() {
+    let (_scratch, place, journal_dir) = scratch("reopened");
+    let root = Directory::destination(&place).unwrap();
+    std::fs::write(place.join("a.bin.part"), b"kept from before").unwrap();
+    let file = root.reopen(OsStr::new("a.bin.part")).unwrap();
+    assert_eq!(file.metadata().unwrap().len(), 16);
+    let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+    journal
+        .started(0, &root, &file, OsStr::new("a.bin.part"), "a.bin", 100)
+        .unwrap();
+    assert_eq!(journal.partials()[0].partial, "a.bin.part");
+    drop(file);
+    journal.crash();
+    drop(root);
+    assert_eq!(clean_up(&journal_dir, &settings()).unwrap(), cleaned(1, 0));
+    assert!(!place.join("a.bin.part").exists());
+}
+
+#[test]
+fn a_partial_is_found_present_without_being_opened_for_its_bytes() {
+    let (_scratch, place, _) = scratch("present");
+    let root = Directory::destination(&place).unwrap();
+    // As a save holds it: on Windows, with no delete sharing.
+    let file = root.create(OsStr::new("a.bin.part")).unwrap();
+    file.set_len(4096).unwrap();
+    let at = PartialAt::of(&root, &root, &file, OsStr::new("a.bin.part")).unwrap();
+    assert_eq!(
+        at.present(&settings()),
+        Some(4096),
+        "while a save has it open"
+    );
+    // The handle shuts nothing out: the save's next opens still work.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Sharing nothing at all, as no save does.
+        drop(file);
+        let alone = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(place.join("a.bin.part"))
+            .unwrap();
+        assert_eq!(
+            at.present(&settings()),
+            Some(4096),
+            "attributes need no sharing"
+        );
+        assert_eq!(at.try_reopen(&settings()).err(), Some(Left::Busy));
+        assert!(at.reopen(&settings()).is_none());
+        drop(alone);
+    }
+    #[cfg(not(windows))]
+    drop(file);
+    let (_, again) = at.try_reopen(&settings()).unwrap();
+    again.set_len(10).unwrap();
+    drop(again);
+    assert_eq!(at.present(&settings()), Some(10));
+    // Another file under the name is not it, whatever its length.
+    std::fs::rename(place.join("a.bin.part"), place.join("moved")).unwrap();
+    std::fs::write(place.join("a.bin.part"), [0; 4096]).unwrap();
+    assert_eq!(at.present(&settings()), None, "replaced");
+    assert_eq!(at.try_reopen(&settings()).err(), Some(Left::Replaced));
+    // Nor is a folder, a link or nothing at all.
+    std::fs::remove_file(place.join("a.bin.part")).unwrap();
+    assert_eq!(at.present(&settings()), None, "gone");
+    assert_eq!(at.try_reopen(&settings()).err(), Some(Left::Gone));
+    std::fs::create_dir(place.join("a.bin.part")).unwrap();
+    assert_eq!(at.present(&settings()), None, "a folder");
+    std::fs::remove_dir(place.join("a.bin.part")).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(place.join("moved"), place.join("a.bin.part")).unwrap();
+        assert_eq!(at.present(&settings()), None, "a link to the very file");
+    }
+    #[cfg(windows)]
+    {
+        // A junction to the folder the very file is in.
+        junction(&place, &place.join("a.bin.part"));
+        assert_eq!(at.present(&settings()), None, "a junction");
+        assert_eq!(
+            std::fs::read(place.join("a.bin.part").join("moved"))
+                .unwrap()
+                .len(),
+            10
+        );
+        std::fs::remove_dir(place.join("a.bin.part")).unwrap();
+        // A file symbolic link needs Developer Mode or an administrator.
+        let (moved, link) = (place.join("moved"), place.join("a.bin.part"));
+        if std::os::windows::fs::symlink_file(moved, link).is_ok() {
+            assert_eq!(at.present(&settings()), None, "a link to the very file");
+        } else {
+            assert!(
+                !symlinks_required(),
+                "SAFECOPY_REQUIRE_SYMLINKS is set, but no file symbolic link can be made"
+            );
+            eprintln!("skipped: no symbolic link can be made here");
+        }
+    }
+}
+
+/// Makes `link` a junction to the folder `target`, with no other program
+/// run: a junction needs no privilege.
+#[cfg(windows)]
+fn junction(target: &std::path::Path, link: &std::path::Path) {
+    use ::windows::Win32::Foundation::HANDLE;
+    use ::windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    use ::windows::Win32::System::IO::DeviceIoControl;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    std::fs::create_dir(link).unwrap();
+    let folder = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+        .open(link)
+        .unwrap();
+    // The target as the system names it, then an empty name to show.
+    let name: Vec<u16> = std::ffi::OsStr::new(r"\??\")
+        .encode_wide()
+        .chain(target.as_os_str().encode_wide())
+        .collect();
+    let len = (name.len() * 2) as u16;
+    let mut buffer = Vec::new();
+    buffer.extend(IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+    for field in [len + 12, 0, 0, len, len + 2, 0] {
+        buffer.extend(field.to_le_bytes());
+    }
+    buffer.extend(name.iter().flat_map(|unit| unit.to_le_bytes()));
+    buffer.extend([0; 4]);
+    // SAFETY: the handle is open, and the buffer is whole for the length given.
+    unsafe {
+        DeviceIoControl(
+            HANDLE(folder.as_raw_handle()),
+            FSCTL_SET_REPARSE_POINT,
+            Some(buffer.as_ptr().cast()),
+            buffer.len() as u32,
+            None,
+            0,
+            None,
+            None,
+        )
+    }
+    .unwrap();
+}
+
+/// A record file with a second name is some other file as well: what a
+/// hold would write through its handle would land there.
+#[test]
+fn a_file_with_a_second_name_is_not_held_and_is_still_taken() {
+    let (_scratch, place, _) = scratch("hold-linked");
+    let (theirs, path) = (place.join("thesis.docx"), place.join("a.resume"));
+    std::fs::write(&theirs, b"theirs").unwrap();
+    std::fs::hard_link(&theirs, &path).unwrap();
+    let held = files::hold(&path).unwrap_err();
+    assert_eq!(held.kind(), io::ErrorKind::InvalidInput);
+    assert!(files::refused(&held) && !files::busy(&held));
+    // A cleanup still takes it, to remove the name alone.
+    let (file, bytes) = files::take(&path, 100).unwrap();
+    assert_eq!(bytes, b"theirs");
+    files::delete(&file, &path).unwrap();
+    drop(file);
+    assert!(!path.exists());
+    assert_eq!(std::fs::read(&theirs).unwrap(), b"theirs");
+    // With one name, it is held; a system's own error is no refusal.
+    std::fs::write(&path, b"one").unwrap();
+    assert!(files::hold(&path).is_ok());
+    let gone = files::hold(&place.join("none.resume")).unwrap_err();
+    assert!(!files::refused(&gone));
+}
+
+#[test]
+fn a_held_record_file_is_read_by_others_and_written_by_one() {
+    use std::io::{Read, Write};
+    let (_scratch, place, _) = scratch("hold");
+    let path = place.join("a.resume");
+    let mut made = files::create(&path).unwrap();
+    made.write_all(b"one").unwrap();
+    // A new file is read while its maker holds it, and held by no other.
+    let read = |path: &Path| {
+        let mut text = String::new();
+        files::open_read(path)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        text
+    };
+    assert_eq!(read(&path), "one");
+    assert!(files::busy(&files::hold(&path).unwrap_err()));
+    drop(made);
+    // So is one that was there and is held again.
+    let mut held = files::hold(&path).unwrap();
+    held.write_all(b"two").unwrap();
+    assert_eq!(read(&path), "two");
+    assert!(files::busy(&files::hold(&path).unwrap_err()));
+    assert!(files::busy(&files::take(&path, 16).unwrap_err()));
+    drop(held);
+    // Let go, it is another's to hold or to take.
+    drop(files::hold(&path).unwrap());
+    let (taken, bytes) = files::take(&path, 16).unwrap();
+    assert_eq!(bytes, b"two");
+    assert!(files::busy(&files::hold(&path).unwrap_err()));
+    files::delete(&taken, &path).unwrap();
+    assert!(
+        !files::busy(&files::hold(&path).unwrap_err()),
+        "gone, not held"
+    );
+}
+
+/// Where a file is removed by name while another has it open, a record
+/// removed between a hold's open and its lock is not held: the lock would
+/// be on a file no name reaches.
+#[cfg(unix)]
+#[test]
+fn a_record_file_removed_while_it_is_being_held_is_not_held() {
+    let (_scratch, place, _) = scratch("hold-removed");
+    let path = place.join("a.resume");
+    std::fs::write(&path, b"one").unwrap();
+    let gone = path.clone();
+    seams::HOLD_OPENED.set(Some(Box::new(move || {
+        std::fs::remove_file(&gone).unwrap();
+    })));
+    let held = files::hold(&path).unwrap_err();
+    assert_eq!(held.kind(), io::ErrorKind::NotFound);
+    // So is one whose name another file has taken since.
+    std::fs::write(&path, b"one").unwrap();
+    let (gone, other) = (path.clone(), place.join("b.resume"));
+    std::fs::write(&other, b"two").unwrap();
+    seams::HOLD_OPENED.set(Some(Box::new(move || {
+        std::fs::rename(&other, &gone).unwrap();
+    })));
+    let held = files::hold(&path).unwrap_err();
+    assert_eq!(held.kind(), io::ErrorKind::NotFound);
+    assert!(files::hold(&path).is_ok());
+}
+
+/// The names of a file are counted through its handle, after the open: a
+/// second name it is given between the two is seen, and it is not held.
+#[test]
+fn a_file_given_a_second_name_while_it_is_being_held_is_not_held() {
+    let (_scratch, place, _) = scratch("hold-linked-late");
+    let (path, other) = (place.join("a.resume"), place.join("notes.txt"));
+    std::fs::write(&path, b"one").unwrap();
+    let (from, to) = (path.clone(), other.clone());
+    seams::HOLD_OPENED.set(Some(Box::new(move || {
+        std::fs::hard_link(&from, &to).unwrap();
+    })));
+    let held = files::hold(&path).unwrap_err();
+    assert_eq!(held.kind(), io::ErrorKind::InvalidInput);
+    assert!(files::refused(&held) && !files::busy(&held));
+    assert_eq!(std::fs::read(&other).unwrap(), b"one");
+    // With the one name again, it is held.
+    std::fs::remove_file(&other).unwrap();
+    assert!(files::hold(&path).is_ok());
+}
+
 use std::fs::File;
 use std::process::Command;
 
@@ -1704,4 +2031,71 @@ mod windows {
         assert!(journal.partials().is_empty());
         root.discard(&file, OsStr::new("a.part")).unwrap();
     }
+}
+
+/// A record read from a disk may name any file of the person's: only a
+/// name that is a partial's is opened, measured or removed.
+#[test]
+fn a_recorded_name_that_is_not_a_partials_is_never_opened() {
+    let (_scratch, place, _) = scratch("not-partial");
+    let root = Directory::destination(&place).unwrap();
+    let bytes = [7u8; 64];
+    // The place of the file at `path`, recorded under `name`.
+    let recorded = |name: &str, path: &Path| {
+        let file = std::fs::File::open(path).unwrap();
+        PartialAt::of(&root, &root, &file, OsStr::new(name)).unwrap()
+    };
+    let plain = place.join("report.docx");
+    std::fs::write(&plain, bytes).unwrap();
+    let alone = place.join(".part");
+    std::fs::write(&alone, bytes).unwrap();
+    std::fs::create_dir(place.join("sub")).unwrap();
+    let below = place.join("sub").join("a.part");
+    std::fs::write(&below, bytes).unwrap();
+    // Windows reads it as a stream of the file; elsewhere it is a name.
+    let stream = if cfg!(windows) {
+        plain.clone()
+    } else {
+        let stream = place.join("report.docx:x.part");
+        std::fs::write(&stream, bytes).unwrap();
+        stream
+    };
+    let refused = [
+        recorded("report.docx", &plain),
+        recorded(".part", &alone),
+        recorded("report.docx:x.part", &stream),
+        recorded("sub/a.part", &below),
+        recorded(r"sub\a.part", &below),
+    ];
+    let s = settings();
+    for at in &refused {
+        assert!(!at.is_partial(&s), "{}", at.partial);
+        assert_eq!(at.try_reopen(&s).err(), Some(Left::Name), "{}", at.partial);
+        assert!(at.reopen(&s).is_none(), "{}", at.partial);
+        assert_eq!(at.present(&s), None, "{}", at.partial);
+        assert!(!at.remove(&s), "{}", at.partial);
+    }
+    for path in [&plain, &alone, &below, &stream] {
+        assert_eq!(std::fs::read(path).unwrap(), bytes, "as it was");
+    }
+
+    // The ending is a setting: each one's partials are the other's files.
+    let other = Settings {
+        partial_ending: ".tmp".to_string(),
+        ..settings()
+    };
+    let (part, tmp) = (place.join("a.bin.part"), place.join("a.bin.tmp"));
+    std::fs::write(&part, bytes).unwrap();
+    std::fs::write(&tmp, bytes).unwrap();
+    let (part, tmp) = (recorded("a.bin.part", &part), recorded("a.bin.tmp", &tmp));
+    assert!(part.is_partial(&s) && !part.is_partial(&other));
+    assert!(tmp.is_partial(&other) && !tmp.is_partial(&s));
+    assert_eq!(part.try_reopen(&other).err(), Some(Left::Name));
+    assert_eq!(part.present(&other), None);
+    assert_eq!(tmp.try_reopen(&s).err(), Some(Left::Name));
+    assert_eq!(tmp.present(&s), None);
+    assert_eq!(part.present(&s), Some(64));
+    assert_eq!(tmp.present(&other), Some(64));
+    assert!(part.try_reopen(&s).is_ok());
+    assert!(tmp.try_reopen(&other).is_ok());
 }

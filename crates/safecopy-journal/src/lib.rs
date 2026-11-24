@@ -6,7 +6,8 @@
 //! the transfer has done, in short segment files. From the moment each
 //! partial file is created, and before it gets a byte, the journal records
 //! the file's folder, its name, its own ID and the entry it is for, synced
-//! to the disk. For a transfer that goes by groups (`safecopy-manifest`'s
+//! to the disk. A partial kept from an earlier transfer and opened again
+//! to continue is recorded the same way, with the bytes it has. For a transfer that goes by groups (`safecopy-manifest`'s
 //! [`groups`](safecopy_manifest::groups)) it also records the groups it
 //! opens and the entries it settles, so its [`Progress`] stays bounded and
 //! can be read back after a crash ([`recover`]).
@@ -16,6 +17,34 @@
 //! renamed since, another file under the name, a folder or a disk that is
 //! gone, is left alone. A journal still held by a running transfer, in this
 //! process or another, is left alone too.
+//!
+//! # A partial kept to continue later
+//!
+//! A caller that keeps a partial file when its stream is cut
+//! (`safecopy-resume`'s records) calls nothing for it then: neither
+//! [`Journal::done`] nor [`Journal::ended`]. The journal goes on listing
+//! it, and is left on the disk when it is dropped. [`clean_up_keeping`]
+//! then leaves the partial while the caller's rule keeps it, and keeps the
+//! journal with it, so the cleanup after the rule lets go (the resume
+//! record expired, was torn or is gone) still knows the file and removes
+//! it, and the journal after it. A transfer that continues the partial in
+//! a later run lists it in that run's journal ([`Journal::started`] takes
+//! a file that has bytes); in the same run it is still listed, and needs
+//! no second call. Once the caller removes a kept partial itself, it calls
+//! [`Journal::ended`] if that journal still runs.
+//!
+//! Journals kept this way count toward [`Settings::keep_most`] and
+//! [`Settings::keep_for`] with the ones kept for a disk that is away, so
+//! both must fit what the caller keeps: at least as many journals as it
+//! keeps partials (each may be alone in its journal), for at least as long
+//! as it keeps one. A partial cut and continued in `n` runs is listed in
+//! `n` kept journals, one per run, so the bound is reached with fewer
+//! partials than it counts. Nothing is orphaned by that: the oldest
+//! journals go first, and the newest one that lists the file stays. The
+//! defaults fit `safecopy-resume`'s (256 files, 24
+//! hours) with as many journals again to spare. A journal past either
+//! bound is removed and its partials left: nothing is removed that a
+//! journal does not prove was written by it.
 //!
 //! # A folder renamed while its transfer runs
 //!
@@ -165,12 +194,20 @@ pub struct Settings {
     /// whose settling was lost: 10,000.
     pub list_most: usize,
     /// How long [`clean_up`] keeps a journal it could not finish (its
-    /// volume could not be opened, a partial could not be removed) for a
-    /// later cleanup, from the journal's last change. Older, it is removed
-    /// and its partials left. 30 days.
+    /// volume could not be opened, a partial could not be removed, a
+    /// partial the caller still keeps) for a later cleanup, from the
+    /// journal's last change. Older, it is removed and its partials left.
+    /// At least as long as the caller keeps a partial. 30 days.
     pub keep_for: Duration,
     /// The most journals [`clean_up`] keeps so; past it the oldest are
-    /// removed and their partials left. 64.
+    /// removed and their partials left. At least the most partials the
+    /// caller keeps, each of which may be alone in its journal, and more
+    /// where partials are continued often: each run that continues one
+    /// lists it in a journal of its own, and all of them are kept with
+    /// it. Past the bound the oldest go, never the newest that lists a
+    /// file. 512: the
+    /// 256 files a `safecopy-resume` store keeps, and as many journals
+    /// again waiting for a disk.
     pub keep_most: usize,
 }
 
@@ -186,7 +223,7 @@ impl Default for Settings {
             names: NameRules::default(),
             list_most: 10_000,
             keep_for: Duration::from_secs(30 * 24 * 60 * 60),
-            keep_most: 64,
+            keep_most: 512,
         }
     }
 }
@@ -292,7 +329,8 @@ impl Record {
 pub struct Start<'a> {
     /// The entry's place in its list.
     pub place: u32,
-    /// The partial file, just created, with no byte yet.
+    /// The partial file: just created, with no byte yet, or a kept one
+    /// opened again with the bytes it has.
     pub file: &'a File,
     /// The partial file's name.
     pub partial: &'a OsStr,
@@ -425,7 +463,10 @@ impl Journal {
     /// The partial file `file` was created as `partial` in `dir`, with no
     /// byte yet, for the entry at `place`, which is published as `name` and
     /// declared `size` bytes. Call it before writing to the file: one that
-    /// cannot be recorded is not, and the caller removes it. `dir` must be
+    /// cannot be recorded is not, and the caller removes it. A partial kept
+    /// from an earlier transfer and opened again is recorded the same way,
+    /// before it is appended to, with the bytes it has: this journal's
+    /// cleanup then knows it too. `dir` must be
     /// `root` or a folder opened below it by name; one renamed or moved
     /// since, and still below `root`, is recorded where it is now (see the
     /// [crate] docs).
@@ -450,8 +491,8 @@ impl Journal {
         )
     }
 
-    /// A bundle's partial files were created in `dir`, with no byte yet:
-    /// recorded in one append and one sync.
+    /// A bundle's partial files were created in `dir`, with no byte yet
+    /// (or kept ones opened again): recorded in one append and one sync.
     pub fn started_many(&self, dir: &Directory, starts: &[Start<'_>]) -> Result<(), JournalError> {
         let Some(open) = &self.inner else {
             return Ok(());
@@ -479,7 +520,9 @@ impl Journal {
     }
 
     /// The partial of the entry at `place` went without the entry being
-    /// settled: cut, to come again, or removed.
+    /// settled: removed, to come again from zero or not at all. Not for a
+    /// partial kept to continue later, which stays listed (see the [crate]
+    /// docs).
     pub fn ended(&self, place: u32) -> Result<(), JournalError> {
         let Some(open) = &self.inner else {
             return Ok(());
@@ -835,8 +878,8 @@ pub struct Cleaned {
     /// disk, on a volume that could not be opened, or kept by the caller.
     pub left: usize,
     /// Journals kept for a later cleanup: a volume that could not be
-    /// opened (a removable disk not plugged in), or a partial that could
-    /// not be removed and may yet be.
+    /// opened (a removable disk not plugged in), a partial that could
+    /// not be removed and may yet be, or a partial the caller keeps.
     pub kept: usize,
 }
 
@@ -862,11 +905,16 @@ struct Taken {
 /// each partial either lists is removed once, the second look counted as
 /// left. A journal of the whole-record format of before is read too.
 ///
-/// A journal is removed once each of its partials is removed, gone,
-/// replaced or kept. One whose volume could not be opened, or with a
-/// partial that failed otherwise, is kept for a later cleanup, at most for
-/// [`Settings::keep_for`] and [`Settings::keep_most`] journals: past
-/// either, the oldest is removed and its partials left.
+/// A journal is removed once each of its partials is removed, gone or
+/// replaced. One that lists a partial `keep` names is kept with it, so a
+/// later cleanup removes that partial once it is kept no more; so is one
+/// whose volume could not be opened, or with a partial that failed
+/// otherwise. A journal is kept at most for [`Settings::keep_for`], and
+/// [`Settings::keep_most`] journals are: past either, the oldest is
+/// removed and its partials left. A journal so lives as long as a partial
+/// it lists is kept: on Unix, where an inode is reused once its file is
+/// deleted, that is as long as it can meet a new partial of the same name
+/// and inode in the same folder, and take it for the one it lists.
 ///
 /// A journal still open in a running transfer, in this process or another,
 /// is left alone; so is one that cannot be opened, and a link or other
@@ -968,6 +1016,8 @@ pub fn clean_up_keeping(
                     continue;
                 };
                 if keep(&at) {
+                    // The journal stays to remove it once it is kept no more.
+                    again = true;
                     cleaned.left += 1;
                     continue;
                 }
@@ -1184,8 +1234,6 @@ fn removable(name: &str, settings: &Settings) -> bool {
 
 /// Switches tests use to act out a failing disk or a crash.
 #[cfg(test)]
-// Android's emulated thread locals make Clippy ask for the `const` already there.
-#[allow(clippy::missing_const_for_thread_local)]
 pub(crate) mod seams {
     use std::cell::Cell;
 
@@ -1200,29 +1248,43 @@ pub(crate) mod seams {
         BeforeOldDeleted,
     }
 
+    /// A seam as it stands until a test sets it. Not a `const` initialiser:
+    /// where thread locals are emulated (Android), Clippy asks for the
+    /// `const` that is already there.
+    fn unset<T: Default>() -> T {
+        T::default()
+    }
+
     thread_local! {
         /// How many of this thread's next appends fail halfway.
-        pub static FAIL_WRITES: Cell<u32> = const { Cell::new(0) };
+        pub static FAIL_WRITES: Cell<u32> = unset();
         /// No recorded volume opens on this thread: a disk unplugged.
-        pub static NO_VOLUME: Cell<bool> = const { Cell::new(false) };
+        pub static NO_VOLUME: Cell<bool> = unset();
         /// How many syncs this thread made.
-        pub static SYNCS: Cell<u32> = const { Cell::new(0) };
+        pub static SYNCS: Cell<u32> = unset();
         /// How many folder syncs this thread made.
-        pub static DIR_SYNCS: Cell<u32> = const { Cell::new(0) };
+        pub static DIR_SYNCS: Cell<u32> = unset();
         /// The journal's root acted out as on another volume (Windows).
-        pub static OTHER_VOLUME: Cell<bool> = const { Cell::new(false) };
+        pub static OTHER_VOLUME: Cell<bool> = unset();
         /// The next segment of this thread's journal fails to begin, once.
-        pub static FAIL_ROLL: Cell<bool> = const { Cell::new(false) };
+        pub static FAIL_ROLL: Cell<bool> = unset();
         /// A crash to act out at the next segment.
-        pub static CRASH: Cell<Option<Crash>> = const { Cell::new(None) };
+        pub static CRASH: Cell<Option<Crash>> = unset();
         /// How this thread reads a held folder's present place.
-        pub static PLACE: Cell<Place> = const { Cell::new(Place::Read) };
+        pub static PLACE: Cell<Place> = unset();
+    }
+
+    thread_local! {
+        /// Run once, when this thread's next `files::hold` has opened its
+        /// file and not yet locked it.
+        pub static HOLD_OPENED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = unset();
     }
 
     /// A reading of a held folder's present place, acted out.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
     pub enum Place {
         /// As the system reads it.
+        #[default]
         Read,
         /// The system reads it and this reading fails.
         Fails,

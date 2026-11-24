@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 
-use safecopy_chunks::{CHUNK, Hasher, hash_prefix};
+use safecopy_chunks::{CHUNK, Hasher, Settings};
 use safecopy_folder::{FileId, Time, identity};
 
 use crate::{Held, PeerId, Receiving, Resumable, ResumeError, Sending, TransferKey};
@@ -235,43 +235,56 @@ fn blocking(file: &File) {
 /// the recorded one (identity, size, modified time), `have` at most its
 /// size and a whole number of chunks, and its own first `have` bytes must
 /// hash to `prefix`, from `hasher` when it still keeps that boundary or
-/// read again from the file.
+/// read again from the file, once.
+///
+/// With [`Next::Continue`] comes the hasher that check used, standing at
+/// `have`: the sender goes on from it (`safecopy_chunks::copy_exact`) and
+/// does not read the prefix again. It is `hasher` rewound, or one read
+/// from the file, made as `settings` makes a sender's. `None` with any
+/// other answer.
 pub async fn sender_checks(
     record: Option<&Sending>,
     source: Option<&Source>,
     held: &Held,
     hasher: Option<&Hasher>,
-) -> Result<Next, ResumeError> {
+    settings: &Settings,
+) -> Result<(Next, Option<Hasher>), ResumeError> {
     let Some(record) = record.filter(|r| r.key == held.key) else {
-        return Ok(Next::Dropped);
+        return Ok((Next::Dropped, None));
     };
     let Some(source) = source else {
-        return Ok(Next::Changed);
+        return Ok((Next::Changed, None));
     };
     if source.id != record.file || source.size != record.size || source.modified != record.modified
     {
-        return Ok(Next::Changed);
+        return Ok((Next::Changed, None));
     }
     if held.have > source.size || !on_chunk(held.have) {
-        return Ok(Next::Restart);
+        return Ok((Next::Restart, None));
     }
-    let ours = match hasher.and_then(|h| h.at(held.have)) {
-        Some(digest) => digest,
+    let ours = match hasher.and_then(|h| h.rewound(held.have)) {
+        Some(rewound) => rewound,
         None => {
             let mut file = source.file.try_clone()?;
             file.seek(SeekFrom::Start(0))?;
             let mut file = tokio::fs::File::from_std(file);
-            match hash_prefix(&mut file, held.have).await {
-                Ok(digest) => digest,
+            #[cfg(test)]
+            crate::tests::seams::PREFIX_BYTES
+                .set(crate::tests::seams::PREFIX_BYTES.get() + held.have);
+            let mut read = settings.sending();
+            match read.read(&mut file, held.have).await {
+                Ok(()) => read,
                 // Shorter than recorded now: changed under us.
-                Err(safecopy_chunks::ChunkError::CutShort { .. }) => return Ok(Next::Changed),
+                Err(safecopy_chunks::ChunkError::CutShort { .. }) => {
+                    return Ok((Next::Changed, None));
+                }
                 Err(e) => return Err(e.into()),
             }
         }
     };
-    Ok(if ours == held.prefix {
-        Next::Continue { from: held.have }
+    Ok(if ours.clone().finish() == held.prefix {
+        (Next::Continue { from: held.have }, Some(ours))
     } else {
-        Next::Restart
+        (Next::Restart, None)
     })
 }
