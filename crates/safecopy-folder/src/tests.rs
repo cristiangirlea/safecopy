@@ -2009,3 +2009,553 @@ fn reopen_opens_only_a_regular_file_already_there_and_never_a_link() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Rules that ask for the published file held open.
+fn holding() -> PublishRules {
+    PublishRules {
+        hold: true,
+        ..PublishRules::default()
+    }
+}
+
+/// A file published as `a.txt` by `route` in a new folder, held open as
+/// the publish gives it; the caller's own handle is closed.
+async fn published_by(route: Route, folder: &str) -> (PathBuf, Directory, Held) {
+    let to = temp(&format!("{folder}-{route:?}"));
+    let dir = Directory::open(&to).unwrap();
+    let file = partial(&dir, "a.txt.part", b"published");
+    route.set(true);
+    let saved = dir
+        .publish(
+            &file,
+            os("a.txt.part"),
+            "a.txt",
+            &holding(),
+            std::future::pending(),
+        )
+        .await;
+    route.set(false);
+    let saved = saved.unwrap();
+    assert_eq!(saved.path, to.join("a.txt"));
+    drop(file);
+    assert_eq!(files_in(&to), ["a.txt"]);
+    (to, dir, saved.held.unwrap())
+}
+
+/// Renames the published file to `moved.txt`. On Windows no one but its
+/// own handle can: held, it is open without delete sharing.
+fn rename_published(dir: &Directory, to: &Path, held: &Held) {
+    #[cfg(unix)]
+    {
+        let _ = (dir, held);
+        std::fs::rename(to.join("a.txt"), to.join("moved.txt")).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        assert!(std::fs::rename(to.join("a.txt"), to.join("moved.txt")).is_err());
+        win::finish(dir.handle(), held.file(), os("a.txt"), os("moved.txt")).unwrap();
+    }
+}
+
+/// However a file got its name (linked or renamed, where the published
+/// file is the one written; copied, where it is a new file), the publish
+/// holds it, and taking it back removes it.
+#[tokio::test]
+async fn a_published_file_is_taken_back_however_it_was_published() {
+    for route in ROUTES {
+        let (to, dir, held) = published_by(route, "take-back").await;
+        assert_eq!(held.name(), os("a.txt"));
+        // The held file is the one under the name, copied or not.
+        let named = dir.entry(os("a.txt")).unwrap();
+        assert_eq!(
+            identity(held.file()).unwrap(),
+            identity(&named).unwrap(),
+            "{route:?}"
+        );
+        drop(named);
+        dir.take_back(held).unwrap();
+        assert!(files_in(&to).is_empty(), "{route:?}");
+        drop(dir);
+        std::fs::remove_dir_all(to).unwrap();
+    }
+}
+
+/// Taken back while the caller still has the file open: the name goes all
+/// the same (at once here; on a disk that removes a name with its file's
+/// last handle, when the caller closes it).
+#[tokio::test]
+async fn a_published_file_is_taken_back_while_the_caller_still_holds_it() {
+    for route in ROUTES {
+        let to = temp(&format!("take-back-open-{route:?}"));
+        let dir = Directory::open(&to).unwrap();
+        let file = partial(&dir, "a.txt.part", b"published");
+        route.set(true);
+        let saved = dir
+            .publish(
+                &file,
+                os("a.txt.part"),
+                "a.txt",
+                &holding(),
+                std::future::pending(),
+            )
+            .await;
+        route.set(false);
+        dir.take_back(saved.unwrap().held.unwrap()).unwrap();
+        drop(file);
+        assert!(files_in(&to).is_empty(), "{route:?}");
+        drop(dir);
+        std::fs::remove_dir_all(to).unwrap();
+    }
+}
+
+/// The published file was deleted and another file made under its name.
+/// A number kept from the publish could be the newcomer's too (Unix gives
+/// a removed file's inode to the next one made); the held file cannot be:
+/// the newcomer is left.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_file_made_under_the_name_of_a_deleted_published_file_is_left() {
+    for route in ROUTES {
+        let (to, dir, held) = published_by(route, "take-back-deleted").await;
+        std::fs::remove_file(to.join("a.txt")).unwrap();
+        std::fs::write(to.join("a.txt"), b"newcomer").unwrap();
+        let replaced = dir.take_back(held).unwrap_err();
+        assert_eq!(refusal(&replaced), Some(Refusal::Replaced), "{route:?}");
+        assert_eq!(files_in(&to), ["a.txt"]);
+        assert_eq!(std::fs::read(to.join("a.txt")).unwrap(), b"newcomer");
+        drop(dir);
+        std::fs::remove_dir_all(to).unwrap();
+    }
+}
+
+/// On Windows a file written through this crate's own handle is open
+/// without delete sharing, and held it stays so: no one else can delete
+/// it, so no file can be made under its name. A caller's file opened
+/// sharing delete can be: deleted by another handle while held, with a
+/// newcomer under its name, the newcomer is left.
+#[cfg(windows)]
+#[tokio::test]
+async fn on_windows_a_file_made_under_the_name_of_a_deleted_published_file_is_left() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+    let to = temp("take-back-deleted");
+    let dir = Directory::open(&to).unwrap();
+    // As std opens a file: sharing delete.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .access_mode((FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE).0)
+        .create_new(true)
+        .open(to.join("a.txt.part"))
+        .unwrap();
+    file.write_all(b"published").unwrap();
+    let saved = dir
+        .publish(
+            &file,
+            os("a.txt.part"),
+            "a.txt",
+            &holding(),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    drop(file);
+    let other = dir.open_for_delete(os("a.txt")).unwrap();
+    delete_by_handle(&other).unwrap();
+    drop(other);
+    std::fs::write(to.join("a.txt"), b"newcomer").unwrap();
+    let replaced = dir.take_back(saved.held.unwrap()).unwrap_err();
+    assert_eq!(refusal(&replaced), Some(Refusal::Replaced));
+    assert_eq!(files_in(&to), ["a.txt"]);
+    assert_eq!(std::fs::read(to.join("a.txt")).unwrap(), b"newcomer");
+    drop(dir);
+    std::fs::remove_dir_all(to).unwrap();
+}
+
+/// On Windows a published file held open stays as it was while it was
+/// written: no one else deletes or renames it, by any route, so the name
+/// cannot come to hold another file; taken back, it goes.
+#[cfg(windows)]
+#[tokio::test]
+async fn on_windows_a_held_published_file_is_not_another_s_to_delete_or_rename() {
+    for route in ROUTES {
+        let (to, dir, held) = published_by(route, "held-locked").await;
+        assert!(std::fs::remove_file(to.join("a.txt")).is_err(), "{route:?}");
+        assert!(dir.remove(os("a.txt")).is_err(), "{route:?}");
+        assert!(std::fs::rename(to.join("a.txt"), to.join("b.txt")).is_err());
+        assert_eq!(files_in(&to), ["a.txt"]);
+        dir.take_back(held).unwrap();
+        assert!(files_in(&to).is_empty(), "{route:?}");
+        drop(dir);
+        std::fs::remove_dir_all(to).unwrap();
+    }
+}
+
+/// The published file was renamed away and another put under its name:
+/// both are left.
+#[tokio::test]
+async fn a_file_put_under_the_name_of_a_renamed_published_file_is_left() {
+    for route in ROUTES {
+        let (to, dir, held) = published_by(route, "take-back-swapped").await;
+        rename_published(&dir, &to, &held);
+        std::fs::write(to.join("a.txt"), b"newcomer").unwrap();
+        let replaced = dir.take_back(held).unwrap_err();
+        assert_eq!(refusal(&replaced), Some(Refusal::Replaced), "{route:?}");
+        assert_eq!(files_in(&to), ["a.txt", "moved.txt"]);
+        assert_eq!(std::fs::read(to.join("a.txt")).unwrap(), b"newcomer");
+        assert_eq!(std::fs::read(to.join("moved.txt")).unwrap(), b"published");
+        drop(dir);
+        std::fs::remove_dir_all(to).unwrap();
+    }
+}
+
+/// A published file that was renamed is not followed to its new name:
+/// the name is free, the call says so, and the renamed file stays.
+#[tokio::test]
+async fn a_renamed_published_file_is_not_taken_back_under_its_new_name() {
+    for route in ROUTES {
+        let (to, dir, held) = published_by(route, "take-back-renamed").await;
+        rename_published(&dir, &to, &held);
+        let gone = dir.take_back(held).unwrap_err();
+        assert_eq!(gone.kind(), io::ErrorKind::NotFound, "{route:?}");
+        assert_eq!(refusal(&gone), None);
+        assert_eq!(files_in(&to), ["moved.txt"]);
+        assert_eq!(std::fs::read(to.join("moved.txt")).unwrap(), b"published");
+        drop(dir);
+        std::fs::remove_dir_all(to).unwrap();
+    }
+}
+
+/// A link put under the name of a renamed published file is never
+/// followed to it: the link and the file both stay.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_link_under_the_name_of_a_published_file_is_not_followed() {
+    for route in ROUTES {
+        let (to, dir, held) = published_by(route, "take-back-link").await;
+        rename_published(&dir, &to, &held);
+        std::os::unix::fs::symlink("moved.txt", to.join("a.txt")).unwrap();
+        let replaced = dir.take_back(held).unwrap_err();
+        assert_eq!(refusal(&replaced), Some(Refusal::Replaced), "{route:?}");
+        assert_eq!(files_in(&to), ["a.txt", "moved.txt"]);
+        assert!(to.join("a.txt").is_symlink());
+        drop(dir);
+        std::fs::remove_dir_all(to).unwrap();
+    }
+}
+
+/// A volume whose file IDs tell no two files apart (FAT and exFAT make
+/// them from a file's place in its folder), acted out by giving every
+/// file the same ID: the published file is still proven by its handle,
+/// which is taken back, and a file under its name is still left.
+#[cfg(windows)]
+#[tokio::test]
+async fn on_a_volume_with_weak_file_ids_the_held_file_is_still_proven() {
+    use crate::seams::WEAK_IDS;
+    for route in ROUTES {
+        let (to, dir, held) = published_by(route, "take-back-weak").await;
+        WEAK_IDS.set(true);
+        let other = dir.entry(os("a.txt")).unwrap();
+        assert_eq!(identity(&other).unwrap(), dir.identity().unwrap());
+        drop(other);
+        let taken = dir.take_back(held);
+        WEAK_IDS.set(false);
+        taken.unwrap();
+        assert!(files_in(&to).is_empty(), "{route:?}");
+        drop(dir);
+        std::fs::remove_dir_all(to).unwrap();
+
+        let (to, dir, held) = published_by(route, "take-back-weak-swapped").await;
+        rename_published(&dir, &to, &held);
+        std::fs::write(to.join("a.txt"), b"newcomer").unwrap();
+        WEAK_IDS.set(true);
+        let replaced = dir.take_back(held);
+        WEAK_IDS.set(false);
+        assert_eq!(refusal(&replaced.unwrap_err()), Some(Refusal::Replaced));
+        assert_eq!(files_in(&to), ["a.txt", "moved.txt"]);
+        assert_eq!(std::fs::read(to.join("a.txt")).unwrap(), b"newcomer");
+        drop(dir);
+        std::fs::remove_dir_all(to).unwrap();
+    }
+}
+
+/// Where the system cannot say where the held file is now, nothing proves
+/// its name is still it: the take-back refuses and removes nothing.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_held_file_whose_place_cannot_be_read_is_not_taken_back() {
+    use crate::seams::NO_PLACE;
+    for route in ROUTES {
+        let (to, dir, held) = published_by(route, "take-back-unproven").await;
+        NO_PLACE.set(true);
+        let unproven = dir.take_back(held);
+        NO_PLACE.set(false);
+        assert_eq!(refusal(&unproven.unwrap_err()), Some(Refusal::Unproven));
+        assert_eq!(std::fs::read(to.join("a.txt")).unwrap(), b"published");
+        drop(dir);
+        std::fs::remove_dir_all(to).unwrap();
+    }
+}
+
+/// How many descriptors of this process are open on the file at `path`.
+#[cfg(unix)]
+fn descriptors_on(path: &Path) -> usize {
+    use std::os::fd::AsRawFd;
+    let stat = |fd| {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `stat` is written before it is read; a number that is
+        // not open only fails the call.
+        (unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == 0).then(|| unsafe { stat.assume_init() })
+    };
+    // Closed again before the count.
+    let meant = stat(File::open(path).unwrap().as_raw_fd()).unwrap();
+    (0..4096)
+        .filter_map(stat)
+        .filter(|open| open.st_dev == meant.st_dev && open.st_ino == meant.st_ino)
+        .count()
+}
+
+/// A publish whose result is dropped removes nothing and leaves no handle
+/// of the file open: on Windows the folder cannot be renamed while the
+/// file is held, and can be once it is dropped.
+#[tokio::test]
+async fn a_published_file_dropped_untaken_stays_and_leaves_no_handle() {
+    for route in ROUTES {
+        let (to, dir, held) = published_by(route, "published-dropped").await;
+        let moved = to.with_file_name(format!("published-moved-{route:?}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&moved);
+        #[cfg(unix)]
+        assert_eq!(descriptors_on(&to.join("a.txt")), 1, "{route:?}");
+        #[cfg(windows)]
+        assert!(std::fs::rename(&to, &moved).is_err(), "{route:?}");
+        drop(held);
+        assert_eq!(std::fs::read(to.join("a.txt")).unwrap(), b"published");
+        #[cfg(unix)]
+        assert_eq!(descriptors_on(&to.join("a.txt")), 0, "{route:?}");
+        // The held folder itself is open with delete sharing, and stays open.
+        std::fs::rename(&to, &moved).unwrap();
+        assert_eq!(files_in(&moved), ["a.txt"]);
+        // No handle of the publish is left on the file: one without
+        // delete sharing would refuse this.
+        #[cfg(windows)]
+        drop(dir.open_for_delete(os("a.txt")).unwrap());
+        drop(dir);
+        std::fs::remove_dir_all(moved).unwrap();
+    }
+}
+
+/// By path a closed file is published and nothing is held: there is no
+/// proof to take it back with.
+#[tokio::test]
+async fn by_path_a_publish_holds_no_file() {
+    let to = temp("by-path-holds-nothing");
+    std::fs::write(to.join("a.txt.part"), b"published").unwrap();
+    let saved = publish_path(
+        &to.join("a.txt.part"),
+        &to.join("a.txt"),
+        &to,
+        "a.txt",
+        &PublishRules::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.path, to.join("a.txt"));
+    assert!(saved.held.is_none());
+    std::fs::remove_dir_all(to).unwrap();
+}
+
+/// Unless the rules ask, a publish holds nothing, by any route: the file
+/// is as free as it was before there was anything to hold.
+#[tokio::test]
+async fn nothing_is_held_unless_asked() {
+    for route in ROUTES {
+        let to = temp(&format!("not-held-{route:?}"));
+        let dir = Directory::open(&to).unwrap();
+        let file = partial(&dir, "a.txt.part", b"published");
+        route.set(true);
+        let saved = dir
+            .publish(
+                &file,
+                os("a.txt.part"),
+                "a.txt",
+                &PublishRules::default(),
+                std::future::pending(),
+            )
+            .await;
+        route.set(false);
+        let saved = saved.unwrap();
+        drop(file);
+        assert!(saved.held.is_none(), "{route:?}");
+        #[cfg(unix)]
+        assert_eq!(descriptors_on(&saved.path), 0, "{route:?}");
+        // Windows removes a file only when no handle without delete sharing is on it.
+        std::fs::remove_file(&saved.path).unwrap();
+        drop(dir);
+        std::fs::remove_dir_all(to).unwrap();
+    }
+}
+
+/// A `Held` is taken back only by the folder it was published in. Given
+/// to another folder that has a second name of the same file, under the
+/// same name, nothing is removed there.
+#[tokio::test]
+async fn a_held_file_is_not_taken_back_from_another_folder() {
+    for route in ROUTES {
+        let (to, dir, held) = published_by(route, "take-back-other-folder").await;
+        std::fs::create_dir(to.join("sub")).unwrap();
+        let other = Directory::open(&to.join("sub")).unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::hard_link(to.join("a.txt"), to.join("sub/a.txt")).unwrap();
+            let refused = other.take_back(held).unwrap_err();
+            assert_eq!(refusal(&refused), Some(Refusal::OtherFolder), "{route:?}");
+            assert_eq!(files_in(&to.join("sub")), ["a.txt"]);
+        }
+        #[cfg(windows)]
+        {
+            // The name is free there.
+            let free = other.take_back(held).unwrap_err();
+            assert_eq!(free.kind(), io::ErrorKind::NotFound, "{route:?}");
+        }
+        assert_eq!(std::fs::read(to.join("a.txt")).unwrap(), b"published");
+        drop((dir, other));
+        std::fs::remove_dir_all(to).unwrap();
+    }
+}
+
+/// A junction put under the name of a renamed published file is never
+/// opened through: it and the file both stay.
+#[cfg(windows)]
+#[tokio::test]
+async fn on_windows_a_junction_under_the_name_of_a_published_file_is_not_followed() {
+    let outside = temp("take-back-junction-outside");
+    std::fs::write(outside.join("b.txt"), b"outside").unwrap();
+    let (to, dir, held) = published_by(Route::Native, "take-back-junction").await;
+    rename_published(&dir, &to, &held);
+    if link_folder(&outside, &to.join("a.txt")) {
+        let replaced = dir.take_back(held).unwrap_err();
+        assert_eq!(refusal(&replaced), Some(Refusal::Replaced));
+        assert_eq!(files_in(&to), ["a.txt", "moved.txt"]);
+        assert_eq!(files_in(&outside), ["b.txt"]);
+        remove_link(&to.join("a.txt"));
+    } else {
+        no_link_here(junctions_required(), "a junction under a published name");
+    }
+    drop(dir);
+    for path in [to, outside] {
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+/// A publish that asked to hold the file and did not publish it (a
+/// cancel, every name taken, a copy that could not be held) leaves no
+/// handle but the caller's on the file, and no copy.
+#[tokio::test]
+async fn a_publish_that_fails_holds_nothing() {
+    use crate::seams::NO_COPY_HANDLE;
+    for route in ROUTES {
+        let to = temp(&format!("hold-failed-{route:?}"));
+        let dir = Directory::open(&to).unwrap();
+        let file = partial(&dir, "a.txt.part", b"published");
+        let publish = |rules: PublishRules, cancelled: bool| {
+            let (dir, file) = (&dir, &file);
+            async move {
+                route.set(true);
+                let cancel = async move {
+                    if !cancelled {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                let saved = dir
+                    .publish(file, os("a.txt.part"), "a.txt", &rules, cancel)
+                    .await;
+                route.set(false);
+                saved.unwrap_err()
+            }
+        };
+        let cancelled = publish(holding(), true).await;
+        assert!(matches!(cancelled, PublishError::Cancelled), "{route:?}");
+        let none = PublishRules {
+            name_tries: 0,
+            ..holding()
+        };
+        let no_name = publish(none, false).await;
+        assert!(matches!(no_name, PublishError::NoNameLeft { tried: 0 }));
+        if matches!(route, Route::Copy) {
+            // The copy was made, could not be held, and is removed.
+            NO_COPY_HANDLE.set(true);
+            let unheld = publish(holding(), false).await;
+            assert!(!NO_COPY_HANDLE.get());
+            assert!(
+                matches!(&unheld, PublishError::Name { path, .. } if *path == to.join("a.txt")),
+                "{unheld:?}"
+            );
+        }
+        assert_eq!(files_in(&to), ["a.txt.part"], "{route:?}");
+        #[cfg(unix)]
+        assert_eq!(descriptors_on(&to.join("a.txt.part")), 1, "{route:?}");
+        // On Windows a second handle left open would keep the name in the folder.
+        dir.discard(&file, os("a.txt.part")).unwrap();
+        drop(file);
+        assert!(files_in(&to).is_empty(), "{route:?}");
+        drop(dir);
+        std::fs::remove_dir_all(to).unwrap();
+    }
+}
+
+/// Linux links the name even when another file took the partial's name:
+/// the held file is the one published, and taking it back leaves the
+/// other.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn a_publish_past_a_swapped_partial_holds_the_published_file() {
+    let to = temp("hold-swapped-partial");
+    let dir = Directory::open(&to).unwrap();
+    let file = partial(&dir, "a.txt.part", b"published");
+    std::fs::rename(to.join("a.txt.part"), to.join("moved")).unwrap();
+    std::fs::write(to.join("a.txt.part"), b"theirs").unwrap();
+    let saved = dir
+        .publish(
+            &file,
+            os("a.txt.part"),
+            "a.txt",
+            &holding(),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    drop(file);
+    assert_eq!(std::fs::read(&saved.path).unwrap(), b"published");
+    dir.take_back(saved.held.unwrap()).unwrap();
+    assert_eq!(files_in(&to), ["a.txt.part", "moved"]);
+    assert_eq!(std::fs::read(to.join("a.txt.part")).unwrap(), b"theirs");
+    drop(dir);
+    std::fs::remove_dir_all(to).unwrap();
+}
+
+/// Where Linux linked the name and could not remove the partial, taking
+/// the file back removes the published name only: the partial, a second
+/// name of the file, is still the caller's.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn taking_back_leaves_a_partial_the_publish_could_not_remove() {
+    let to = temp("hold-partial-left");
+    let dir = Directory::open(&to).unwrap();
+    let file = partial(&dir, "a.txt.part", b"published");
+    crate::seams::REMOVE_ERRORS.with_borrow_mut(|e| e.push_back(libc::EIO));
+    let saved = dir
+        .publish(
+            &file,
+            os("a.txt.part"),
+            "a.txt",
+            &holding(),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(files_in(&to), ["a.txt", "a.txt.part"]);
+    dir.take_back(saved.held.unwrap()).unwrap();
+    assert_eq!(files_in(&to), ["a.txt.part"]);
+    dir.discard(&file, os("a.txt.part")).unwrap();
+    drop((file, dir));
+    std::fs::remove_dir_all(to).unwrap();
+}

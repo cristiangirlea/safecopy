@@ -479,3 +479,32 @@ pub fn discard(parent: &File, file: &File, name: &OsStr) -> io::Result<()> {
     }
     remove(parent, name)
 }
+
+/// The published file `file` removed from `name`, only while the name is
+/// still that file: `file` is open, so no other file has its inode.
+pub fn take_back(
+    parent: &File,
+    folder: Option<&File>,
+    file: &File,
+    name: &OsStr,
+) -> io::Result<()> {
+    // Both folders are open, so neither number can be another folder's:
+    // a second name of the file in some other folder is not the one published.
+    let published_here = match folder {
+        Some(folder) => {
+            let (here, there) = (parent.metadata()?, folder.metadata()?);
+            here.dev() == there.dev() && here.ino() == there.ino()
+        }
+        None => false,
+    };
+    if !published_here {
+        return Err(refused(Refusal::OtherFolder));
+    }
+    discard(parent, file, name)
+}
+
+/// The folder a held file was published in, held too: [`take_back`]
+/// knows it again by it.
+pub fn hold_folder(parent: &File) -> io::Result<Option<File>> {
+    parent.try_clone().map(Some)
+}

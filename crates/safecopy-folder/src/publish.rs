@@ -1,6 +1,6 @@
 //! Giving a finished file its name without replacing anything.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
 use std::io;
@@ -30,6 +30,11 @@ pub struct PublishRules {
     /// publish fails with [`PublishError::NoNameLeft`].
     /// [`NAME_TRIES`](crate::NAME_TRIES) by default.
     pub name_tries: usize,
+    /// Give the published file back held open ([`Published::held`]), so
+    /// it can be taken back with proof ([`Directory::take_back`]). Off by
+    /// default: an open file has a cost, on Windows a high one (see
+    /// [`Held`]), and only a caller that may take the file back pays it.
+    pub hold: bool,
 }
 
 impl Default for PublishRules {
@@ -39,6 +44,7 @@ impl Default for PublishRules {
             retries: 5,
             retry_wait: Duration::from_millis(50),
             name_tries: crate::NAME_TRIES,
+            hold: false,
         }
     }
 }
@@ -214,8 +220,17 @@ impl<'a> Claim<'a> {
         })
     }
 
-    fn keep(mut self) {
+    /// Keeps the copy, and with `hold` gives it held open: the publish
+    /// stands.
+    fn keep(mut self, hold: bool) -> io::Result<Option<File>> {
+        // A copy that cannot be held is removed as any other that failed.
+        #[cfg(test)]
+        if hold && crate::seams::NO_COPY_HANDLE.replace(false) {
+            return Err(io::ErrorKind::Other.into());
+        }
+        let held = hold.then(|| self.file.try_clone()).transpose()?;
         self.kept = true;
+        Ok(held)
     }
 }
 
@@ -250,13 +265,82 @@ pub enum Marked {
 }
 
 /// A file published.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
+#[non_exhaustive]
 pub struct Published {
     /// Where it is: the name asked for, or a numbered one when that was
     /// taken.
     pub path: PathBuf,
     /// Whether it was marked as downloaded.
     pub marked: Marked,
+    /// The published file itself, held open, for [`Directory::take_back`]:
+    /// the file the caller wrote where it was linked or renamed, the new
+    /// file where it was copied. Only when [`PublishRules::hold`] asked
+    /// for it; and always `None` from [`publish_path`], which publishes a
+    /// closed file by path and holds nothing.
+    ///
+    /// Drop it, or this whole value, as soon as the file is no longer to
+    /// be taken back: see [`Held`] for what it costs while it is open.
+    pub held: Option<Held>,
+}
+
+/// A published file held open: the proof of which file was published.
+///
+/// A number that names a file (an inode, a Windows file ID) proves
+/// nothing once the file is gone: Unix gives a removed file's inode to
+/// the next file made, and a FAT or exFAT volume makes its numbers from
+/// where a file's entry sits in its folder, so a new file under the name
+/// of one just deleted usually has the number of the old one. An open
+/// handle is the file itself on every system, so this holds one:
+///
+/// - **Unix:** the file's inode cannot be given to another file while
+///   this is open, so the name's device and inode compared with this
+///   handle's ([`Directory::take_back`]) say whether the name is still
+///   this file. That is as good as the file system's inode numbers: one
+///   that gives two files there at once the same number (some FUSE and
+///   network file systems) cannot be told apart by anything this crate
+///   can read. Holding it costs one descriptor, and a file removed
+///   meanwhile keeps its space on the disk until this is dropped.
+/// - **Windows:** this is a second handle of the very one the file was
+///   written through, with its rights and its sharing; no file ID is
+///   read, on NTFS, ReFS, FAT or exFAT alike. Holding it costs more:
+///   the folder the file is in, and every folder above it, cannot be
+///   renamed or moved while any file below is open, and the file stays
+///   as it was while it was written. Written through
+///   [`Directory::create`] or [`Directory::reopen`], or copied into its
+///   name, that is without delete sharing: no one else can rename or
+///   delete it, and a program that opens it must share writing and
+///   deleting, which many do not. A file the caller opened some other
+///   way keeps the sharing the caller gave it.
+///
+/// So hold it only while the file may still be taken back (a cancel that
+/// arrives as the publish ends), and drop it then. Dropped, nothing is
+/// removed.
+#[derive(Debug)]
+pub struct Held {
+    file: File,
+    name: OsString,
+    /// The folder it was published in, where the system needs it held
+    /// to know that folder again (Unix).
+    folder: Option<File>,
+}
+
+impl Held {
+    /// The open file. Where the file was linked or renamed into its name
+    /// this is a second handle of the one it was written through, and
+    /// shares its position.
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
+    /// The name it was published under, in its folder.
+    pub fn name(&self) -> &OsStr {
+        &self.name
+    }
+
+    pub(crate) fn into_parts(self) -> (File, OsString, Option<File>) {
+        (self.file, self.name, self.folder)
+    }
 }
 
 /// Why [`Directory::publish`] or [`publish_path`] did not publish.
@@ -267,7 +351,8 @@ pub enum PublishError {
     /// partial file is still there for the caller to discard.
     Cancelled,
     /// The system refused before any name was tried: the file's time or
-    /// execute bit could not be set.
+    /// execute bit could not be set, or no second handle of the file
+    /// could be opened to hold it by ([`PublishRules::hold`]).
     Io(io::Error),
     /// The system refused while the file was being given a name.
     Name {
@@ -451,6 +536,11 @@ impl Directory {
     /// refused), the file is published and `partial` is left behind, a
     /// second name of the same file, for the caller's crash cleanup (the
     /// journal) to remove.
+    ///
+    /// With [`PublishRules::hold`] the published file comes back held
+    /// open ([`Published::held`]), however it got its name, so
+    /// [`Self::take_back`] can remove it and no other. Drop it when the
+    /// publish stands: see [`Held`].
     pub async fn publish(
         &self,
         file: &File,
@@ -511,6 +601,14 @@ impl Directory {
         };
         // After the mark: writing it changes the time on Windows.
         let mut applied = self.apply(file, meta, meta_rules)?;
+        // Before any name: a file that has its name is published, and
+        // must not fail for a handle then. Linked or renamed, the
+        // published file is this one.
+        let own = if rules.hold {
+            Some((file.try_clone()?, crate::platform::hold_folder(&self.file)?))
+        } else {
+            None
+        };
         for (taken, target) in candidates(name).take(rules.name_tries).enumerate() {
             if taken > 0 {
                 // Taken names are passed without a wait: the runtime gets
@@ -518,11 +616,16 @@ impl Directory {
                 tokio::task::yield_now().await;
             }
             let leaf = OsStr::new(&target);
-            let published = |marked, applied| {
+            let published = |marked, applied, held: Option<(File, Option<File>)>| {
                 (
                     Published {
                         path: self.path.join(&target),
                         marked,
+                        held: held.map(|(file, folder)| Held {
+                            file,
+                            name: leaf.to_os_string(),
+                            folder,
+                        }),
                     },
                     applied,
                 )
@@ -552,10 +655,10 @@ impl Directory {
                 }
             };
             match finished {
-                Ok(()) => return Ok(published(marked, applied)),
+                Ok(()) => return Ok(published(marked, applied, own)),
                 // Named all the same; the file that took `partial` is not ours to remove.
                 Err(e) if refusal(&e) == Some(Refusal::Replaced) => {
-                    return Ok(published(marked, applied));
+                    return Ok(published(marked, applied, own));
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) if no_hard_links(&e) => {
@@ -568,7 +671,7 @@ impl Directory {
                 Err(e) => return Err(at_name(e)),
             }
             match self.rename(file, partial, leaf) {
-                Ok(()) => return Ok(published(marked, applied)),
+                Ok(()) => return Ok(published(marked, applied, own)),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e)
                     if no_hard_links(&e)
@@ -634,9 +737,13 @@ impl Directory {
                 PublishError::Io(e) => at_name(e),
                 other => other,
             })?;
-            claim.keep();
+            // The copy is the published file, not the one the caller holds.
+            let copy = claim.keep(rules.hold).map_err(at_name)?;
+            // The handle of the file written is closed here: on Windows a
+            // file goes from its folder with its last handle.
+            let folder = own.and_then(|(_, folder)| folder);
             let _ = self.discard(file, partial);
-            return Ok(published(marked, applied));
+            return Ok(published(marked, applied, copy.map(|copy| (copy, folder))));
         }
         Err(PublishError::NoNameLeft {
             tried: rules.name_tries,
@@ -658,6 +765,13 @@ impl Directory {
 /// that claim.
 ///
 /// By path, links on the way are followed: prefer [`Directory::publish`].
+///
+/// The file is closed and named by path, so nothing is held:
+/// [`Published::held`] is `None`, and there is no proof to take it back
+/// with. Its own cleanup has none either: the partial after a link, and
+/// an empty claim after a rename that failed, are removed on Unix while
+/// the name still has the device and inode read before (a number, which
+/// a new file can have once the old one is gone), and on Windows by path.
 ///
 /// An error of the system is a [`PublishError::Name`]: the name being tried
 /// when it refused, which is `wanted` or a numbered one after it. Every
@@ -698,6 +812,7 @@ pub async fn publish_path(
                 return Ok(Published {
                     path: target,
                     marked,
+                    held: None,
                 });
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -740,6 +855,7 @@ pub async fn publish_path(
         return Ok(Published {
             path: target,
             marked,
+            held: None,
         });
     }
     Err(PublishError::NoNameLeft {
@@ -789,11 +905,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_default_rules_mark_nothing_and_retry_five_times_fifty_milliseconds_apart() {
+    fn the_default_rules_mark_and_hold_nothing_and_retry_five_times_fifty_milliseconds_apart() {
         let rules = PublishRules::default();
         assert!(!rules.mark);
         assert_eq!(rules.retries, 5);
         assert_eq!(rules.retry_wait, Duration::from_millis(50));
+        assert!(!rules.hold);
     }
 
     /// A name is tried as far as the default name rules number one.

@@ -149,6 +149,10 @@ pub fn identity(file: &File) -> io::Result<FileId> {
 }
 
 fn file_id(file: &File) -> io::Result<(u64, [u8; 16])> {
+    #[cfg(test)]
+    if crate::seams::WEAK_IDS.get() {
+        return Ok((0, [0; 16]));
+    }
     let mut info = FILE_ID_INFO::default();
     // SAFETY: `info` is the buffer the class needs, of its size.
     unsafe {
@@ -479,6 +483,46 @@ pub fn discard(_: &File, file: &File, _: &OsStr) -> io::Result<()> {
         )
     }
     .map_err(io::Error::from)
+}
+
+/// Whether the open `file` is `name` in `parent` now, read from the
+/// handles: no name is opened and no file ID compared.
+fn named(parent: &File, file: &File, name: &OsStr) -> io::Result<bool> {
+    #[cfg(test)]
+    let place = if crate::seams::NO_PLACE.get() {
+        // ERROR_INVALID_FUNCTION, as a volume that cannot answer gives.
+        Err(io::Error::from_raw_os_error(1))
+    } else {
+        final_path(file)
+    };
+    #[cfg(not(test))]
+    let place = final_path(file);
+    // Without a place nothing says the name is this file. (A file deleted
+    // while open still has one on NTFS, outside every folder.)
+    let place = place.map_err(|_| refused(Refusal::Unproven))?;
+    Ok(place.file_name() == Some(name) && place.parent() == Some(final_path(parent)?.as_path()))
+}
+
+/// The published file `file` deleted through its own handle, only while
+/// it is still `name` in `parent`: whatever has the name, no other file
+/// can go.
+pub fn take_back(parent: &File, _: Option<&File>, file: &File, name: &OsStr) -> io::Result<()> {
+    if named(parent, file, name)? {
+        return delete_by_handle(file);
+    }
+    // Not under its name any more: the name is another's, or free, or
+    // the system would not say.
+    Err(match inspect(parent, name) {
+        Ok(_) => refused(Refusal::Replaced),
+        Err(e) if crate::is_link(&e) => refused(Refusal::Replaced),
+        Err(e) => e,
+    })
+}
+
+/// The handle's place says which folder a held file is in: no handle of
+/// the folder is kept.
+pub fn hold_folder(_: &File) -> io::Result<Option<File>> {
+    Ok(None)
 }
 
 /// The folder `name` in `parent`, never through a link, with the rights to
