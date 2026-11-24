@@ -32,7 +32,9 @@ pub struct Level {
 /// followed. One moved out of the root, or whose place cannot be read, is
 /// not found. On Unix, which has no open by ID, the root is opened by its
 /// path and each level below it by name, no link followed, each one's
-/// device and inode compared, so a folder renamed since is not found.
+/// device and inode compared, so a folder renamed since is not found. A
+/// level recorded on another device than the root's is not found on any
+/// system ([`Left::Volume`]): nothing is opened at it or below it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Location {
     /// The root.
@@ -60,7 +62,9 @@ pub enum Left {
     /// ([`PartialAt::is_partial`]): never removed, never opened.
     Name,
     /// A root recorded on another system, a volume path that is not a
-    /// volume's, or another disk under it.
+    /// volume's, another disk under it, or a folder recorded on another
+    /// volume or device than the root's: a file system mounted below the
+    /// root, which a version before this rule recorded on Unix.
     Volume,
     /// Another file, folder or link under the recorded name, or another
     /// folder on the way.
@@ -128,8 +132,27 @@ pub(crate) fn root_of(root: &Directory) -> Result<Root, JournalError> {
     }
 }
 
+/// A folder's identity as the walks read it.
+fn seen(dir: &Directory) -> io::Result<FileId> {
+    let id = dir.identity()?;
+    #[cfg(test)]
+    if let Some((folder, device)) = crate::seams::OTHER_DEVICE.get()
+        && folder == id.file
+    {
+        return Ok(FileId {
+            volume: device,
+            ..id
+        });
+    }
+    Ok(id)
+}
+
 /// The folders from `root` down to `dir`, each opened by name from the one
 /// above with no link followed.
+///
+/// Every level is on the root's volume or device, as the system reports
+/// it: one that is not, and a `dir` that is not, is
+/// [`JournalError::OtherVolume`].
 ///
 /// The path `dir` was opened at is walked first. When it no longer reaches
 /// `dir` (renamed, moved, another folder or a link under its name), the
@@ -145,15 +168,21 @@ pub(crate) fn levels(
     root: &Directory,
     dir: &Directory,
 ) -> Result<Vec<(Level, FileId)>, JournalError> {
-    let want = dir.identity()?;
-    if want == root.identity()? {
+    let want = seen(dir)?;
+    let top = root.identity()?;
+    if want == top {
         return Ok(Vec::new());
+    }
+    // An ID or an inode names a file on one volume or device only.
+    if want.volume != top.volume {
+        return Err(JournalError::OtherVolume);
     }
     let below = dir
         .path()
         .strip_prefix(root.path())
         .map_err(|_| JournalError::NotBelow)?;
-    let opened = walk(root, below, want);
+    let down = |below: &Path| walk(root, below, top.volume, want);
+    let opened = down(below);
     if opened.is_ok() {
         return opened;
     }
@@ -173,7 +202,7 @@ pub(crate) fn levels(
                 .strip_prefix(&root_now)
                 .map_err(|_| JournalError::NotBelow)?;
             // Renamed again in this moment: the first walk's error stands.
-            walk(root, below, want).or(opened)
+            down(below).or(opened)
         }
         // It could be anywhere: a failed reading is never taken for a rename.
         (Place::Unreadable, _) | (_, Place::Unreadable) => {
@@ -248,10 +277,12 @@ fn no_procfs() -> bool {
 
 /// The folders `below` names from `root` down, each opened by name from
 /// the one above with no link followed: [`JournalError::NotBelow`] when the
-/// last is not the folder `want`.
+/// last is not the folder `want`, [`JournalError::OtherVolume`] at the
+/// first that is not on `device`, the root's.
 fn walk(
     root: &Directory,
     below: &Path,
+    device: u64,
     want: FileId,
 ) -> Result<Vec<(Level, FileId)>, JournalError> {
     let mut at = root.try_clone()?;
@@ -262,7 +293,11 @@ fn walk(
         };
         let text = name.to_str().ok_or(JournalError::NameNotText)?;
         at = at.directory(name)?;
-        let id = at.identity()?;
+        let id = seen(&at)?;
+        // A way that leaves the root's device and comes back is refused too.
+        if id.volume != device {
+            return Err(JournalError::OtherVolume);
+        }
         levels.push((
             Level {
                 name: text.to_string(),
@@ -324,7 +359,8 @@ fn still_below(root: &Directory, dir: &Directory, recorded: &[Level]) -> io::Res
 impl Location {
     /// The folder, opened again by identity.
     /// Fails with why it is not found: gone, replaced, on another disk or
-    /// system, or not reachable now.
+    /// system, below a level on another device than the root's, or not
+    /// reachable now.
     pub fn open(&self) -> Result<Directory, Left> {
         self.find()
     }
@@ -345,7 +381,8 @@ impl Location {
                 .levels
                 .last()
                 .map_or((*serial, *folder), |l| (l.device, l.id));
-            if device != *serial {
+            // No level on another volume, the last or one on the way.
+            if device != *serial || self.levels.iter().any(|l| l.device != *serial) {
                 return Err(Left::Volume);
             }
             let open = |id: u128| {
@@ -391,6 +428,11 @@ impl Location {
                 return Err(Left::Unreachable);
             }
             for level in &self.levels {
+                // Recorded across a mount, by a version that walked one:
+                // an inode there is another device's, so nothing is opened.
+                if level.device != *device {
+                    return Err(Left::Volume);
+                }
                 // Known by its identity alone: no name finds it again.
                 if level.name.is_empty() {
                     return Err(Left::Gone);
@@ -398,7 +440,8 @@ impl Location {
                 dir = dir
                     .directory(OsStr::new(&level.name))
                     .map_err(|e| left(&e))?;
-                let id = dir.identity().map_err(|_| Left::Io)?;
+                let id = seen(&dir).map_err(|_| Left::Io)?;
+                // Another device here now is a file system mounted since.
                 if id.volume != level.device || id.file != level.id {
                     return Err(Left::Replaced);
                 }
@@ -412,7 +455,9 @@ impl PartialAt {
     /// Where the partial file `file`, created as `partial` in `dir`, is:
     /// `dir` is `root` or a folder opened below it by name, each level
     /// recorded with its identity, as a journal records it: under its
-    /// present names when it was renamed since it was opened.
+    /// present names when it was renamed since it was opened. A `dir` on
+    /// another volume or device than `root`'s, or reached through a level
+    /// that is, is refused with [`JournalError::OtherVolume`].
     pub fn of(
         root: &Directory,
         dir: &Directory,
@@ -476,7 +521,9 @@ impl PartialAt {
             let file = dir.entry(name).map_err(|e| left(&e))?;
             let meta = file.metadata().map_err(|_| Left::Io)?;
             let id = identity(&file).map_err(|_| Left::Io)?;
-            if !meta.is_file() || id.file != self.file {
+            let volume = dir.identity().map_err(|_| Left::Io)?.volume;
+            // A file mounted over the name is another device's.
+            if !meta.is_file() || id.file != self.file || volume != id.volume {
                 return Err(Left::Replaced);
             }
             dir.discard(&file, name).map_err(|e| left(&e))
@@ -574,6 +621,7 @@ pub(crate) fn find_published(
     size: u64,
     settings: &Settings,
 ) -> Option<String> {
+    let volume = dir.identity().ok()?.volume;
     let names = dir.names(settings.list_most).ok()?;
     for found in names.into_iter().map_while(Result::ok) {
         let Some(found) = found.to_str() else {
@@ -585,7 +633,8 @@ pub(crate) fn find_published(
         let Some(candidate) = dir.candidate(OsStr::new(found), size) else {
             continue;
         };
-        if identity(candidate.file()).is_ok_and(|id| id.file == file) {
+        // An ID or an inode is the recorded file's on the folder's volume only.
+        if identity(candidate.file()).is_ok_and(|id| id.file == file && id.volume == volume) {
             return Some(found.to_string());
         }
     }

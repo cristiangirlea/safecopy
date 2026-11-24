@@ -2237,3 +2237,327 @@ fn a_recorded_name_that_is_not_a_partials_is_never_opened() {
     assert!(part.try_reopen(&s).is_ok());
     assert!(tmp.try_reopen(&other).is_ok());
 }
+
+// A file system mounted below the root.
+
+/// A folder acted out as a mount point until this is dropped: the walks
+/// read it as on another device than its own.
+struct Mounted;
+
+impl Mounted {
+    /// With the device it is read as on.
+    fn at(dir: &Directory) -> (Self, u64) {
+        let id = dir.identity().unwrap();
+        let device = id.volume ^ 1;
+        seams::OTHER_DEVICE.set(Some((id.file, device)));
+        (Self, device)
+    }
+}
+
+impl Drop for Mounted {
+    fn drop(&mut self) {
+        seams::OTHER_DEVICE.set(None);
+    }
+}
+
+/// Each way of recording the partial `file`, made as `a.part` in `dir`.
+fn recorded(
+    journal: &Journal,
+    root: &Directory,
+    dir: &Directory,
+    file: &File,
+) -> [Result<(), JournalError>; 3] {
+    let partial = OsStr::new("a.part");
+    let start = Start {
+        place: 0,
+        file,
+        partial,
+        name: "a",
+        size: 0,
+    };
+    [
+        journal.started(0, dir, file, partial, "a", 0),
+        journal.started_many(dir, &[start, Start { place: 1, ..start }]),
+        PartialAt::of(root, dir, file, partial).map(|_| ()),
+    ]
+}
+
+#[test]
+fn a_folder_on_or_below_another_device_is_refused() {
+    let (_scratch, place, journal_dir) = scratch("other-device");
+    let root = Directory::destination(&place).unwrap();
+    let disk = root.claim("Disk").unwrap();
+    let below = disk.claim("Photos").unwrap();
+    let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+    let mounted = Mounted::at(&disk);
+    // The folder that is the mount point, and one reached through it that
+    // reports the root's own device again.
+    for dir in [&disk, &below] {
+        let file = dir.create(OsStr::new("a.part")).unwrap();
+        assert_eq!(
+            recorded(&journal, &root, dir, &file),
+            [Err(JournalError::OtherVolume); 3]
+        );
+        assert!(journal.partials().is_empty());
+        dir.discard(&file, OsStr::new("a.part")).unwrap();
+    }
+    // The root's own files are recorded as ever.
+    let file = root.create(OsStr::new("a.part")).unwrap();
+    journal
+        .started(0, &root, &file, OsStr::new("a.part"), "a", 0)
+        .unwrap();
+    journal.ended(0).unwrap();
+    // One device again, and the same folder is taken.
+    drop(mounted);
+    let file = below.create(OsStr::new("a.part")).unwrap();
+    journal
+        .started(0, &below, &file, OsStr::new("a.part"), "a", 0)
+        .expect("only the device refused it");
+    journal.ended(0).unwrap();
+    // Renamed, where nothing reads its place: not by its identity alone.
+    below.discard(&file, OsStr::new("a.part")).unwrap();
+    drop((file, below));
+    let _mounted = Mounted::at(&disk);
+    std::fs::rename(place.join("Disk"), place.join("Drive")).unwrap();
+    seams::PLACE.set(seams::Place::Unknown);
+    let file = disk.create(OsStr::new("a.part")).unwrap();
+    let alone = recorded(&journal, &root, &disk, &file);
+    seams::PLACE.set(seams::Place::Read);
+    assert_eq!(alone, [Err(JournalError::OtherVolume); 3]);
+    disk.discard(&file, OsStr::new("a.part")).unwrap();
+}
+
+/// A folder as a segment records it: its name, device and inode.
+type Recorded<'a> = (&'a str, u64, u128);
+
+/// A segment as a version that walked across a mount wrote it: `levels`
+/// one below the other from the root, each with the device and inode it
+/// had, and the partial `file` as `partial` in the last.
+fn older_segment(root: &Directory, levels: &[Recorded<'_>], partial: &str, file: &File) -> Vec<u8> {
+    use crate::log::{Entry, State, frame};
+    let state = State::new(location::root_of(root).unwrap(), &settings());
+    let mut bytes = frame(&state.header());
+    for (n, (name, device, id)) in (1u32..).zip(levels) {
+        let entry = Entry::Folder(Folder {
+            n,
+            parent: n - 1,
+            name: name.to_string(),
+            device: *device,
+            id: *id,
+        });
+        bytes.extend(frame(&entry.encode()));
+    }
+    let started = Entry::Started(Started {
+        place: 0,
+        folder: levels.len() as u32,
+        name: partial.strip_suffix(".part").unwrap().to_string(),
+        partial: partial.to_string(),
+        size: 4,
+        file: identity(file).unwrap().file,
+    });
+    bytes.extend(frame(&started.encode()));
+    bytes
+}
+
+/// What every way of finding a partial again says of `at`, which is below
+/// a level on another device: nothing is opened, cut or removed.
+fn never_found(at: &PartialAt) {
+    let s = settings();
+    assert!(at.is_partial(&s));
+    assert_eq!(at.location.open().err(), Some(Left::Volume));
+    assert_eq!(at.try_reopen(&s).err(), Some(Left::Volume));
+    assert!(at.reopen(&s).is_none());
+    assert_eq!(at.present(&s), None);
+    assert!(!at.remove(&s));
+}
+
+/// Unix walked a mount below the root and recorded what was there until
+/// this rule: such a record is still read, and never followed, on any
+/// system and at any level.
+#[test]
+fn an_older_record_below_another_device_is_left_and_never_found() {
+    let (_scratch, place, journal_dir) = scratch("older-device");
+    let root = Directory::destination(&place).unwrap();
+    let disk = root.claim("Disk").unwrap();
+    let below = disk.claim("Photos").unwrap();
+    let (mounted, device) = Mounted::at(&disk);
+    let (disk_id, below_id) = (disk.identity().unwrap(), below.identity().unwrap());
+    // Directly in the mounted folder, and in a folder further down.
+    let on = [("Disk", device, disk_id.file)];
+    let under = [on[0], ("Photos", below_id.volume, below_id.file)];
+    let cases: [(&Directory, &[Recorded<'_>], &str); 2] =
+        [(&disk, &on, "a.jpg.part"), (&below, &under, "b.jpg.part")];
+    let mut places = Vec::new();
+    for (n, (dir, levels, partial)) in cases.into_iter().enumerate() {
+        let mut file = dir.create(OsStr::new(partial)).unwrap();
+        file.write_all(b"half").unwrap();
+        let bytes = older_segment(&root, levels, partial, &file);
+        drop(file);
+        let segment = read_segment(&bytes, &settings()).unwrap();
+        let at = segment.places().pop().unwrap().unwrap();
+        assert_eq!(at.location.levels.len(), levels.len());
+        places.push(at);
+        std::fs::write(journal_dir.join(format!("7-{n}.1.jlog")), bytes).unwrap();
+    }
+    // The partial under its published name too: a recovery that looked in
+    // the folder would find it there.
+    for (partial, name) in [
+        ("Disk/a.jpg.part", "Disk/a.jpg"),
+        ("Disk/Photos/b.jpg.part", "Disk/Photos/b.jpg"),
+    ] {
+        std::fs::hard_link(place.join(partial), place.join(name)).unwrap();
+    }
+    let read = recover(&journal_dir, &settings()).unwrap();
+    assert_eq!(read.len(), 2);
+    for one in &read {
+        assert_eq!(one.partials().len(), 1);
+        assert!(one.settled.is_empty() && one.candidates.is_empty());
+    }
+    places.iter().for_each(never_found);
+    // Left, and the journals go: their entries are ones never found.
+    assert_eq!(clean_up(&journal_dir, &settings()).unwrap(), cleaned(0, 2));
+    assert_eq!(journals(&journal_dir), 0);
+    assert_eq!(
+        std::fs::read(place.join("Disk/a.jpg.part")).unwrap(),
+        b"half"
+    );
+    assert_eq!(
+        std::fs::read(place.join("Disk/Photos/b.jpg.part")).unwrap(),
+        b"half"
+    );
+    drop(mounted);
+}
+
+/// A real second file system below the root, where the process may mount
+/// one: Linux, as root or with the capability for it.
+#[cfg(target_os = "linux")]
+mod mounted {
+    use super::*;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    /// Whether a mount that cannot be made fails its test: set where the
+    /// tests run with the right to mount.
+    fn mount_required() -> bool {
+        std::env::var_os("SAFECOPY_REQUIRE_MOUNT").is_some_and(|v| !v.is_empty())
+    }
+
+    /// A memory file system mounted at a folder until this is dropped.
+    struct Tmpfs(CString);
+
+    impl Tmpfs {
+        fn mount(at: &Path) -> io::Result<Self> {
+            let at = CString::new(at.as_os_str().as_bytes()).unwrap();
+            let kind = c"tmpfs";
+            // SAFETY: three strings that end in a zero byte, and no data.
+            let made = unsafe {
+                libc::mount(
+                    kind.as_ptr(),
+                    at.as_ptr(),
+                    kind.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            match made {
+                0 => Ok(Self(at)),
+                _ => Err(io::Error::last_os_error()),
+            }
+        }
+    }
+
+    impl Drop for Tmpfs {
+        fn drop(&mut self) {
+            // Detached even with a folder of it still open.
+            // SAFETY: a string that ends in a zero byte.
+            unsafe { libc::umount2(self.0.as_ptr(), libc::MNT_DETACH) };
+        }
+    }
+
+    /// `at` with a file system mounted on it, or `None` where this process
+    /// may not mount one and need not.
+    fn mount(at: &Path) -> Option<Tmpfs> {
+        match Tmpfs::mount(at) {
+            Ok(mounted) => Some(mounted),
+            Err(e) => {
+                assert!(
+                    !mount_required(),
+                    "SAFECOPY_REQUIRE_MOUNT is set, but no file system can be mounted: {e}"
+                );
+                eprintln!("skipped: this process may not mount a file system ({e})");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn a_folder_on_a_file_system_mounted_below_the_root_is_refused() {
+        let (_scratch, place, journal_dir) = scratch("mount");
+        let root = Directory::destination(&place).unwrap();
+        // Recorded while it is one file system: what a mount put over the
+        // folder later does to it.
+        let songs = root.claim("Songs").unwrap();
+        let mut early = songs.create(OsStr::new("c.mp3.part")).unwrap();
+        early.write_all(b"half").unwrap();
+        let before = PartialAt::of(&root, &songs, &early, OsStr::new("c.mp3.part")).unwrap();
+        drop((early, songs));
+        std::fs::create_dir(place.join("Disk")).unwrap();
+        let Some(_disk) = mount(&place.join("Disk")) else {
+            return;
+        };
+        let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+        let disk = root.directory(OsStr::new("Disk")).unwrap();
+        let below = disk.claim("Photos").unwrap();
+        let (top, disk_id, below_id) = (
+            root.identity().unwrap(),
+            disk.identity().unwrap(),
+            below.identity().unwrap(),
+        );
+        assert_ne!(top.volume, disk_id.volume, "another device");
+        assert_eq!(disk_id.volume, below_id.volume);
+        let on = [("Disk", disk_id.volume, disk_id.file)];
+        let under = [on[0], ("Photos", below_id.volume, below_id.file)];
+        let cases: [(&Directory, &[Recorded<'_>], &str); 2] =
+            [(&disk, &on, "a.jpg.part"), (&below, &under, "b.jpg.part")];
+        for (n, (dir, levels, partial)) in cases.into_iter().enumerate() {
+            let file = dir.create(OsStr::new("a.part")).unwrap();
+            assert_eq!(
+                recorded(&journal, &root, dir, &file),
+                [Err(JournalError::OtherVolume); 3]
+            );
+            assert!(journal.partials().is_empty());
+            dir.discard(&file, OsStr::new("a.part")).unwrap();
+            // What a version that walked the mount left there.
+            let mut file = dir.create(OsStr::new(partial)).unwrap();
+            file.write_all(b"half").unwrap();
+            let bytes = older_segment(&root, levels, partial, &file);
+            drop(file);
+            let segment = read_segment(&bytes, &settings()).unwrap();
+            never_found(&segment.places().pop().unwrap().unwrap());
+            std::fs::write(journal_dir.join(format!("7-{n}.1.jlog")), bytes).unwrap();
+        }
+        drop(journal);
+        assert_eq!(clean_up(&journal_dir, &settings()).unwrap(), cleaned(0, 2));
+        assert_eq!(journals(&journal_dir), 0);
+        assert_eq!(
+            std::fs::read(place.join("Disk/a.jpg.part")).unwrap(),
+            b"half"
+        );
+        assert_eq!(
+            std::fs::read(place.join("Disk/Photos/b.jpg.part")).unwrap(),
+            b"half"
+        );
+
+        // A file system mounted over a folder recorded before: another
+        // folder is under the name, and the partial below is not reached.
+        let s = settings();
+        assert_eq!(before.present(&s), Some(4));
+        let over = mount(&place.join("Songs")).expect("mounted once already");
+        std::fs::write(place.join("Songs/c.mp3.part"), b"other").unwrap();
+        assert_eq!(before.try_reopen(&s).err(), Some(Left::Replaced));
+        assert_eq!(before.present(&s), None);
+        assert!(!before.remove(&s));
+        drop(over);
+        assert_eq!(before.present(&s), Some(4));
+    }
+}
