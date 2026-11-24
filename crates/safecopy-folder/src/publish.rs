@@ -300,7 +300,9 @@ impl From<io::Error> for PublishError {
     }
 }
 
-/// The staging name of `path`: its name with `.part` after it.
+/// The staging name of `path`: its name with `.part` after it. Five more
+/// bytes, and UTF-16 units, than the name: the caller's limit on a name
+/// leaves them (the default `safecopy_names::NameRules` do).
 pub fn part(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".part");
@@ -309,7 +311,9 @@ pub fn part(path: &Path) -> PathBuf {
 
 /// `name` in `dir`, or "name (2).ext" and so on when that or its
 /// [`part`] exists. Only a wish: another file may take it before it is
-/// published, which [`publish_path`] allows for.
+/// published, which [`publish_path`] allows for. Nothing is cut: a number
+/// makes `name` longer by " (N)", which the caller's limit on a name leaves
+/// room for, as it does for [`part`].
 pub fn unique(dir: &Path, name: &str) -> PathBuf {
     candidates(name)
         .map(|name| dir.join(name))
@@ -764,5 +768,28 @@ pub(crate) mod tests {
     fn a_partial_file_is_named_after_its_file() {
         assert_eq!(part(Path::new("a/b.txt")), Path::new("a/b.txt.part"));
         assert_eq!(part(Path::new(".hidden")), Path::new(".hidden.part"));
+    }
+
+    /// A name as long as the default rules let it be, numbered as far as
+    /// they number and with the partial ending, is within the 255 a system
+    /// holds, in bytes as in UTF-16 units.
+    #[test]
+    fn a_numbered_partial_of_the_longest_safe_name_fits_a_system_s_limit() {
+        let rules = safecopy_names::NameRules::default();
+        for name in [
+            format!("{}.png", "😀".repeat(100)),
+            format!("{}.pdf", "文".repeat(90)),
+            format!("{}.txt", "я".repeat(130)),
+            format!("{}.docx", "文".repeat(65)),
+            "x".repeat(300),
+        ] {
+            let safe = safecopy_names::safe_name(&name, &rules).unwrap();
+            let numbered = candidates(&safe).nth(rules.max_number - 1).unwrap();
+            assert!(numbered.contains(" (10001)"), "{numbered}");
+            let partial = part(Path::new(&numbered));
+            let partial = partial.to_str().unwrap();
+            assert!(partial.len() <= 255, "{partial}");
+            assert!(partial.encode_utf16().count() <= 255, "{partial}");
+        }
     }
 }

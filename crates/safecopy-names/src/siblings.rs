@@ -120,6 +120,42 @@ mod tests {
         assert_eq!(two.encode_utf16().count(), MAX_NAME_UNITS);
     }
 
+    /// A numbered name fits the bytes as well as the units, with its
+    /// extension, up to the highest number the rules allow.
+    #[test]
+    fn a_numbered_name_at_the_byte_limit_still_fits() {
+        let fits = |name: &str| name.len() <= 200 && name.encode_utf16().count() <= 200;
+        let name = format!("{}.docx", "文".repeat(65)); // 200 bytes, 70 units
+        let mut siblings = Siblings::default();
+        assert_eq!(siblings.take(OsStr::new(&name)).unwrap(), name);
+        let two = siblings.take(OsStr::new(&name)).unwrap();
+        assert_eq!(two, format!("{} (2).docx", "文".repeat(63)));
+        assert!(fits(&two), "{two}");
+        // A longer name cut to the limit loses its extension, and is
+        // numbered within the limit too.
+        let long = format!("{}.docx", "文".repeat(90));
+        let mut siblings = Siblings::default();
+        assert_eq!(siblings.take(OsStr::new(&long)).unwrap(), "文".repeat(66));
+        let two = siblings.take(OsStr::new(&long)).unwrap();
+        assert_eq!(two, format!("{} (2)", "文".repeat(65)));
+        assert!(fits(&two), "{two}");
+
+        let rules = NameRules::default();
+        let last = numbered(&name, rules.max_number, &rules).unwrap();
+        assert_eq!(last, format!("{} (10001).docx", "文".repeat(62)));
+        assert!(fits(&last), "{last}");
+        // Every number on the way, in a folder that allows few.
+        let mut siblings = Siblings::new(NameRules::default().with_max_number(12));
+        for n in 1..=12 {
+            let given = siblings.take(OsStr::new(&name)).unwrap();
+            assert!(fits(&given) && given.ends_with(".docx"), "{n}: {given}");
+        }
+        assert_eq!(
+            siblings.take(OsStr::new(&name)),
+            Err(NameError::NoNumberLeft { most: 12 })
+        );
+    }
+
     #[test]
     fn a_name_that_is_not_unicode_is_refused_not_guessed() {
         #[cfg(unix)]

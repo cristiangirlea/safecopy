@@ -177,7 +177,11 @@ pub struct Saved {
 pub struct Target<'a> {
     /// The folder it is saved into.
     pub dir: &'a Directory,
-    /// Its name there; a taken one is numbered, never replaced.
+    /// Its name there; a taken one is numbered, never replaced. Nothing is
+    /// cut here: the number (" (N)") and the partial file's ending
+    /// (`.part`, `.N.part`) come after it, so the caller's limit on a name
+    /// leaves room for them below what the disk holds in one. The default
+    /// rules of `safecopy-names` leave 55, in bytes and in UTF-16 units.
     pub name: &'a str,
     /// The whole file's bytes, a resumed one's kept bytes included.
     pub size: u64,
