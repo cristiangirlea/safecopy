@@ -20,6 +20,20 @@ hash before the file gets its name (`safecopy-chunks`).
   - `receiving`, `keep` (rewritten once 64 MiB more is whole and a second
     has passed, or at once at a drop), `sending`, `received`, `sent`,
     `forget`, `remove_all`, `kept_bytes`.
+  - `saving(peer, key) -> Result<Saving, ResumeError>`: one save's claim
+    on a file being received, taken before anything is done for a stream
+    that brings it and held around the save. `ResumeError::Busy` when a
+    save of this store is on that file already (another `Saving`, or its
+    receiving record held). `Saving::kept(&held, now, &file)` ends a save
+    that kept its partial (the record written at once, then let go),
+    `Saving::forget()` one that published or kept nothing; dropped
+    without either (the save's future dropped, a panic) it lets the
+    record go and removes nothing, so the file is continued later.
+  - `forget(peer, key)` is `ResumeError::Busy`, removing nothing, for a
+    file this store is receiving: a `Saving` is on it, or its receiving
+    record is held. The save's own `Saving::forget` removes it then;
+    so do `remove_all` (the person's word) and `expire` for a key left
+    out of its `live` list.
   - `kept_by(peer) -> Result<Vec<Held>, ResumeError>`: what is kept from
     one peer, from the records and the folders' listings alone: each
     record whose partial is still the recorded file under its name and
@@ -95,26 +109,51 @@ each program words them, and maps each `Verdict` to its own codes.
 
 With `safecopy_chunks::save_resumable` and a journal, in order.
 
+**For every stream that brings a file, first:** `let saving =
+store.saving(peer, key)?`, before a check's answer is acted on.
+`ResumeError::Busy` says a save of this store is on that file already
+(the same key on a second connection): refuse the stream and touch
+nothing. The guard is held until the save has ended, outside the save's
+future, and every end below goes through it.
+
 The first time, on the receiver:
 
 1. `Resent::check(peer, None, &stream, same)` says `Take::New`.
 2. `save_resumable(.., Start::New, &keep, ..)` with a rule that keeps a
-   cut stream, and hooks that call `Journal::started` in `created` and,
-   in `whole`, `Store::receiving` for the first whole chunk and
-   `Store::keep(.., false)` for each later one.
-3. It ends with `Stopped { kept: Some(kept), .. }`: call
-   `Store::keep(peer, &Held { key, have: kept.have(), prefix:
-   kept.prefix() }, now, &kept.file, true)`, and nothing on the journal.
-   Then drop `kept` and `Store::release(peer, key)`: until then the
-   store takes the file to be in use and will not reopen it.
-   `Store::release_peer(peer)` lets go of every record of the peer at
-   once, whichever connection was saving it: use it only when no save of
-   that peer's still runs.
+   cut stream, and the first save's hooks (below).
+3. It ends, in one of four ways:
+   - `Ok(saved)`: `Journal::done`, then `saving.forget()`.
+   - `Stopped { kept: Some(kept), .. }`: `saving.kept(&Held { key, have:
+     kept.have(), prefix: kept.prefix() }, now, &kept.file)`, which
+     writes the record at once and lets it go; nothing on the journal;
+     then drop `kept`.
+   - `Stopped { kept: None, .. }`, for whatever reason (a cancel, an
+     error the rule does not keep, less than one whole chunk, a wrong
+     offset, a partial that could not be cut back): `saving.forget()`,
+     and `Journal::ended` if the partial was listed. Without it the
+     record would stay held, and offered by `kept_by`, until an expiry.
+   - The save's future is dropped, or it panics: nothing to call. The
+     guard, dropped with the task, lets the record go as it was last
+     written, and the partial is continued or expired later.
+
+The hooks of the two saves differ:
+
+| | first save (`Start::New`) | continued save (`Start::Resume`) |
+|---|---|---|
+| `before_create` | called | not called |
+| `created` | `Journal::started` | not called: the caller lists the partial itself (step 6) |
+| `whole`, first whole chunk | `Store::receiving(&record, file)` | `Store::keep(peer, &held, now, file, false)` |
+| `whole`, each later one | `Store::keep(peer, &held, now, file, false)` | `Store::keep(peer, &held, now, file, false)` |
+
+A continued save has its record already: `Store::receiving` in its
+`whole` would write the record anew, with the first save's `created`
+time lost. A save that starts new after a restart is a first save.
 
 The sender keeps `Store::sending` for the file from its first stream.
 
-At any later start, on the receiver: `Store::expire`, then
-`Store::clean_up(journals, ..)`.
+At every start, on the receiver: `Store::expire`, then
+`Store::clean_up(journals, ..)`. The expiry is also what removes a file
+under a record's name that is not that record (see Systems).
 
 When the peer is back:
 
@@ -126,16 +165,19 @@ When the peer is back:
    from }` it sends the `Resumable { key, from, size }` prefix and
    `copy_exact` from `from` with the hasher that came back, then the
    trailer.
-6. The receiver: `Resent::check(peer, record, &stream, same)` says
-   `Take::Append`; `Store::reopen_hashed(peer, key)` gives the folder and
-   the `Kept`: the partial open, its prefix read and checked through
-   that handle, and its name, `kept.partial`, which is the one the first
-   save gave it (`name.part`, or `name.N.part`) as the record keeps it.
+6. The receiver, with its `saving` taken: `Resent::check(peer, record,
+   &stream, same)` says `Take::Append`; `Store::reopen_hashed(peer,
+   key)` gives the folder and the `Kept`: the partial open, its prefix
+   read and checked through that handle, and its name, `kept.partial`,
+   which is the one the first save gave it (`name.part`, or
+   `name.N.part`) as the record keeps it.
    `Journal::started(place, &dir, &kept.file, &kept.partial, name, size)`
    lists it in this run's journal; then `save_resumable(reader, Target {
-   dir: &dir, name, size }, Start::Resume(Box::new(kept)), &keep, ..)`.
-7. Published: `Journal::done`, then `Store::forget(peer, key)` on both
-   sides. Cut again: step 3 again.
+   dir: &dir, name, size }, Start::Resume(Box::new(kept)), &keep, ..)`
+   with the continued save's hooks.
+7. It ends as at step 3. Published: `Journal::done` and
+   `saving.forget()` on the receiver, `Store::forget(peer, key)` on the
+   sender.
 
 The prefix is hashed at step 6 and not at step 4 for two reasons. A list
 that hashed would read every kept file each time the other side
@@ -154,12 +196,36 @@ failing disk or by another program writing the partial, is not seen.
 Any other answer of a check (`Restart`, `Resend`, `Refuse`, `Dropped`,
 `Changed`, `ResumeError::PrefixChanged`), and a save that ends with
 `ChunkError::Damaged`, is the file from zero or not at all:
-`Store::forget`, and `Journal::ended` if the partial was listed.
-`ResumeError::Busy` from a reopening or a write means the file is in
-use, by another process or by a save of this one (the same key on a
-second connection): leave it alone, and refuse the stream.
-`ResumeError::Unreachable` means its disk is away: nothing is removed,
-and it may be tried again.
+`saving.forget()`, and `Journal::ended` if the partial was listed. The
+answer is acted on only with the `saving` in hand: a check answers for
+the stream it was given, and the same key may be coming on another
+connection, whose record and partial a `forget` would remove under it.
+For that reason `Store::forget` itself is `Busy` for a file this store
+is receiving, and removes nothing; a caller cannot leave that out, as it
+could a question asked before the call.
+`ResumeError::Busy` from `saving`, a reopening, a write or a `forget`
+means the file is in use, by another process or by a save of this one
+(the same key on a second connection): leave it alone, and refuse the
+stream. `ResumeError::Unreachable` means its disk is away: nothing is
+removed, and it may be tried again.
+
+**Where the blocking calls run.** The store's calls are synchronous and
+most do file work: the lookups and `saving` list the records' folder
+under the store's lock, and `kept_by` then inspects each partial's name;
+`receiving`, `keep` when a rewrite is due (every 64 MiB
+and second, and at a drop), `Saving::kept` and `Saving::forget` flush
+the partial and write or remove a record. On an async runtime, run
+`kept_by`, `expire` and `clean_up` on its blocking pool
+(`tokio::task::spawn_blocking`, with the store in an `Arc`), and the
+guard's `kept` and `forget` inside `tokio::task::block_in_place`: the
+guard borrows its store and does not move to another thread's task.
+`Hooks::whole` is called on the thread that polls the save: the
+`Store::keep` in it returns at once but when a rewrite is due, and then
+holds that thread for two flushes; on a multi-threaded runtime wrap it
+in `tokio::task::block_in_place`, or give the save a thread of its own.
+The crate's async functions (`reopen_hashed`, `held_hashed`,
+`held_from`) hold the store's lock across no wait, and their futures are
+`Send`.
 
 ## Systems
 
@@ -184,6 +250,27 @@ and key at the same moment, the second finds the file made and is told
 are still found by what they hold, not by their name, so one under
 another name (the 32 random hex digits of before) is read, rewritten in
 its place and removed as ever.
+
+**A file under a record's name that is not that record.** Anyone can work
+out the name, so another program of the same person can put a file under
+it first. The store writes a file it did not make only when the file
+shows it is the record: its bytes read as a record of that kind, peer
+and key, and it has that one name. Anything else is `ResumeError::Busy`
+and is not written, cut or reopened: bytes that read as nothing or as
+another record, and a file with a second name (a hard link to some other
+file, which a write would have overwritten; counted through the open
+handle, `st_nlink` on Unix and the number of links on Windows). An empty
+file with one name is a record not yet written, and is taken. A
+symbolic link to a file was refused before with the system's error, and
+is `Busy` now; a folder or a junction there is still the system's error
+(`ResumeError::Io`). `expire` removes a regular file among these by its
+name alone, never what a second name of it shows; a link or a folder it
+leaves, as a cleanup never removes through one, and its key has no
+record until the person removes it. Until then that peer and key has no record, so the file is
+received without one and starts from zero if it is cut. The same holds
+for a record whose **first** write was torn by a crash: its file reads
+as nothing, and blocks its key until the next `expire`. Run `expire` at
+every start.
 
 **A partial open elsewhere.** On Windows a partial file being written is
 open without delete sharing, which shuts out the reopening a check or a
@@ -223,6 +310,38 @@ The handshake and the checks are fuzzed: `fuzz/fuzz_targets/resume_handshake.rs`
 
 ## Changes
 
+- **The store writes only records it can tell are its own.** A record
+  file's name can be worked out from its peer and key; a file found under
+  it was held and written at its first slot, then cut to a record's
+  length, whatever it was, so a hard link put there overwrote the file it
+  led to. A file not made by the store is now written only when it reads
+  as that record and has one name; any other is `ResumeError::Busy` and
+  left to `expire`
+  (`a_file_under_a_records_name_that_is_not_its_record_is_not_written`).
+  A first write torn by a crash so blocks its key until the next
+  `expire` (`a_first_write_torn_by_a_crash_waits_for_the_next_expiry`).
+  A symbolic link under a record's name is `Busy`, where it was `Io`
+  (`a_link_under_a_records_name_is_not_written_through`).
+- **New: `Store::saving(peer, key)` and `Saving`**, the guard a save
+  holds: one save per file in a store, and a save whose future is
+  dropped, or that panics, lets its record go instead of leaving the
+  file in use until the store is dropped
+  (`a_save_dropped_or_panicked_leaves_its_file_to_be_continued`).
+- **`Store::forget` is `ResumeError::Busy` for a file its store is
+  receiving**, taking the file as a save does for as long as it
+  removes, where it removed the held record and, on Unix, the partial
+  under the save writing it: the same key on a second connection, with a
+  check that answered "restart", cut the first connection's save. The
+  save forgets through `Saving::forget`; a record held with no save left
+  is released first. A sending record is forgotten as before
+  (`a_peer_that_connects_again_while_its_file_comes_does_not_stop_the_save`,
+  `a_sending_record_is_forgotten_while_its_store_holds_it`).
+- **The flow above** names the continued save's hooks, every end of a
+  save, and where the blocking calls run.
+- **Tested:** a junction or a symbolic link under a kept partial's name
+  is not listed (`a_link_under_a_kept_partials_name_is_not_listed`), and
+  the futures of `reopen_hashed`, `held_hashed` and `held_from` are
+  `Send` (`the_stores_futures_can_run_on_another_thread`).
 - **`Store::kept_by(peer)`** lists what is kept without reading it; the
   "how to resume" flow lists with it and hashes at `reopen_hashed`
   (`what_is_kept_is_listed_without_a_byte_of_it_read`).

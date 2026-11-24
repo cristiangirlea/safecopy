@@ -17,7 +17,9 @@
 //!   ([`Store::kept_by`]); a kept partial is checked when it is
 //!   continued ([`Store::reopen_hashed`]), and the hasher of that check
 //!   handed on, so the save (`safecopy_chunks::save_resumable`) reads
-//!   the prefix once.
+//!   the prefix once. A save holds a guard on its file
+//!   ([`Store::saving`], [`Saving`]): one save per file, and a save that
+//!   is dropped or panics lets its record go.
 //! - **The checks** ([`receiver_takes`], [`sender_checks`], [`Resent`]):
 //!   what the receiver states it holds, what the sender checks of its own
 //!   file, and what a stream under a kept key may be.
@@ -55,6 +57,42 @@
 //! records' folder runs as the person. A tampered receiving record can
 //! only make a file start from zero, since every byte is checked against
 //! the whole-file hash.
+//!
+//! # A save's hooks, and how it ends
+//!
+//! A save takes its file first ([`Store::saving`]), before a check's
+//! answer is acted on, and holds that guard until it has ended.
+//!
+//! - **A first save** (`safecopy_chunks::Start::New`): its `whole` hook
+//!   calls [`Store::receiving`] for the first whole chunk and
+//!   [`Store::keep`] (not at a drop) for each later one.
+//! - **A continued save** (`Start::Resume`): its `whole` hook calls
+//!   [`Store::keep`] only, since the record is there; `before_create`
+//!   and `created` are not called for it, and the caller lists the
+//!   reopened partial in its journal itself.
+//! - **It ends** with its partial kept: [`Saving::kept`]. Published, or
+//!   stopped with nothing kept for any reason: [`Saving::forget`].
+//!   Dropped or panicked: the guard lets the record go.
+//!
+//! [`Store::forget`] is [`ResumeError::Busy`] for a file being received,
+//! so the same key on a second connection cannot have the first's record
+//! and partial removed, whatever a check answered for it.
+//!
+//! # Blocking
+//!
+//! [`Store`]'s functions are synchronous but for three, and do file work
+//! under the store's lock. On an async runtime run [`Store::kept_by`],
+//! [`Store::expire`] and [`Store::clean_up`] on its blocking pool, and
+//! [`Saving::kept`] and [`Saving::forget`], whose guard borrows the
+//! store, inside `tokio::task::block_in_place`. A save's `whole` hook runs on
+//! the thread that polls the save: the [`Store::keep`] in it returns at
+//! once except when a rewrite is due ([`Limits::rewrite_bytes`],
+//! [`Limits::rewrite_every`]), when it flushes the partial and the
+//! record; on a multi-threaded runtime wrap it in
+//! `tokio::task::block_in_place`, or give the save a thread of its own.
+//! [`Store::reopen_hashed`], [`Store::held_hashed`] and
+//! [`Store::held_from`] hold the lock across no wait; their futures are
+//! `Send`.
 
 use std::fmt;
 use std::io;
@@ -71,7 +109,7 @@ mod wire;
 
 pub use checks::{Next, Resent, Source, Take, receiver_takes, sender_checks};
 pub use record::{Receiving, Sending};
-pub use store::{Expired, Store};
+pub use store::{Expired, Saving, Store};
 
 /// A transfer's key: 16 random bytes the sender chose for a file the first
 /// time it goes. It names the file to the receiver's record and grants

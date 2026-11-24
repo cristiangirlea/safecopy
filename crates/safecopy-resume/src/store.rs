@@ -83,6 +83,8 @@ struct State {
     held: HashMap<String, File>,
     /// What each record file held when it was last read.
     index: HashMap<String, Indexed>,
+    /// The files a save of this store is on ([`Saving`]).
+    saving: HashSet<(PeerId, TransferKey)>,
 }
 
 /// The resume records of one program, one file per transfer in a folder
@@ -98,7 +100,28 @@ struct State {
 /// save appending to it, and [`Self::held_from`] and
 /// [`Self::held_hashed`] pass it by, neither hashing nor removing it.
 /// Let a record go when its save has ended without publishing, and
-/// forget it when the file is published.
+/// forget it when the file is published: a save does both through its
+/// guard ([`Self::saving`], [`Saving`]), which also lets the record go
+/// when the save's future is dropped or it panics.
+///
+/// **A file under a record's name that is not that record.** A record
+/// file is named by its kind, peer and key, which anyone can work out,
+/// so another program may put a file there first. The store writes a
+/// file it did not make only when its bytes read as that record and it
+/// has that one name; an empty one, not yet written, is taken. Any other
+/// is [`ResumeError::Busy`] and never written, cut or reopened: bytes
+/// that read as nothing or as another record, a symbolic link, a file
+/// with a second name. [`Self::expire`] removes the name of a regular
+/// file among them; a link stays, and so does a folder there (the
+/// system's error, [`ResumeError::Io`]), until the person removes it. A
+/// record whose first
+/// write was torn by a crash is such a file too, and its key has no
+/// record until then: run [`Self::expire`] at each start.
+///
+/// **Blocking.** Every function here but the three async ones is
+/// synchronous and does file work, most of it under the store's lock: on
+/// an async runtime, call them where blocking is allowed (see the
+/// [crate] docs). No async function holds the lock across a wait.
 ///
 /// **Several stores on one folder** (several processes). Another store
 /// still reads a held record, so its lookups, [`Self::keeps`],
@@ -176,7 +199,7 @@ impl Store {
     /// changed.
     fn all(&self) -> Result<Vec<(String, Option<Found>)>, ResumeError> {
         let mut state = lock(&self.state);
-        let State { held, index } = &mut *state;
+        let State { held, index, .. } = &mut *state;
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         for entry in std::fs::read_dir(&self.dir)? {
@@ -246,7 +269,8 @@ impl Store {
 
     /// Writes `record`: into a new file, or over the older slot of the
     /// file holding its key, then flushed to the disk. A file another
-    /// store holds is not written: [`ResumeError::Busy`].
+    /// store holds is not written, nor one that does not show it is this
+    /// record's: [`ResumeError::Busy`].
     fn write(&self, record: &Record) -> Result<(), ResumeError> {
         let receiving = matches!(record, Record::Receiving(_));
         let existing = self.find(record.peer(), record.key(), receiving);
@@ -266,11 +290,16 @@ impl Store {
         if let Some(found) = existing {
             match self.hold(&mut state, &found.name)? {
                 Hold::Had => place = Some((found.name, found.seq, found.slot)),
-                // Another store may have written it since it was read.
-                Hold::Taken(now) => {
-                    let (seq, slot) = now.map_or((0, 1), |now| (now.seq, now.slot));
-                    place = Some((found.name, seq, slot));
-                }
+                // Another store may have written it since it was read, or
+                // another file may be under its name: only one that still
+                // reads as this record is written.
+                Hold::Taken(now) => match now.filter(|now| same_record(&now.record, record)) {
+                    Some(now) => place = Some((found.name, now.seq, now.slot)),
+                    None => {
+                        self.drop_hold(&mut state, &found.name);
+                        return Err(ResumeError::Busy);
+                    }
+                },
                 // Removed since: written as a new one.
                 Hold::Gone => {}
             }
@@ -336,7 +365,15 @@ impl Store {
     ///
     /// It is made under the one name its transfer has. When another
     /// store made it since this one looked, whoever holds it has the
-    /// transfer ([`ResumeError::Busy`]); one nobody holds is taken.
+    /// transfer ([`ResumeError::Busy`]); one nobody holds is taken when
+    /// it holds this record, or nothing at all.
+    ///
+    /// The name can be worked out by anyone, so a file found under it is
+    /// written only when it shows it is this record's: any other, with
+    /// bytes that do not read or another record's, is
+    /// [`ResumeError::Busy`] and not touched, and [`Store::expire`]
+    /// removes its name. A file with a second name is refused before
+    /// that, where it is held.
     fn make(
         &self,
         state: &mut State,
@@ -367,12 +404,14 @@ impl Store {
             // Removed in this very moment: the caller's next write makes it.
             Hold::Gone => return Err(ResumeError::Busy),
         };
-        let other = now.as_ref().is_some_and(|now| {
-            matches!(now.record, Record::Receiving(_)) != receiving
-                || now.record.peer() != record.peer()
-                || now.record.key() != record.key()
-        });
-        if other {
+        let own = match &now {
+            Some(now) => same_record(&now.record, record),
+            // One this store made, with its first write torn, is its own.
+            // One it took just now is only when it is empty: a store made
+            // it and has not written yet, and no byte is lost by a write.
+            None => had || state.held.get(&name).is_some_and(empty),
+        };
+        if !own {
             if !had {
                 self.drop_hold(state, &name);
             }
@@ -384,7 +423,8 @@ impl Store {
 
     /// Makes this store the only writer of the record file `name`, read
     /// again through the handle when it was not held before:
-    /// [`ResumeError::Busy`] when another store holds it.
+    /// [`ResumeError::Busy`] when another store holds it, or when it is
+    /// not a file with this one name.
     fn hold(&self, state: &mut State, name: &str) -> Result<Hold, ResumeError> {
         if state.held.contains_key(name) {
             return Ok(Hold::Had);
@@ -401,7 +441,9 @@ impl Store {
                 }
                 Ok(Hold::Taken(now.map(Box::new)))
             }
-            Err(e) if files::busy(&e) => Err(ResumeError::Busy),
+            // Held elsewhere, or not a file a record is written to: a
+            // link, or a file with a second name.
+            Err(e) if files::busy(&e) || files::refused(&e) => Err(ResumeError::Busy),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 state.index.remove(name);
                 Ok(Hold::Gone)
@@ -571,6 +613,10 @@ impl Store {
     /// [`Limits::rewrite_bytes`] more are whole and
     /// [`Limits::rewrite_every`] has passed, or at once with `at_drop`.
     /// Whether it was written.
+    ///
+    /// When it writes, it flushes `partial` and the record to the disk,
+    /// and holds its thread for that long: in a save's `whole` hook on a
+    /// multi-threaded runtime, wrap it in `tokio::task::block_in_place`.
     pub fn keep(
         &self,
         peer: PeerId,
@@ -618,6 +664,10 @@ impl Store {
     /// [`Self::expire`] and [`Self::clean_up`] do that. What is listed is
     /// what the records say; the bytes are checked when a file is
     /// continued ([`Self::reopen_hashed`]).
+    ///
+    /// It is synchronous: it lists the store's folder under the store's
+    /// lock, then inspects each partial's name. On an async runtime, run
+    /// it on the blocking pool.
     pub fn kept_by(&self, peer: PeerId) -> Result<Vec<Held>, ResumeError> {
         let mut kept = Vec::new();
         for found in self.all()?.into_iter().filter_map(|(_, found)| found) {
@@ -783,16 +833,73 @@ impl Store {
 
     /// Forgets the file of `key` from or to `peer`: its records go, and a
     /// received partial is removed by identity.
+    ///
+    /// A file this store is receiving is not forgotten here:
+    /// [`ResumeError::Busy`], with nothing removed, while a [`Saving`] is
+    /// on it or the store holds its receiving record. The same key coming
+    /// on a second connection so never has its record and its partial
+    /// removed under the save of the first, whatever a check answered for
+    /// the second. The save itself forgets through its guard
+    /// ([`Saving::forget`]); a record held with no save left is let go
+    /// first ([`Self::release`]). [`Self::remove_all`] and
+    /// [`Self::expire`] (for a key not in its `live`) still remove a
+    /// file being received: the person's word, and the caller's list.
+    /// The refusal is here, and not a question
+    /// asked before the call, so that no caller can leave it out or have
+    /// the answer change between the two.
     pub fn forget(&self, peer: PeerId, key: TransferKey) -> Result<(), ResumeError> {
+        // Taken as a save takes it, for as long as the removal: a save
+        // that starts meanwhile is told it is in use.
+        let claim = self.saving(peer, key)?;
+        let forgotten = self.forget_as(peer, key, false);
+        drop(claim);
+        forgotten
+    }
+
+    /// Removes the records of `key` from or to `peer`. With `saving`, the
+    /// word of the save on that file, its receiving record goes held or
+    /// not; without, one this store holds stays: a save took it since.
+    fn forget_as(&self, peer: PeerId, key: TransferKey, saving: bool) -> Result<(), ResumeError> {
         for (_, found) in self.all()? {
             if let Some(found) = found
                 && found.record.peer() == peer
                 && found.record.key() == key
             {
-                self.remove(&found);
+                let own = saving || matches!(found.record, Record::Sending(_));
+                self.remove_claimed(&found, own);
             }
         }
         Ok(())
+    }
+
+    /// Takes the file of `key` from `peer` for one save, before anything
+    /// is done for a stream that brings it: before a check's answer is
+    /// acted on, before [`Self::reopen_hashed`], before the save. The
+    /// guard is held around the save, and says how it ended
+    /// ([`Saving::kept`], [`Saving::forget`]); dropped without either, by
+    /// a save's future dropped or a panic, it lets the record go, so the
+    /// file can be continued later and is not in use for good.
+    ///
+    /// [`ResumeError::Busy`] when a save of this store is on that file
+    /// already: another guard is, or the store holds its receiving
+    /// record. The stream is then refused, and nothing of the file is
+    /// touched. It reads the store's folder, as a lookup does.
+    pub fn saving(&self, peer: PeerId, key: TransferKey) -> Result<Saving<'_>, ResumeError> {
+        let all = self.all()?;
+        let mut state = lock(&self.state);
+        let held = all.into_iter().filter_map(|(_, found)| found).any(|found| {
+            matches!(&found.record, Record::Receiving(r) if r.peer == peer && r.key == key)
+                && state.held.contains_key(&found.name)
+        });
+        // Looked up and taken under one lock: of two at once, one is told.
+        if held || !state.saving.insert((peer, key)) {
+            return Err(ResumeError::Busy);
+        }
+        Ok(Saving {
+            store: self,
+            peer,
+            key,
+        })
     }
 
     /// Removes every record, of `peer` only when given, with the received
@@ -855,10 +962,13 @@ impl Store {
 
     /// Removes what is past its time or the caps, never a record of `live`
     /// (the files of sessions still running, moving or paused, each by its
-    /// peer and its key: a key names a file to one peer only):
+    /// peer and its key: a key names a file to one peer only). Run it at
+    /// each start: until it has, a file under a record's name that is not
+    /// that record keeps its key without one.
     ///
-    /// - a file with no slot that reads (its journal entry removes the
-    ///   partial);
+    /// - a file with no slot that reads, by its name alone (its journal
+    ///   entry removes the partial): a record torn at its first write, or
+    ///   a file another program put under a record's name;
     /// - any record whose last byte is older than `keep_for` at `now`;
     /// - past [`Limits::sending`] sending records, the oldest;
     /// - past [`Limits::per_peer`] files of one peer, that peer's oldest;
@@ -990,6 +1100,93 @@ impl Store {
     }
 }
 
+/// One save's claim on a file being received, from [`Store::saving`]:
+/// while it lives, no other save of its store takes that file, and
+/// [`Store::forget`] leaves it.
+///
+/// Hold it around the save, outside the save's future, and end it by how
+/// the save ended:
+///
+/// - published, or stopped with nothing kept: [`Self::forget`];
+/// - stopped with its partial kept: [`Self::kept`];
+/// - neither (the save's future dropped, a panic, an early return):
+///   dropping it lets the receiving record go, removing nothing, so a
+///   later [`Store::reopen_hashed`] continues the file from what the
+///   record last said.
+///
+/// Dropping it writes nothing, and reads a record file only in a store
+/// with more of them than its index remembers ([`Limits::indexed`]). On
+/// Windows a write of the dropped save still under way on the blocking
+/// pool keeps the partial open for a moment longer: a reopening in that
+/// moment is [`ResumeError::Busy`], and is tried again. On Unix nothing
+/// shuts that reopening out, and such a write (one slice at most) may
+/// land after it, at its own offset past the bytes the record names: the
+/// bytes the dropped stream brought there. A file whose sender's bytes
+/// changed in between is not continued at all (the sender's check), so
+/// they are the bytes the continued stream brings too.
+#[derive(Debug)]
+pub struct Saving<'a> {
+    store: &'a Store,
+    peer: PeerId,
+    key: TransferKey,
+}
+
+impl Saving<'_> {
+    /// The save stopped and kept its partial, now `held.have` whole bytes
+    /// hashing to `held.prefix`, its last byte come at `now`: the record
+    /// is written at once, after `partial` is flushed
+    /// ([`Store::keep`] at a drop), and let go. An error leaves the
+    /// record as it was last written, and lets it go all the same.
+    ///
+    /// It flushes a file and writes a record: on an async runtime, call it
+    /// where blocking is allowed (`tokio::task::block_in_place`; the guard
+    /// borrows its store, so it does not move to the blocking pool).
+    pub fn kept(self, held: &Held, now: u64, partial: &File) -> Result<(), ResumeError> {
+        self.store.keep(self.peer, held, now, partial, true)?;
+        Ok(())
+    }
+
+    /// The save published its file, or ended with nothing kept: the
+    /// records of the file go, as [`Store::forget`] removes them, with
+    /// what is left of a partial, by identity.
+    pub fn forget(self) -> Result<(), ResumeError> {
+        self.store.forget_as(self.peer, self.key, true)
+    }
+}
+
+impl Drop for Saving<'_> {
+    fn drop(&mut self) {
+        let (peer, key) = (self.peer, self.key);
+        let mut state = lock(&self.store.state);
+        let State { held, index, .. } = &mut *state;
+        // Only the record of the file received: a sending one has no save.
+        // From what the store holds, with no folder listed: this must not
+        // fail. One whose first write was torn is known by its name.
+        let own = file_name(true, peer, key);
+        let received =
+            |r: &Record| matches!(r, Record::Receiving(r) if r.peer == peer && r.key == key);
+        let names: Vec<String> = held
+            .iter()
+            .filter(|(name, file)| {
+                **name == own
+                    || match index.get(*name) {
+                        Some(was) => was.found.as_ref().is_some_and(|f| received(&f.record)),
+                        None => read_held(file)
+                            .and_then(|bytes| parse(name, &bytes))
+                            .is_some_and(|f| received(&f.record)),
+                    }
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in names {
+            held.remove(&name);
+            // No longer its only writer: read again when next looked up.
+            index.remove(&name);
+        }
+        state.saving.remove(&(peer, key));
+    }
+}
+
 /// A record taken to reopen its partial, while the prefix is read: let go
 /// when that reading's future is dropped, so a reopening that was
 /// cancelled does not leave the file in use for good.
@@ -1098,6 +1295,19 @@ async fn hash_partial(
     Ok((dir, file, hasher))
 }
 
+/// Whether `a` and `b` are records of one transfer: the same kind, peer
+/// and key.
+fn same_record(a: &Record, b: &Record) -> bool {
+    matches!(a, Record::Receiving(_)) == matches!(b, Record::Receiving(_))
+        && a.peer() == b.peer()
+        && a.key() == b.key()
+}
+
+/// Whether the held file has no byte.
+fn empty(file: &File) -> bool {
+    file.metadata().is_ok_and(|meta| meta.len() == 0)
+}
+
 /// What a record file's bytes hold, when a slot reads.
 fn parse(name: &str, bytes: &[u8]) -> Option<Found> {
     let (record, seq, slot) = newest(bytes)?;
@@ -1131,7 +1341,7 @@ fn read_path(path: &Path) -> Option<Vec<u8>> {
 /// A record file's name: the SHA-256 of its kind, peer and key. One
 /// transfer has one name, so the second of two stores that first write
 /// it at the same moment finds the file made.
-fn file_name(receiving: bool, peer: PeerId, key: TransferKey) -> String {
+pub(crate) fn file_name(receiving: bool, peer: PeerId, key: TransferKey) -> String {
     let mut context = ring::digest::Context::new(&ring::digest::SHA256);
     context.update(&[u8::from(receiving)]);
     context.update(&peer.0);

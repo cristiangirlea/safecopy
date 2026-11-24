@@ -29,5 +29,10 @@ features = ["Win32_Foundation", "Win32_Storage_FileSystem"]
 safecopy-manifest.workspace = true
 tokio = { version = "1.53.3", features = ["rt", "rt-multi-thread", "macros", "io-util", "fs"] }
 
+# A junction made in tests with no other program run: the control call for it.
+[target.'cfg(windows)'.dev-dependencies.windows]
+version = "0.62.2"
+features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"]
+
 [lints]
 workspace = true

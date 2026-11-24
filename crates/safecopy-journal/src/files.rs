@@ -115,10 +115,12 @@ pub fn take(path: &Path, most: usize) -> io::Result<(File, Vec<u8>)> {
 /// one: for this process to write, while others still read it
 /// ([`open_read`]) and none takes it or holds it too. On Windows it is
 /// open with read sharing only; on Unix under an exclusive lock, which
-/// readers do not ask for. A link is opened as itself and refused; one
-/// already held or taken fails ([`busy`] tells that error from others),
-/// and one removed in the moment it was opened is
-/// [`io::ErrorKind::NotFound`].
+/// readers do not ask for. A link is opened as itself and refused, and so
+/// is a file with more than one name (a hard link): what is written
+/// through the handle would land in a file some other name shows, which
+/// nothing says is a record ([`refused`] tells those errors from others).
+/// One already held or taken fails ([`busy`] tells that error), and one
+/// removed in the moment it was opened is [`io::ErrorKind::NotFound`].
 pub fn hold(path: &Path) -> io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true);
@@ -156,6 +158,13 @@ pub fn hold(path: &Path) -> io::Result<File> {
     if let Some(hook) = crate::seams::HOLD_OPENED.take() {
         hook();
     }
+    // Counted through the handle: the file opened, whatever its name shows
+    // next. None left: removed in the moment it was opened.
+    match links(&file, &meta)? {
+        0 => return Err(io::ErrorKind::NotFound.into()),
+        1 => {}
+        _ => return Err(io::ErrorKind::InvalidInput.into()),
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -168,6 +177,45 @@ pub fn hold(path: &Path) -> io::Result<File> {
         }
     }
     Ok(file)
+}
+
+/// How many names the open file `file` has.
+fn links(file: &File, meta: &std::fs::Metadata) -> io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Read now, not when the file was opened.
+        let _ = meta;
+        Ok(file.metadata()?.nlink())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let _ = meta;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: the handle is open for as long as `file` is borrowed, and
+        // `info` is a whole structure of the size the call fills.
+        unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
+            .map_err(crate::win::win32)?;
+        Ok(info.nNumberOfLinks.into())
+    }
+}
+
+/// Whether `error`, from [`hold`], [`take`] or [`open_read`], says what is
+/// under the name is not a file they open: a link, anything but a regular
+/// file or, for [`hold`], a file with more than one name. The system's own
+/// errors are not it, but for the one a link gives where links are not
+/// followed.
+pub fn refused(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return true;
+    }
+    error.kind() == io::ErrorKind::InvalidInput && error.raw_os_error().is_none()
 }
 
 /// Whether `error`, from [`hold`] or [`take`], says another holder has

@@ -416,6 +416,104 @@ fn a_partial_is_found_present_without_being_opened_for_its_bytes() {
         std::os::unix::fs::symlink(place.join("moved"), place.join("a.bin.part")).unwrap();
         assert_eq!(at.present(), None, "a link to the very file");
     }
+    #[cfg(windows)]
+    {
+        // A junction to the folder the very file is in.
+        junction(&place, &place.join("a.bin.part"));
+        assert_eq!(at.present(), None, "a junction");
+        assert_eq!(
+            std::fs::read(place.join("a.bin.part").join("moved"))
+                .unwrap()
+                .len(),
+            10
+        );
+        std::fs::remove_dir(place.join("a.bin.part")).unwrap();
+        // A file symbolic link needs Developer Mode or an administrator.
+        let (moved, link) = (place.join("moved"), place.join("a.bin.part"));
+        if std::os::windows::fs::symlink_file(moved, link).is_ok() {
+            assert_eq!(at.present(), None, "a link to the very file");
+        } else {
+            assert!(
+                !symlinks_required(),
+                "SAFECOPY_REQUIRE_SYMLINKS is set, but no file symbolic link can be made"
+            );
+            eprintln!("skipped: no symbolic link can be made here");
+        }
+    }
+}
+
+/// Makes `link` a junction to the folder `target`, with no other program
+/// run: a junction needs no privilege.
+#[cfg(windows)]
+fn junction(target: &std::path::Path, link: &std::path::Path) {
+    use ::windows::Win32::Foundation::HANDLE;
+    use ::windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    use ::windows::Win32::System::IO::DeviceIoControl;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    std::fs::create_dir(link).unwrap();
+    let folder = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+        .open(link)
+        .unwrap();
+    // The target as the system names it, then an empty name to show.
+    let name: Vec<u16> = std::ffi::OsStr::new(r"\??\")
+        .encode_wide()
+        .chain(target.as_os_str().encode_wide())
+        .collect();
+    let len = (name.len() * 2) as u16;
+    let mut buffer = Vec::new();
+    buffer.extend(IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+    for field in [len + 12, 0, 0, len, len + 2, 0] {
+        buffer.extend(field.to_le_bytes());
+    }
+    buffer.extend(name.iter().flat_map(|unit| unit.to_le_bytes()));
+    buffer.extend([0; 4]);
+    // SAFETY: the handle is open, and the buffer is whole for the length given.
+    unsafe {
+        DeviceIoControl(
+            HANDLE(folder.as_raw_handle()),
+            FSCTL_SET_REPARSE_POINT,
+            Some(buffer.as_ptr().cast()),
+            buffer.len() as u32,
+            None,
+            0,
+            None,
+            None,
+        )
+    }
+    .unwrap();
+}
+
+/// A record file with a second name is some other file as well: what a
+/// hold would write through its handle would land there.
+#[test]
+fn a_file_with_a_second_name_is_not_held_and_is_still_taken() {
+    let (_scratch, place, _) = scratch("hold-linked");
+    let (theirs, path) = (place.join("thesis.docx"), place.join("a.resume"));
+    std::fs::write(&theirs, b"theirs").unwrap();
+    std::fs::hard_link(&theirs, &path).unwrap();
+    let held = files::hold(&path).unwrap_err();
+    assert_eq!(held.kind(), io::ErrorKind::InvalidInput);
+    assert!(files::refused(&held) && !files::busy(&held));
+    // A cleanup still takes it, to remove the name alone.
+    let (file, bytes) = files::take(&path, 100).unwrap();
+    assert_eq!(bytes, b"theirs");
+    files::delete(&file, &path).unwrap();
+    drop(file);
+    assert!(!path.exists());
+    assert_eq!(std::fs::read(&theirs).unwrap(), b"theirs");
+    // With one name, it is held; a system's own error is no refusal.
+    std::fs::write(&path, b"one").unwrap();
+    assert!(files::hold(&path).is_ok());
+    let gone = files::hold(&place.join("none.resume")).unwrap_err();
+    assert!(!files::refused(&gone));
 }
 
 #[test]

@@ -50,7 +50,10 @@ partials left: cleanup removes only what a journal proves it wrote. On
 Linux and macOS, where an inode is reused once its file is deleted, a
 journal kept longer can meet a new partial of the same name and inode in
 the same folder; run a cleanup after forgetting kept files so such a
-journal does not outlast them.
+journal does not outlast them. A journal that lists a kept partial now
+lives as long as that partial is kept (up to the caller's keep time, and
+512 journals by default) where it went at the next cleanup, so the time
+in which an old journal can meet such a new partial is that much longer.
 
 ```rust
 use std::ffi::OsStr;
@@ -130,6 +133,11 @@ how long and how many journals cleanup keeps for a later try (30 days,
 `safecopy-resume` keeps its records with them. A file held (`create`,
 `hold`) has one writer and is still read by other processes (`open_read`);
 `busy` tells the error of a file another holder has from any other.
+`hold` refuses a link and a file with more than one name (a hard link,
+counted through the open handle: `st_nlink`, or the number of links
+`GetFileInformationByHandle` gives): what it wrote would land in a file
+another name shows. `take`, which only reads and removes the name, takes
+such a file. `refused` tells those refusals from the system's errors.
 
 ## A folder renamed while its transfer runs
 
@@ -220,6 +228,17 @@ After a crash, cleanup:
   kept and opened again is listed by the new run's journal
   (`a_reopened_partial_with_bytes_is_listed_by_the_new_runs_journal`).
   `ended` is for a partial that was removed, not for one kept.
+- **`files::hold` refuses a file with more than one name**, where it
+  held any regular file: a hard link put under a record's name is no
+  longer written through. New: **`files::refused(&error)`**, whether an
+  error says the name holds a link, something other than a regular file
+  or a file with a second name
+  (`a_file_with_a_second_name_is_not_held_and_is_still_taken`). A file
+  removed in the moment it was opened, with no name left, is `NotFound`
+  as before.
+- **Tested:** a junction and a file symbolic link under a partial's name
+  are not `present()` on Windows
+  (`a_partial_is_found_present_without_being_opened_for_its_bytes`).
 - **`files::hold(path)`** holds a record file that is already there as
   `files::create` holds a new one, and **`files::busy(&error)`** says
   whether an error means another holder has it

@@ -642,6 +642,8 @@ async fn a_from_zero_stream_under_a_kept_key_restarts_and_is_the_one_resend() {
         resent.check(PEER, Some(&record), &zero, b"f.bin"),
         Take::Resend
     );
+    // The save that wrote the record is over.
+    later(&side);
     side.store.forget(PEER, key(11)).unwrap();
     assert!(side.store.received(PEER, key(11)).is_none());
     assert!(
@@ -1257,6 +1259,7 @@ async fn a_stream_from_another_whole_chunk_restarts_and_marks_the_key() {
     );
     assert!(resent.marked(PEER, key(60)));
     // The caller removes the record; the resend from zero is taken once.
+    later(&side);
     side.store.forget(PEER, key(60)).unwrap();
     let zero = Resumable { from: 0, ..other };
     assert_eq!(resent.check(PEER, None, &zero, b"f.bin"), Take::Resend);
@@ -1454,6 +1457,8 @@ async fn a_cut_save_keeps_its_partial_and_a_later_one_continues_and_publishes() 
     let mut reader = &stream[..stream.len() - 33 - (C / 2 + 1000) as usize];
     let prefix = Resumable::read_prefix(&mut reader).await.unwrap();
     let mut resent = Resent::new();
+    // The file is this save's from before the check's answer is acted on.
+    let saving = receiver.store.saving(PEER, key(100)).unwrap();
     assert_eq!(resent.check(PEER, None, &prefix, b"f.bin"), Take::New);
     let first = journal(&receiver);
     let hooks = Keeping {
@@ -1488,16 +1493,13 @@ async fn a_cut_save_keeps_its_partial_and_a_later_one_continues_and_publishes() 
         have: kept.have(),
         prefix: kept.prefix(),
     };
-    assert!(
-        receiver
-            .store
-            .keep(PEER, &held, 20, &kept.file, true)
-            .unwrap()
-    );
+    // Written at once and let go, by the save's guard.
+    saving.kept(&held, 20, &kept.file).unwrap();
+    assert_eq!(receiver.store.received(PEER, key(100)).unwrap().have, 2 * C);
     // The session ends: nothing is called on the journal for a kept partial.
     drop(kept);
     drop(first);
-    assert_eq!(receiver.store.release_peer(PEER), 1);
+    assert_eq!(receiver.store.release_peer(PEER), 0, "let go already");
     assert_eq!(files_in(&receiver.journals).len(), 1);
     // A cleanup at the next start leaves the file, and the journal that lists it.
     for _ in 0..2 {
@@ -1554,6 +1556,7 @@ async fn a_cut_save_keeps_its_partial_and_a_later_one_continues_and_publishes() 
 
     let mut reader = &stream[..];
     let prefix = Resumable::read_prefix(&mut reader).await.unwrap();
+    let saving = receiver.store.saving(PEER, key(100)).unwrap();
     let record = receiver.store.received(PEER, key(100)).unwrap();
     assert_eq!(
         resent.check(PEER, Some(&record), &prefix, b"f.bin"),
@@ -1634,7 +1637,13 @@ async fn a_cut_save_keeps_its_partial_and_a_later_one_continues_and_publishes() 
     }
     // Published: settled in its journal, and its record forgotten.
     second.done(0).unwrap();
-    receiver.store.forget(PEER, key(100)).unwrap();
+    // Only the save's own guard forgets a file being saved.
+    assert_eq!(
+        receiver.store.forget(PEER, key(100)),
+        Err(ResumeError::Busy)
+    );
+    saving.forget().unwrap();
+    assert!(receiver.store.received(PEER, key(100)).is_none());
     drop(second);
     assert!(saved_at.exists(), "forgetting removes no published file");
     // The first run's journal has nothing left to wait for.
@@ -2190,8 +2199,13 @@ async fn a_partial_being_continued_is_not_reopened_a_second_time() {
     let (_, file) = side.store.reopen(PEER, key(171)).unwrap();
     assert_eq!(file.metadata().unwrap().len(), 2 * C);
     drop(file);
-    // Forgotten, it is not held either.
+    // In use, it is not forgotten under its save; let go, it is.
+    assert_eq!(side.store.forget(PEER, key(171)), Err(ResumeError::Busy));
+    assert!(side.store.received(PEER, key(171)).is_some());
+    assert!(side.place.join("f.part").exists());
+    assert!(side.store.release(PEER, key(171)));
     side.store.forget(PEER, key(171)).unwrap();
+    assert!(!side.place.join("f.part").exists());
     assert_eq!(
         side.store.reopen(PEER, key(171)).err(),
         Some(ResumeError::NotHeld)
@@ -2437,6 +2451,10 @@ async fn a_peer_that_connects_again_while_its_file_comes_does_not_stop_the_save(
         assert_eq!(keys(&store.kept_by(PEER).unwrap()), [key(192)]);
         let again = store.reopen_hashed(PEER, key(192)).await;
         assert_eq!(again.err(), Some(ResumeError::Busy));
+        // Whatever a check answered for that connection's stream, the
+        // file of the save under way is not forgotten.
+        assert_eq!(store.forget(PEER, key(192)), Err(ResumeError::Busy));
+        assert_eq!(store.saving(PEER, key(192)).err(), Some(ResumeError::Busy));
         record_stays();
         // The save goes on, and its next chunk is recorded.
         sending.write_all(&bytes[c + 10..2 * c + 10]).await.unwrap();
@@ -2473,4 +2491,401 @@ async fn a_peer_that_connects_again_while_its_file_comes_does_not_stop_the_save(
     let (_, kept) = store.reopen_hashed(PEER, key(192)).await.unwrap();
     assert_eq!(kept.have(), 2 * C);
     assert_eq!(kept.prefix(), hash(&bytes[..2 * c]));
+}
+
+/// Makes `link` a junction to the folder `target`, with no other program
+/// run: a junction needs no privilege.
+#[cfg(windows)]
+fn junction(target: &std::path::Path, link: &std::path::Path) {
+    use ::windows::Win32::Foundation::HANDLE;
+    use ::windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    use ::windows::Win32::System::IO::DeviceIoControl;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    std::fs::create_dir(link).unwrap();
+    let folder = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+        .open(link)
+        .unwrap();
+    // The target as the system names it, then an empty name to show.
+    let name: Vec<u16> = std::ffi::OsStr::new(r"\??\")
+        .encode_wide()
+        .chain(target.as_os_str().encode_wide())
+        .collect();
+    let len = (name.len() * 2) as u16;
+    let mut buffer = Vec::new();
+    buffer.extend(IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+    for field in [len + 12, 0, 0, len, len + 2, 0] {
+        buffer.extend(field.to_le_bytes());
+    }
+    buffer.extend(name.iter().flat_map(|unit| unit.to_le_bytes()));
+    buffer.extend([0; 4]);
+    // SAFETY: the handle is open, and the buffer is whole for the length given.
+    unsafe {
+        DeviceIoControl(
+            HANDLE(folder.as_raw_handle()),
+            FSCTL_SET_REPARSE_POINT,
+            Some(buffer.as_ptr().cast()),
+            buffer.len() as u32,
+            None,
+            0,
+            None,
+            None,
+        )
+    }
+    .unwrap();
+}
+
+/// A record of one whole chunk of zeros for `key`, and its partial, not
+/// yet written to any store.
+fn unwritten(side: &Side, key: TransferKey, name: &str) -> (Receiving, File) {
+    let partial = format!("{name}.part");
+    let file = side.root.create(OsStr::new(&partial)).unwrap();
+    file.set_len(C).unwrap();
+    let record = Receiving {
+        peer: PEER,
+        key,
+        same: Vec::new(),
+        size: C,
+        at: PartialAt::of(&side.root, &side.root, &file, OsStr::new(&partial)).unwrap(),
+        have: C,
+        prefix: hash(&vec![0; C as usize]),
+        created: 5,
+        last: 5,
+    };
+    (record, file)
+}
+
+/// A record file's name can be worked out from its peer and key: a file
+/// put under it by another program is not written, whatever it is.
+#[tokio::test]
+async fn a_file_under_a_records_name_that_is_not_its_record_is_not_written() {
+    let side = side("not-its-record", Limits::default());
+    let records = side.base.join("records");
+    let store = &side.store;
+    let hour = Duration::from_secs(3600);
+
+    // Bytes that are no record.
+    let (record, partial) = unwritten(&side, key(200), "plain");
+    let name = records.join(crate::store::file_name(true, PEER, key(200)));
+    let theirs = b"someone's notes, longer than nothing".to_vec();
+    std::fs::write(&name, &theirs).unwrap();
+    for _ in 0..2 {
+        assert_eq!(store.receiving(&record, &partial), Err(ResumeError::Busy));
+        assert!(std::fs::read(&name).unwrap() == theirs, "not a byte of it");
+    }
+    assert!(store.received(PEER, key(200)).is_none());
+    // The key is free again once an expiry has removed the file.
+    assert_eq!(store.expire(10, hour, &[]).unwrap().removed, 1);
+    assert!(!name.exists());
+    store.receiving(&record, &partial).unwrap();
+    assert_eq!(store.received(PEER, key(200)).unwrap().have, C);
+
+    // Another file of the person's, given a second name there.
+    let (record, partial) = unwritten(&side, key(201), "linked");
+    let name = records.join(crate::store::file_name(true, PEER, key(201)));
+    let other = side.place.join("thesis.docx");
+    std::fs::write(&other, &theirs).unwrap();
+    std::fs::hard_link(&other, &name).unwrap();
+    assert_eq!(store.receiving(&record, &partial), Err(ResumeError::Busy));
+    assert!(std::fs::read(&other).unwrap() == theirs, "not a byte of it");
+    assert_eq!(store.expire(10, hour, &[]).unwrap().removed, 1);
+    assert!(!name.exists(), "the name alone goes");
+    assert!(std::fs::read(&other).unwrap() == theirs);
+    store.receiving(&record, &partial).unwrap();
+    assert_eq!(store.received(PEER, key(201)).unwrap().have, C);
+
+    // A file that reads as the very record, under a second name: only
+    // its count of names says it is not the store's to write.
+    let (mut record, partial) = unwritten(&side, key(202), "copied");
+    let name = records.join(crate::store::file_name(true, PEER, key(202)));
+    store.receiving(&record, &partial).unwrap();
+    assert!(store.release(PEER, key(202)));
+    let copy = side.place.join("copy.bin");
+    std::fs::copy(&name, &copy).unwrap();
+    std::fs::remove_file(&name).unwrap();
+    std::fs::hard_link(&copy, &name).unwrap();
+    let was = std::fs::read(&copy).unwrap();
+    record.last = 9;
+    assert_eq!(store.receiving(&record, &partial), Err(ResumeError::Busy));
+    let held = Held {
+        key: key(202),
+        have: C,
+        prefix: record.prefix,
+    };
+    assert_eq!(
+        store.keep(PEER, &held, 9, &partial, true),
+        Err(ResumeError::Busy)
+    );
+    assert_eq!(store.reopen(PEER, key(202)).err(), Some(ResumeError::Busy));
+    assert!(std::fs::read(&copy).unwrap() == was, "not a byte of it");
+
+    // An empty file with the one name is a record not yet written.
+    let (record, partial) = unwritten(&side, key(203), "empty");
+    let name = records.join(crate::store::file_name(true, PEER, key(203)));
+    std::fs::write(&name, b"").unwrap();
+    store.receiving(&record, &partial).unwrap();
+    assert_eq!(store.received(PEER, key(203)).unwrap().have, C);
+}
+
+/// A record whose first write was torn by a crash: its file reads as
+/// nothing, and is written by no later run until an expiry removed it.
+#[tokio::test]
+async fn a_first_write_torn_by_a_crash_waits_for_the_next_expiry() {
+    let mut side = side("torn-first", Limits::default());
+    let records = side.base.join("records");
+    let (record, partial) = unwritten(&side, key(204), "f");
+    seams::TEAR.set(true);
+    side.store.receiving(&record, &partial).unwrap();
+    assert!(side.store.received(PEER, key(204)).is_none());
+    // The process is gone; the next one finds the file.
+    side.store = Store::open(&records, Limits::default()).unwrap();
+    let torn = std::fs::read(records.join(&files_in(&records)[0])).unwrap();
+    assert_eq!(
+        side.store.receiving(&record, &partial),
+        Err(ResumeError::Busy)
+    );
+    assert!(std::fs::read(records.join(&files_in(&records)[0])).unwrap() == torn);
+    let expired = side.store.expire(10, Duration::from_secs(3600), &[]);
+    assert_eq!(expired.unwrap().removed, 1);
+    side.store.receiving(&record, &partial).unwrap();
+    assert_eq!(side.store.received(PEER, key(204)).unwrap().have, C);
+}
+
+/// A connection lost takes its task with it, and the save's future is
+/// dropped where it stood: the file is not left in use for good.
+#[tokio::test]
+async fn a_save_dropped_or_panicked_leaves_its_file_to_be_continued() {
+    use safecopy_chunks::{SaveOptions, Start, Target, save_resumable};
+    use tokio::io::AsyncWriteExt;
+    let side = side("save-dropped", Limits::default());
+    let bytes = data(3 * C);
+    let c = C as usize;
+    let journal = journal(&side);
+    let keeping = Keeping {
+        side: &side,
+        journal: &journal,
+        key: key(193),
+        name: "f.bin",
+        size: 3 * C,
+        partial: Default::default(),
+    };
+    let hooks = Telling(keeping, Default::default());
+    let (mut sending, mut receiving) = tokio::io::duplex(1 << 16);
+    let store = &side.store;
+    let busy = Some(ResumeError::Busy);
+    let guard = store.saving(PEER, key(193)).unwrap();
+    // The same key on a second connection, before any record of it.
+    assert_eq!(store.saving(PEER, key(193)).err(), busy);
+    assert_eq!(store.forget(PEER, key(193)).err(), busy);
+    assert!(store.saving(OTHER, key(193)).is_ok(), "another peer's file");
+    {
+        let target = Target {
+            dir: &side.root,
+            name: "f.bin",
+            size: 3 * C,
+        };
+        let options = SaveOptions::default();
+        let pending = std::future::pending();
+        let (start, keep) = (Start::New, &cut_short);
+        let save = save_resumable(
+            &mut receiving,
+            target,
+            start,
+            keep,
+            &options,
+            &hooks,
+            pending,
+        );
+        tokio::pin!(save);
+        // One whole chunk and no byte more, so no write is under way.
+        let peer = async {
+            sending.write_all(&bytes[..c]).await.unwrap();
+            hooks.recorded(C).await;
+        };
+        tokio::select! {
+            biased;
+            _ = &mut save => panic!("its stream is still open"),
+            () = peer => {}
+        }
+        assert_eq!(store.forget(PEER, key(193)).err(), busy);
+        assert_eq!(store.reopen(PEER, key(193)).err(), busy);
+        // The save's future is dropped here, with its partial open.
+    }
+    assert_eq!(store.reopen(PEER, key(193)).err(), busy, "still held");
+    drop(guard);
+    assert!(!store.release(PEER, key(193)), "let go by the guard");
+    assert!(side.place.join("f.bin.part").exists());
+    assert_eq!(keys(&store.kept_by(PEER).unwrap()), [key(193)]);
+
+    // A panic while the next save has it lets it go as well.
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = store.saving(PEER, key(193)).unwrap();
+        drop(store.reopen(PEER, key(193)).unwrap());
+        std::panic::resume_unwind(Box::new("a save that panics"));
+    }));
+    assert!(panicked.is_err());
+
+    // Continued later, from what the record last said.
+    let guard = store.saving(PEER, key(193)).unwrap();
+    let (_, kept) = store.reopen_hashed(PEER, key(193)).await.unwrap();
+    assert_eq!(kept.have(), C);
+    assert_eq!(kept.prefix(), hash(&bytes[..c]));
+    // A save that ends with nothing kept: the record and the partial go.
+    drop(kept);
+    guard.forget().unwrap();
+    assert!(store.received(PEER, key(193)).is_none());
+    assert!(!side.place.join("f.bin.part").exists());
+    assert!(files_in(&side.base.join("records")).is_empty());
+    // And the key is free for a new save.
+    assert!(store.saving(PEER, key(193)).is_ok());
+}
+
+/// A sending record has no save to cut: it is forgotten while held.
+#[tokio::test]
+async fn a_sending_record_is_forgotten_while_its_store_holds_it() {
+    let side = side("forget-sending", Limits::default());
+    source(&side, key(194), b"sent");
+    assert!(side.store.sent(PEER, key(194)).is_some());
+    side.store.forget(PEER, key(194)).unwrap();
+    assert!(side.store.sent(PEER, key(194)).is_none());
+    assert!(files_in(&side.base.join("records")).is_empty());
+}
+
+/// What is under a kept partial's name is listed only when it is the
+/// recorded file itself, never through a link to it.
+#[tokio::test]
+async fn a_link_under_a_kept_partials_name_is_not_listed() {
+    let side = side("kept-link", Limits::default());
+    kept_zeros(&side, PEER, key(205), "f", 1, 5);
+    later(&side);
+    let (partial, moved) = (side.place.join("f.part"), side.place.join("moved"));
+    assert_eq!(keys(&side.store.kept_by(PEER).unwrap()), [key(205)]);
+    std::fs::rename(&partial, &moved).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&moved, &partial).unwrap();
+        assert!(side.store.kept_by(PEER).unwrap().is_empty(), "a link");
+        std::fs::remove_file(&partial).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        junction(&side.place, &partial);
+        assert!(partial.join("moved").exists(), "it leads there");
+        assert!(side.store.kept_by(PEER).unwrap().is_empty(), "a junction");
+        std::fs::remove_dir(&partial).unwrap();
+        // A file symbolic link needs Developer Mode or an administrator.
+        if std::os::windows::fs::symlink_file(&moved, &partial).is_ok() {
+            assert!(side.store.kept_by(PEER).unwrap().is_empty(), "a link");
+            std::fs::remove_file(&partial).unwrap();
+        } else {
+            let required = std::env::var_os("SAFECOPY_REQUIRE_SYMLINKS");
+            assert!(
+                required.is_none_or(|v| v.is_empty()),
+                "SAFECOPY_REQUIRE_SYMLINKS is set, but no file symbolic link can be made"
+            );
+            eprintln!("skipped: no symbolic link can be made here");
+        }
+    }
+    // Under its name again, it is listed, and its record was not removed.
+    std::fs::rename(&moved, &partial).unwrap();
+    assert_eq!(keys(&side.store.kept_by(PEER).unwrap()), [key(205)]);
+}
+
+/// A program spawns these on its runtime: none holds the store's lock,
+/// nor anything else tied to its thread, across a wait.
+#[tokio::test]
+async fn the_stores_futures_can_run_on_another_thread() {
+    fn sendable<T: Send>(_: &T) {}
+    let side = side("send", Limits::default());
+    sendable(&side.store.reopen_hashed(PEER, key(206)));
+    sendable(&side.store.held_hashed(PEER));
+    sendable(&side.store.held_from(PEER));
+    sendable(&side.store.saving(PEER, key(206)).unwrap());
+}
+
+/// A record's file replaced under its name between this store's last
+/// reading of it and its next write: what is there now is not written.
+#[tokio::test]
+async fn a_record_file_that_no_longer_reads_as_its_record_is_not_written() {
+    let side = side("replaced-record", Limits::default());
+    let records = side.base.join("records");
+    let (mut record, partial) = unwritten(&side, key(207), "f");
+    let name = records.join(crate::store::file_name(true, PEER, key(207)));
+    side.store.receiving(&record, &partial).unwrap();
+    assert!(side.store.release(PEER, key(207)));
+    let theirs = b"someone's notes".to_vec();
+    let (path, bytes) = (name.clone(), theirs.clone());
+    seams::LOOKED.set(Some(Box::new(move || {
+        std::fs::write(&path, &bytes).unwrap();
+    })));
+    record.last += 1;
+    assert_eq!(
+        side.store.receiving(&record, &partial),
+        Err(ResumeError::Busy)
+    );
+    assert!(std::fs::read(&name).unwrap() == theirs, "not a byte of it");
+}
+
+/// A guard that ends lets go of its own file's record, and no other's.
+#[tokio::test]
+async fn a_guard_dropped_lets_go_of_its_own_record_only() {
+    let side = side("guard-own", Limits::default());
+    let store = &side.store;
+    let (one, other) = (
+        store.saving(PEER, key(208)).unwrap(),
+        store.saving(PEER, key(209)).unwrap(),
+    );
+    kept_zeros(&side, PEER, key(208), "one", 1, 5);
+    kept_zeros(&side, PEER, key(209), "other", 1, 5);
+    source(&side, key(208), b"sent under the same key");
+    drop(one);
+    assert_eq!(store.reopen(PEER, key(209)).err(), Some(ResumeError::Busy));
+    assert!(store.reopen(PEER, key(208)).is_ok(), "let go");
+    // The sending record of the same key is still this store's to write.
+    let later = Store::open(&side.base.join("records"), Limits::default()).unwrap();
+    let mut sending = later.sent(PEER, key(208)).unwrap();
+    sending.last = 2;
+    assert_eq!(later.sending(&sending), Err(ResumeError::Busy));
+    drop(other);
+    assert!(store.reopen(PEER, key(209)).is_ok());
+}
+
+/// A symbolic link under a record's name leads to some other file: it is
+/// not written through, and an expiry does not remove through it.
+#[tokio::test]
+async fn a_link_under_a_records_name_is_not_written_through() {
+    let side = side("record-link", Limits::default());
+    let records = side.base.join("records");
+    let (record, partial) = unwritten(&side, key(210), "f");
+    let name = records.join(crate::store::file_name(true, PEER, key(210)));
+    let other = side.place.join("thesis.docx");
+    std::fs::write(&other, b"theirs").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&other, &name).unwrap();
+    // A file symbolic link needs Developer Mode or an administrator.
+    #[cfg(windows)]
+    if std::os::windows::fs::symlink_file(&other, &name).is_err() {
+        let required = std::env::var_os("SAFECOPY_REQUIRE_SYMLINKS");
+        assert!(
+            required.is_none_or(|v| v.is_empty()),
+            "SAFECOPY_REQUIRE_SYMLINKS is set, but no file symbolic link can be made"
+        );
+        eprintln!("skipped: no symbolic link can be made here");
+        return;
+    }
+    assert_eq!(
+        side.store.receiving(&record, &partial),
+        Err(ResumeError::Busy)
+    );
+    let expired = side.store.expire(10, Duration::from_secs(3600), &[]);
+    assert_eq!(expired.unwrap().removed, 0);
+    assert!(std::fs::symlink_metadata(&name).is_ok(), "left as it is");
+    assert_eq!(std::fs::read(&other).unwrap(), b"theirs");
 }

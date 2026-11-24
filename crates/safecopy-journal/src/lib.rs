@@ -911,7 +911,10 @@ struct Taken {
 /// whose volume could not be opened, or with a partial that failed
 /// otherwise. A journal is kept at most for [`Settings::keep_for`], and
 /// [`Settings::keep_most`] journals are: past either, the oldest is
-/// removed and its partials left.
+/// removed and its partials left. A journal so lives as long as a partial
+/// it lists is kept: on Unix, where an inode is reused once its file is
+/// deleted, that is as long as it can meet a new partial of the same name
+/// and inode in the same folder, and take it for the one it lists.
 ///
 /// A journal still open in a running transfer, in this process or another,
 /// is left alone; so is one that cannot be opened, and a link or other

@@ -1926,6 +1926,82 @@ async fn a_hook_that_moves_the_files_position_moves_no_byte() {
     std::fs::remove_dir_all(&to).unwrap();
 }
 
+/// A clone of the file kept from `created`, and moved to the file's start
+/// by another thread before every slice is written, while the bytes come.
+#[derive(Default)]
+struct Meddling(Mutex<Option<File>>);
+
+impl Hooks for Meddling {
+    fn created(&self, file: &File, _: &OsStr) -> io::Result<()> {
+        *self.0.lock().unwrap() = Some(file.try_clone()?);
+        Ok(())
+    }
+}
+
+impl Pace for Meddling {
+    fn before_write(&self, _: usize) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let kept = self.0.lock().unwrap().as_ref().map(File::try_clone);
+        let mut kept = kept.expect("created").unwrap();
+        // Joined, so the position is moved before the slice is written.
+        let moved = std::thread::spawn(move || io::Seek::seek(&mut kept, io::SeekFrom::Start(0)));
+        moved.join().unwrap().unwrap();
+        Box::pin(std::future::ready(()))
+    }
+}
+
+#[tokio::test]
+async fn a_clone_of_the_file_moved_on_another_thread_moves_no_byte() {
+    let to = temp("meddling");
+    let dir = Directory::open(&to).unwrap();
+    let c = CHUNK as usize;
+    let bytes = data(c + 3 * SLICE + 9);
+    let stream = framed(&bytes).await;
+    let target = Target {
+        dir: &dir,
+        name: "a.bin",
+        size: bytes.len() as u64,
+    };
+    let meddling = Meddling::default();
+    let options = SaveOptions {
+        pace: &meddling,
+        ..SaveOptions::default()
+    };
+    let keep = |_: &ChunkError| false;
+    let pending = std::future::pending();
+    let saved = save_resumable(
+        &mut &stream[..],
+        target,
+        Start::New,
+        &keep,
+        &options,
+        &meddling,
+        pending,
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.digest, sha(&bytes));
+    assert!(std::fs::read(to.join("a.bin")).unwrap() == bytes);
+    drop((meddling, dir));
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// A write runs on the blocking pool after the call that asked for it
+/// returned: its error is not lost, and comes with the flush.
+#[tokio::test]
+async fn a_placed_write_the_system_refuses_fails_the_flush() {
+    let to = temp("placed-refused");
+    std::fs::write(to.join("a.part"), b"kept").unwrap();
+    // Open for reading only: every write through it is refused.
+    let file = File::open(to.join("a.part")).unwrap();
+    let mut writer = crate::save::Placed::new(&file, 0).unwrap();
+    assert!(writer.write_all(b"more").await.is_ok(), "handed on");
+    assert!(writer.flush().await.is_err(), "refused");
+    assert!(writer.flush().await.is_ok(), "told once");
+    drop((writer, file));
+    assert_eq!(std::fs::read(to.join("a.part")).unwrap(), b"kept");
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
 /// A kept partial with no byte kept, its handle left past the start.
 #[tokio::test]
 async fn a_resumed_save_from_zero_writes_from_the_files_first_byte() {

@@ -56,10 +56,10 @@ file before it gets its name.
   is written and before the next byte is read, for a resume record kept
   from the first chunk on; when it fails and the rule keeps a hook's
   error, the chunk it was told of is kept too, written and hashed as it
-  is. `created` and `whole` get the handle the save writes through:
-  reading or seeking it there moves no byte, since each chunk is written
-  at its own offset, but a clone kept past the hook's return must not be
-  moved.
+  is. `created` and `whole` get the save's own handle: reading or
+  seeking it, there or later through a clone kept, on any thread, moves
+  no byte, since every byte is written at its own offset in the file
+  (a positioned write) and never at the handle's position.
   `save_verified` is this save from `Start::New`, keeping nothing. The
   caller answers for a handed-in hasher matching the partial's bytes
   (`safecopy-resume` gives one read from the disk and checked).
@@ -96,6 +96,13 @@ The framing is fuzzed: `fuzz/fuzz_targets/framing.rs`.
 - **`save_resumable` takes a `Target { dir, name, size }`** where it took
   the three as arguments: `save_resumable(reader, target, start, keep,
   options, hooks, cancel)`. `save_verified` is as it was.
+- **Every byte is written at its own offset**, by a positioned write
+  (`pwrite`, or a write with its offset on Windows), where the position
+  was set before each chunk and the bytes then written at it: a clone of
+  the file kept by a hook and moved while a chunk was written still
+  moved where its bytes landed. Nothing done to the handle's position
+  does now
+  (`a_clone_of_the_file_moved_on_another_thread_moves_no_byte`).
 - **Each chunk is written at its own offset.** The writer shared its
   position with the handle given to `Hooks::created` and `Hooks::whole`,
   and with the one a `Kept` came with: a hook that read or sought the

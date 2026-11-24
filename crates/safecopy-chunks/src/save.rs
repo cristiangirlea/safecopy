@@ -2,16 +2,18 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{self, Seek};
+use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
+use std::task::{Context, Poll, ready};
 
 use safecopy_folder::{
     Applied, Directory, Finish, Marked, Meta, MetaRules, PublishError, PublishRules, Refusal,
     refusal,
 };
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::task::JoinHandle;
 
 use crate::{
     ChunkError, Digest, Hasher, Pace, Progress, Settings, copy_exact, read_end, read_trailer,
@@ -30,10 +32,10 @@ pub trait Hooks: Send + Sync {
 
     /// The partial file `partial` was created as `file`: for a crash record.
     /// Not called for [`Start::Resume`], whose caller holds the file
-    /// already. `file` is the handle the save writes through: reading or
-    /// seeking it here is harmless, since the save sets the position
-    /// before each chunk, but a clone of it kept and moved while the
-    /// bytes come moves where they land. Do not move one after returning.
+    /// already. `file` is the save's own handle: reading or seeking it,
+    /// here or later through a clone kept, moves no byte the save writes,
+    /// since every byte is written at its own offset in the file and
+    /// never at the handle's position.
     fn created(&self, file: &File, partial: &OsStr) -> io::Result<()> {
         let _ = (file, partial);
         Ok(())
@@ -49,9 +51,12 @@ pub trait Hooks: Send + Sync {
     /// partial file is kept with this chunk in it: its bytes are written
     /// and hashed, whatever the hook did not get to record.
     ///
-    /// `file` is the handle the save writes through, as in
-    /// [`Self::created`]: its position is set again before the next chunk,
-    /// and a clone of it must not be moved after this returns.
+    /// `file` is the save's own handle, as in [`Self::created`]: its
+    /// position is nothing to the save.
+    ///
+    /// It is called on the thread that polls the save. A hook that
+    /// flushes to the disk here (a resume record's rewrite) holds that
+    /// thread meanwhile: see `safecopy-resume` for where to run it.
     fn whole(&self, file: &File, have: u64, prefix: Digest) -> io::Result<()> {
         let _ = (file, have, prefix);
         Ok(())
@@ -509,16 +514,13 @@ async fn fill<R: AsyncRead + Unpin + ?Sized>(
     }
     let chunk = run.hasher.chunk();
     let (hasher, whole) = (&mut run.hasher, &mut run.whole);
-    let mut writer = tokio::fs::File::from_std(file.try_clone()?);
+    let mut writer = Placed::new(file, from)?;
     let receiving = async {
-        let mut position = file;
         let mut at = from;
         while at < size {
-            // The handle a kept partial came with, or a hook was given,
-            // shares its position with the writer: each chunk goes to its
-            // own place, wherever that position was left. No write is
-            // under way here: `copy_exact` flushes before it returns.
-            position.seek(io::SeekFrom::Start(at))?;
+            // Each chunk at its own place. No write is under way here:
+            // `copy_exact` flushes before it returns.
+            writer.at = at;
             // One chunk at a time, so the caller hears of each.
             let end = (at / chunk + 1).saturating_mul(chunk).min(size);
             #[cfg(test)]
@@ -562,8 +564,10 @@ async fn fill<R: AsyncRead + Unpin + ?Sized>(
         () = cancel.as_mut() => Err(ChunkError::Cancelled),
         trailer = receiving => trailer,
     };
-    // Every write is done before the handle is used for anything else.
-    drop(writer.into_std().await);
+    // Every write is done, and its handle closed, before the file is
+    // used for anything else.
+    writer.settle().await;
+    drop(writer);
     let trailer = trailer?;
     let digest = hasher.clone().finish();
     if digest != trailer {
@@ -605,4 +609,92 @@ async fn fill<R: AsyncRead + Unpin + ?Sized>(
         applied,
         digest,
     })
+}
+
+/// Writes a file at offsets it keeps itself, never at the handle's
+/// position: whatever moves that position, through the handle a hook was
+/// given or a clone of it on any thread, moves no byte. Each write runs on
+/// the blocking pool; its error comes with the next write or the flush.
+pub(crate) struct Placed {
+    file: Arc<File>,
+    /// Where the next byte goes.
+    at: u64,
+    writing: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl Placed {
+    pub(crate) fn new(file: &File, at: u64) -> io::Result<Self> {
+        Ok(Self {
+            file: Arc::new(file.try_clone()?),
+            at,
+            writing: None,
+        })
+    }
+
+    /// The write under way, ended: its error, when it had one.
+    fn poll_done(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Some(writing) = &mut self.writing else {
+            return Poll::Ready(Ok(()));
+        };
+        let done = ready!(Pin::new(writing).poll(cx));
+        self.writing = None;
+        Poll::Ready(done.unwrap_or_else(|_| Err(io::ErrorKind::Other.into())))
+    }
+
+    /// Waits for the write under way, whatever became of it: for a save
+    /// that has its error already.
+    async fn settle(&mut self) {
+        let _ = std::future::poll_fn(|cx| self.poll_done(cx)).await;
+    }
+}
+
+impl AsyncWrite for Placed {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        ready!(this.poll_done(cx))?;
+        let (file, at, owned) = (this.file.clone(), this.at, bytes.to_vec());
+        this.writing = Some(tokio::task::spawn_blocking(move || {
+            write_at(&file, &owned, at)
+        }));
+        this.at += bytes.len() as u64;
+        Poll::Ready(Ok(bytes.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().poll_done(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().poll_done(cx)
+    }
+}
+
+/// Writes all of `bytes` at the offset `at` of `file`.
+fn write_at(file: &File, bytes: &[u8], at: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(bytes, at)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let (mut bytes, mut at) = (bytes, at);
+        while !bytes.is_empty() {
+            match file.seek_write(bytes, at) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => {
+                    bytes = &bytes[n..];
+                    at += n as u64;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
 }
