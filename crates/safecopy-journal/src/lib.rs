@@ -132,7 +132,9 @@
 //!   that shares no writing or deleting), so a name is never there with
 //!   its file not yet held, and a cleanup's open of a held segment is
 //!   refused: neither side has a moment between finding a file and
-//!   holding it.
+//!   holding it, so no temporary name is used there. What a roll does
+//!   with a taken next name and with an old segment it cannot remove
+//!   holds on every system.
 //! - **Linux, macOS and Android** lock a file after opening it, and the
 //!   lock is on the file, not on its name. A cleanup therefore checks,
 //!   once it has the lock, that the file is still the one its name
@@ -153,11 +155,13 @@
 //!   stays until a cleanup takes it with no journal running under its
 //!   name.
 //! - **A journals folder on a network file system** has weaker locks on
-//!   Unix: Linux turns this lock into a lock a process holds, so a cleanup
-//!   in the process that runs the journal is given it too, and whether
-//!   another computer sees it is the server's matter. Keep the journals
-//!   on a local disk, or run no cleanup in a process that has a journal
-//!   open there.
+//!   Unix: Linux turns this lock into a lock a process holds. A cleanup
+//!   in the process that runs the journal is given it too, and the
+//!   process loses it when it closes any handle of that file, as a
+//!   cleanup or a recovery does with each segment it looks at. Whether
+//!   another computer sees the lock is the server's matter. Keep the
+//!   journals on a local disk, or run no cleanup and no recovery in a
+//!   process that has a journal open there.
 //!
 //! # Systems
 //!

@@ -158,8 +158,10 @@ segment to fit fails with the system's error for the removal.
 - **Windows** makes or opens a file and holds it in one step, an open that
   shares no writing or deleting. A name is never there with its file not
   yet held, and a cleanup's open of a held segment is refused. Neither
-  side has a moment between finding a file and holding it, so nothing more
-  is done there.
+  side has a moment between finding a file and holding it, so no
+  temporary name is used there. The two rules for a roll hold on every
+  system, Windows too: a file under the next segment's name is stepped
+  past, and an old segment whose name cannot be removed stays held.
 - **Linux, macOS and Android** lock a file after opening it, and the lock
   is on the file, not on its name. A cleanup (`files::take`) checks, once
   it has the lock, that the file is still the one its name reaches (the
@@ -190,10 +192,12 @@ segment to fit fails with the system's error for the removal.
 names a file and then locks it on Unix, and fails with the error `busy`
 tells when another had it in between; its caller handles that.
 **A journals folder on a network file system** has weaker locks on Unix:
-Linux turns this lock into a lock a process holds, so a cleanup in the
-process that runs the journal is given it too, and whether another
-computer sees it is the server's matter. Keep the journals on a local
-disk, or run no cleanup in a process that has a journal open there.
+Linux turns this lock into a lock a process holds. A cleanup in the
+process that runs the journal is given it too, and the process loses it
+when it closes any handle of that file, as a cleanup or a recovery does
+with each segment it looks at. Whether another computer sees the lock is
+the server's matter. Keep the journals on a local disk, or run no cleanup
+and no recovery in a process that has a journal open there.
 
 ## A folder renamed while its transfer runs
 
@@ -274,7 +278,9 @@ After a crash, cleanup:
   an old segment whose name cannot be removed stays held, and a file under
   the next segment's name is stepped past: see "A cleanup beside a running
   journal". Windows was not affected by either: its open holds the file in
-  the same step. Tested with each moment held open by a seam, in one
+  the same step. The last two changes hold there too: before, a roll that
+  found its next name taken failed, and every later one with it, and an
+  old segment that could not be removed was let go. Tested with each moment held open by a seam, in one
   process (`meet_tests`). The on-disk format is the same. What is new on
   the disk is the temporary name (`*.jnew`) a segment has for a moment on
   Unix: an older version of this crate that meets one left by a crash
