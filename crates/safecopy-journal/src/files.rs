@@ -6,18 +6,29 @@
 //! it holds an exclusive lock (`flock`), which only other programs that
 //! lock see. Either way another process still reads it ([`open_read`]),
 //! and none takes it ([`take`]) or holds it too ([`hold`]).
+//!
+//! On Windows the open that makes or finds a file is what holds it, in
+//! one step. On Unix the lock comes after the open, and is on the file,
+//! not on its name: [`take`] and [`hold`] therefore check, under the lock,
+//! that the file is still the one its name reaches: a journal removes a
+//! segment's name before letting go of the segment. [`create`] makes the
+//! name and then locks it, so a file it made may be held by another for
+//! that moment; a journal's segments are locked before they are named.
 
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// How many taken names a new journal steps past before it gives up.
-const NAME_TRIES: u32 = 64;
+/// How many taken names a new journal, or the next segment of one, steps
+/// past before it gives up.
+pub(crate) const NAME_TRIES: u32 = 64;
 
 /// A new journal file, held so no other cleanup takes it while its
 /// transfer runs: on Windows open without write or delete sharing, on Unix
-/// under an exclusive lock.
+/// under an exclusive lock. On Unix the file is made and then locked:
+/// another process may hold it in between, and then this fails with the
+/// error [`busy`] tells, the empty file left under its name.
 pub fn create(path: &Path) -> io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.create_new(true).read(true).write(true);
@@ -42,8 +53,160 @@ pub fn create(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// A new journal file in `dir` named `<process>-<count><salt>` and `tail`,
-/// under a name no other has, stepping past one an earlier process left.
+/// A new segment of a journal at `path`, held from before its name is
+/// there: whoever finds the name finds the file held.
+///
+/// Windows makes and holds it in one open. On Unix it is made under a
+/// temporary name (ending `jnew`, which no cleanup takes for a segment),
+/// locked, given its own name as a second one, never in place of
+/// a file already there, and the temporary name removed. A cleanup removes
+/// a temporary name it can lock, so one made here and lost to a cleanup
+/// before its lock is given up for another.
+///
+/// A folder that gives a file no second name (a file system without hard
+/// links, a system whose rules refuse them) leaves only [`create`]'s way:
+/// the name, then the lock. A cleanup that had the empty file in between
+/// removed it or left it: either way this fails with the error [`busy`]
+/// tells, and the caller takes the next name.
+pub(crate) fn create_held(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        create_then_name(path)
+    }
+    #[cfg(not(unix))]
+    {
+        create(path)
+    }
+}
+
+/// A new file at `path`, for this process to read and write: never one
+/// already there, never through a link.
+#[cfg(unix)]
+fn create_new(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Whether the open file `file` is the one `path` names now, no link
+/// followed. A file with no name left is not: its holder removed it.
+#[cfg(unix)]
+fn named(file: &File, path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let held = file.metadata()?;
+    if held.nlink() == 0 {
+        return Ok(false);
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(at) => Ok(at.dev() == held.dev() && at.ino() == held.ino()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Counts the temporary names this process makes.
+#[cfg(unix)]
+pub(crate) static NEW: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(unix)]
+fn create_then_name(path: &Path) -> io::Result<File> {
+    let dir = path.parent().unwrap_or(Path::new(""));
+    let mut tries = 0;
+    loop {
+        let n = NEW.fetch_add(1, Ordering::Relaxed);
+        let temp = dir.join(format!(
+            "{}-{n}.{}",
+            std::process::id(),
+            crate::NEW_EXTENSION
+        ));
+        let file = match create_new(&temp) {
+            // One an earlier process of this number left.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && tries + 1 < NAME_TRIES => {
+                tries += 1;
+                continue;
+            }
+            made => made?,
+        };
+        #[cfg(test)]
+        crate::seams::at(crate::seams::Point::TempMade);
+        // A cleanup locks a temporary name to see whether it was left, and
+        // removes the one it locked: held here under its name, it is past
+        // that. Otherwise it is the cleanup's, and another is made.
+        let ours = match file.try_lock() {
+            Ok(()) => named(&file, &temp)?,
+            Err(std::fs::TryLockError::WouldBlock) => false,
+            Err(std::fs::TryLockError::Error(e)) => {
+                let _ = delete(&file, &temp);
+                return Err(e);
+            }
+        };
+        if !ours {
+            if tries + 1 < NAME_TRIES {
+                tries += 1;
+                continue;
+            }
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        // The file's own name, never in place of one already there.
+        #[cfg(test)]
+        let linked = if crate::seams::NO_LINKS.get() {
+            Err(io::Error::from_raw_os_error(libc::EPERM))
+        } else {
+            std::fs::hard_link(&temp, path)
+        };
+        #[cfg(not(test))]
+        let linked = std::fs::hard_link(&temp, path);
+        // A temporary name that stays is a second name of a held file: no
+        // cleanup takes it, and one removes it once the file is let go.
+        let _ = delete(&file, &temp);
+        return match linked {
+            Ok(()) => Ok(file),
+            Err(e) if no_second_name(&e) => create_in_place(path),
+            Err(e) => Err(e),
+        };
+    }
+}
+
+/// Whether `error`, from giving a file of this process a second name
+/// beside its first, says the folder gives none: a file system without
+/// hard links, or a system whose rules refuse them to this process.
+#[cfg(unix)]
+fn no_second_name(error: &io::Error) -> bool {
+    // Compared one by one: two of them are one number on some systems.
+    [
+        libc::EPERM,
+        libc::EACCES,
+        libc::ENOTSUP,
+        libc::EOPNOTSUPP,
+        libc::ENOSYS,
+    ]
+    .iter()
+    .any(|code| error.raw_os_error() == Some(*code))
+}
+
+/// A new segment made under its own name and then locked, where it can
+/// have no other first. A cleanup that locked the empty file in between
+/// has it, or removed it as a journal that says nothing: [`busy`].
+#[cfg(unix)]
+fn create_in_place(path: &Path) -> io::Result<File> {
+    let file = create_new(path)?;
+    #[cfg(test)]
+    crate::seams::at(crate::seams::Point::Made);
+    file.try_lock().map_err(io::Error::from)?;
+    if !named(&file, path)? {
+        return Err(io::ErrorKind::WouldBlock.into());
+    }
+    Ok(file)
+}
+
+/// A new journal's first segment in `dir`, named `<process>-<count><salt>`
+/// and `tail`, held as [`create_held`] holds it, under a name no other
+/// has: one an earlier process left, or a cleanup has, is stepped past.
 /// Its name without `tail`, and the file.
 pub(crate) fn create_named(
     dir: &Path,
@@ -55,20 +218,32 @@ pub(crate) fn create_named(
     loop {
         let n = next.fetch_add(1, Ordering::Relaxed);
         let name = format!("{}-{n}{salt}", std::process::id());
-        match create(&dir.join(format!("{name}{tail}"))) {
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && tries + 1 < NAME_TRIES => {
-                tries += 1;
-            }
+        match create_held(&dir.join(format!("{name}{tail}"))) {
+            Err(e) if taken(&e) && tries + 1 < NAME_TRIES => tries += 1,
             Err(e) => return Err(e),
             Ok(file) => return Ok((name, file)),
         }
     }
 }
 
+/// Whether `error`, from [`create_held`], says the name is not this
+/// journal's to have: a file is under it, or a cleanup has the one just
+/// made there. The next name is tried.
+pub(crate) fn taken(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::AlreadyExists || busy(error)
+}
+
 /// A journal file no running transfer holds, opened for this process
 /// alone, and its first `most` bytes and one more, so a longer one is told
 /// apart. A link is opened as itself and refused, never followed: its
 /// target is not a journal, and would be deleted with it.
+///
+/// On Unix the lock comes after the open, and a holder removes a file's
+/// name before it lets go of the file. So a file that is locked here and
+/// is no longer the one `path` names was let go in between, removed or
+/// replaced: it is not taken ([`io::ErrorKind::NotFound`]), and says
+/// nothing of the journal it was part of. Windows has no such moment: the
+/// open is refused while another holds the file.
 pub fn take(path: &Path, most: usize) -> io::Result<(File, Vec<u8>)> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true);
@@ -101,9 +276,17 @@ pub fn take(path: &Path, most: usize) -> io::Result<(File, Vec<u8>)> {
     if !meta.is_file() {
         return Err(io::ErrorKind::InvalidInput.into());
     }
-    // Held by a running transfer, in this process or another.
+    #[cfg(test)]
+    crate::seams::at(crate::seams::Point::TakeOpened);
     #[cfg(unix)]
-    file.try_lock().map_err(io::Error::from)?;
+    {
+        // Held by a running transfer, in this process or another.
+        file.try_lock().map_err(io::Error::from)?;
+        // Let go since it was opened: its name went first.
+        if !named(&file, path)? {
+            return Err(io::ErrorKind::NotFound.into());
+        }
+    }
     let mut bytes = Vec::new();
     (&file)
         .take(most.saturating_add(1) as u64)
@@ -311,6 +494,24 @@ pub(crate) struct Held {
 
 impl Held {
     pub(crate) fn delete(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if crate::seams::FAIL_DELETES.get() > 0 {
+            crate::seams::FAIL_DELETES.set(crate::seams::FAIL_DELETES.get() - 1);
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
         delete(&self.file, &self.path)
+    }
+
+    /// Removes its name, then lets go of it. `Err` with the file still
+    /// held when the name could not be removed; a name that is no longer
+    /// this file's is gone already.
+    pub(crate) fn retire(self) -> Result<(), (Self, io::Error)> {
+        let removed = self.delete();
+        #[cfg(test)]
+        crate::seams::at(crate::seams::Point::Unlinked);
+        match removed {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err((self, e)),
+            _ => Ok(()),
+        }
     }
 }

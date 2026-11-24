@@ -92,7 +92,9 @@ its folder too, so the new name outlasts a crash), and only then deletes
 the old segment. `group` is written with the next entry,
 `done` and `ended` without a sync of their own. A crash between the two
 segments leaves both; a reader takes the highest-numbered segment whose
-header is whole. A transfer without groups starts its next segment after
+header is whole. A file already under the next segment's name is left as
+it is and the number after is taken (up to 64 tries), so a journal's
+numbers grow and need not follow one another. A transfer without groups starts its next segment after
 every `Settings::roll_every` (256) partials ended or settled. An append
 that would pass `Settings::segment_bytes` starts the next segment first,
 whose snapshot holds only what is live, and goes there: starts and ends
@@ -138,6 +140,60 @@ counted through the open handle: `st_nlink`, or the number of links
 `GetFileInformationByHandle` gives): what it wrote would land in a file
 another name shows. `take`, which only reads and removes the name, takes
 such a file. `refused` tells those refusals from the system's errors.
+
+## A cleanup beside a running journal
+
+A cleanup may run in one process while a journal is written in another. It
+goes by one rule: **a running journal holds every segment it made, from
+before the segment has its name until after that name is gone.** A segment
+a cleanup holds under its name is therefore no running journal's, and what
+it lists was left behind. A journal keeps its side while it starts its
+next segment: the new one is held before it is named, so both are named
+and held before the old one's name is removed, and that name is removed
+before the old one is let go. An old segment whose name cannot be removed
+stays held, and the journal starts no further segment until it can be:
+entries still go into the segment it has, and one that needs the next
+segment to fit fails with the system's error for the removal.
+
+- **Windows** makes or opens a file and holds it in one step, an open that
+  shares no writing or deleting. A name is never there with its file not
+  yet held, and a cleanup's open of a held segment is refused. Neither
+  side has a moment between finding a file and holding it, so nothing more
+  is done there.
+- **Linux, macOS and Android** lock a file after opening it, and the lock
+  is on the file, not on its name. A cleanup (`files::take`) checks, once
+  it has the lock, that the file is still the one its name reaches (the
+  handle's device and inode against the name's, no link followed, and at
+  least one name left): a segment its journal let go of since the cleanup
+  opened it has lost its name, and the journal is left alone. A journal
+  makes a segment under a temporary name (`<process>-<count>.jnew`), locks
+  it, gives it its own name beside the first, never in place of a file
+  already there, and removes the temporary one.
+- **A temporary name a crash left** is removed by the next cleanup, by
+  this rule: it is named as one (`<process>-<count>.jnew`, both numbers),
+  the cleanup can lock it, and it is still under that name.
+  No age is asked of it. A journal whose temporary name a cleanup removes
+  or holds before the journal's own lock sees that under its lock and
+  makes another, so the rule costs a running journal one more try and
+  never its segment. A temporary name is never read as a journal,
+  whatever it holds, and one that is the second name of a segment (a crash
+  between the two steps) is removed without touching the segment.
+- **Where a folder gives a file no second name** (a file system without
+  hard links; a system whose rules refuse them, as Android's do to an
+  app), a segment is made under its own name and then locked. A cleanup
+  may lock the empty file in between. It lists nothing, so nothing is
+  removed for it, and the journal takes the next name (a first segment) or
+  the next number (a later one). The empty file stays until a cleanup
+  takes it with no journal running under its name.
+
+`files::create`, which `safecopy-resume` makes its records with, still
+names a file and then locks it on Unix, and fails with the error `busy`
+tells when another had it in between; its caller handles that.
+**A journals folder on a network file system** has weaker locks on Unix:
+Linux turns this lock into a lock a process holds, so a cleanup in the
+process that runs the journal is given it too, and whether another
+computer sees it is the server's matter. Keep the journals on a local
+disk, or run no cleanup in a process that has a journal open there.
 
 ## A folder renamed while its transfer runs
 
@@ -206,6 +262,25 @@ After a crash, cleanup:
 
 ## Changes
 
+- **A cleanup and a running journal no longer meet at a segment (Unix).**
+  Two things could happen with a cleanup in one process and a journal in
+  another. A cleanup that opened a segment just before its journal started
+  the next one, and locked it just after, read it as an ended journal's
+  and removed partials still being written. And a cleanup could lock a
+  segment between its making and its journal's lock: a journal then failed
+  to start, or left its next segment behind and failed every later one
+  with "already exists". Now `files::take` leaves a file that is no longer
+  under its name once locked, a segment is locked before it has its name,
+  an old segment whose name cannot be removed stays held, and a file under
+  the next segment's name is stepped past: see "A cleanup beside a running
+  journal". Windows was not affected by either: its open holds the file in
+  the same step. Tested with each moment held open by a seam, in one
+  process (`meet_tests`). The on-disk format is the same. What is new on
+  the disk is the temporary name (`*.jnew`) a segment has for a moment on
+  Unix: an older version of this crate that meets one left by a crash
+  neither reads nor removes it, and it stays until a cleanup of this
+  version runs. A segment number may now be skipped; every version reads
+  the highest.
 - **Tested:** a file given a second name between `files::hold`'s open
   and its count of names is not held: the count is read from the handle
   after the open

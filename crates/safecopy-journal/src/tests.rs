@@ -612,16 +612,30 @@ fn a_file_given_a_second_name_while_it_is_being_held_is_not_held() {
 use std::fs::File;
 use std::process::Command;
 
+/// Held for writing while a child process starts, and for reading by a
+/// test that cannot have its open files copied into one: on Unix a child
+/// holds every open file of this process until it becomes its own program,
+/// locks included, so a file a test let go of can read as held.
+pub(crate) static CHILD_START: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 /// The test binary run again as another process, in `role`.
 fn child(role: &str, place: &Path, journal_dir: &Path) -> String {
-    let output = Command::new(std::env::current_exe().unwrap())
+    use std::process::Stdio;
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
         .args(["tests::as_child", "--exact", "--ignored", "--nocapture"])
         .args(["--test-threads", "1"])
         .env("SAFECOPY_JOURNAL_CHILD", role)
         .env("SAFECOPY_JOURNAL_PLACE", place)
         .env("SAFECOPY_JOURNAL_DIR", journal_dir)
-        .output()
-        .unwrap();
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let started = {
+        let _alone = CHILD_START.write().unwrap_or_else(PoisonError::into_inner);
+        command.spawn().unwrap()
+    };
+    let output = started.wait_with_output().unwrap();
     let out = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
         output.status.success(),

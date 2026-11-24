@@ -104,12 +104,60 @@
 //! or an append would pass [`Settings::segment_bytes`], the journal starts
 //! its next segment: the snapshot is written and synced there first (on
 //! Unix its folder too), and only then is the old segment deleted. A reader takes
-//! the highest-numbered segment whose header is whole.
+//! the highest-numbered segment whose header is whole. When a file is
+//! already under the next segment's name, the journal leaves it and takes
+//! the number after: the numbers of a journal's segments grow, and need
+//! not follow one another.
 //!
 //! A journal syncs once per partial started (once for a bundle's, with
 //! [`Journal::started_many`]) and once per mark move; settling and ending
 //! are written without a sync of their own and reach the disk with the
 //! next.
+//!
+//! # A cleanup beside a running journal
+//!
+//! A cleanup may run in one process while a journal is written in
+//! another. It goes by one rule: a running journal holds every segment it
+//! made, from before the segment has its name until after that name is
+//! gone. So a segment a cleanup holds under its name is no running
+//! journal's, and what it lists was left behind. The journal keeps its
+//! side while it starts its next segment: the new one is held before it is
+//! named, the old one's name is removed before the old one is let go, and
+//! an old one whose name cannot be removed stays held. The journal starts
+//! no further segment until it can be: entries still go into the segment
+//! it has, and one that needs the next segment to fit fails with the
+//! system's error for the removal.
+//!
+//! - **Windows** makes or opens a file and holds it in one step (an open
+//!   that shares no writing or deleting), so a name is never there with
+//!   its file not yet held, and a cleanup's open of a held segment is
+//!   refused: neither side has a moment between finding a file and
+//!   holding it.
+//! - **Linux, macOS and Android** lock a file after opening it, and the
+//!   lock is on the file, not on its name. A cleanup therefore checks,
+//!   once it has the lock, that the file is still the one its name
+//!   reaches: a segment its journal let go of since the cleanup opened it
+//!   has lost its name, and is left. A journal makes a segment under a
+//!   temporary name (ending `jnew`), locks it, gives it its own name
+//!   beside the first without replacing anything, and removes the
+//!   temporary one. [`clean_up`] removes a temporary name it can lock
+//!   under that name: a crash left it, and it is never read as a journal.
+//!   A journal that loses its temporary name to a cleanup before its lock
+//!   makes another.
+//! - **Where a folder gives a file no second name** (a file system
+//!   without hard links, or a system whose rules refuse them, as Android's
+//!   do to an app), a segment is made under its own name and then locked.
+//!   A cleanup may lock the empty file in between: it lists nothing, so
+//!   nothing is removed for it, and the journal takes the next name (a
+//!   first segment's) or the next number (a later one's). The empty file
+//!   stays until a cleanup takes it with no journal running under its
+//!   name.
+//! - **A journals folder on a network file system** has weaker locks on
+//!   Unix: Linux turns this lock into a lock a process holds, so a cleanup
+//!   in the process that runs the journal is given it too, and whether
+//!   another computer sees it is the server's matter. Keep the journals
+//!   on a local disk, or run no cleanup in a process that has a journal
+//!   open there.
 //!
 //! # Systems
 //!
@@ -163,6 +211,12 @@ pub const EXTENSION: &str = "journal";
 
 /// The ending of a segment of a journal's log.
 pub const LOG_EXTENSION: &str = "jlog";
+
+/// The ending of the name a new segment is made under on Unix before it
+/// has its own: never read as a journal, and removed by [`clean_up`] when
+/// a crash left it.
+#[cfg(unix)]
+const NEW_EXTENSION: &str = "jnew";
 
 /// What a journal may hold and which names its cleanup may remove.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,6 +426,9 @@ struct Open {
 
 struct Log {
     segment: Held,
+    /// A segment this journal is done with, whose name could not be
+    /// removed: held until it can be.
+    stale: Option<Held>,
     len: u64,
     state: State,
     /// Partials ended or settled since the last segment began, for a
@@ -427,6 +484,7 @@ impl Journal {
                 settings: settings.clone(),
                 log: Mutex::new(Log {
                     segment,
+                    stale: None,
                     len: header.len() as u64,
                     state,
                     since_roll: 0,
@@ -795,18 +853,21 @@ impl Open {
 
     /// Starts the next segment: its snapshot written and synced first, then
     /// the old segment deleted.
+    ///
+    /// What a cleanup relies on is kept here: from before a segment has
+    /// its name until after that name is gone, this journal holds it. The
+    /// next segment is held before it is named, so it is named and held
+    /// before the old one's name goes, and the old one's name goes before
+    /// the old one is let go. A segment whose name cannot be removed stays
+    /// held, and the journal starts no further segment until it can: this
+    /// fails with that removal's error.
     fn roll(&self, log: &mut Log) -> Result<(), JournalError> {
+        log.retire_stale()?;
         let mut state = log.state.clone();
-        state.seq += 1;
         // The new segment names only the folders its partials need.
         let needed = state.needed_folders();
         state.folders = needed.into_iter().map(|f| (f.n, f)).collect();
-        let header = frame(&state.header());
         let most = self.settings.segment_bytes;
-        if header.len() > most {
-            return Err(JournalError::TooLarge { most });
-        }
-        let path = self.dir.join(segment_name(&self.name, state.seq));
         #[cfg(test)]
         if seams::FAIL_ROLL.replace(false) {
             return Err(io::Error::from(io::ErrorKind::Other).into());
@@ -815,8 +876,25 @@ impl Open {
         if seams::CRASH.get() == Some(seams::Crash::BeforeSnapshot) {
             return Err(log.crash());
         }
-        let file = files::create(&path)?;
-        let segment = Held { file, path };
+        let mut tries = 0;
+        let (segment, header) = loop {
+            state.seq += 1;
+            let header = frame(&state.header());
+            if header.len() > most {
+                return Err(JournalError::TooLarge { most });
+            }
+            let path = self.dir.join(segment_name(&self.name, state.seq));
+            match files::create_held(&path) {
+                Ok(file) => break (Held { file, path }, header),
+                // A file under the next name is none this journal wrote:
+                // it holds every one it did. Another's, or its own empty
+                // one that a cleanup had, is left as it is for the cleanup
+                // after this journal, and the number after is taken: a
+                // reader goes by the highest.
+                Err(e) if files::taken(&e) && tries + 1 < files::NAME_TRIES => tries += 1,
+                Err(e) => return Err(e.into()),
+            }
+        };
         #[cfg(test)]
         if seams::CRASH.get() == Some(seams::Crash::TornSnapshot) {
             let _ = (&segment.file).write_all(&header[..header.len() / 2]);
@@ -827,18 +905,25 @@ impl Open {
             .write_all(&header)
             .and_then(|()| sync(&segment.file))
             .and_then(|()| sync_dir(&self.dir));
+        #[cfg(test)]
+        let written = match seams::FAIL_SNAPSHOT.replace(false) {
+            true => Err(io::Error::from(io::ErrorKind::StorageFull)),
+            false => written,
+        };
         if let Err(e) = written {
             // The old segment still holds everything.
-            let _ = segment.delete();
+            log.retire(segment);
             return Err(e.into());
         }
         #[cfg(test)]
         if seams::CRASH.get() == Some(seams::Crash::BeforeOldDeleted) {
             return Err(log.crash());
         }
-        // A deletion that fails leaves an older segment, which a reader passes over.
-        let _ = log.segment.delete();
-        log.segment = segment;
+        #[cfg(test)]
+        seams::at(seams::Point::Rolled);
+        let old = std::mem::replace(&mut log.segment, segment);
+        // An older segment that stays is one a reader passes over.
+        log.retire(old);
         log.len = header.len() as u64;
         log.state = state;
         log.since_roll = 0;
@@ -849,6 +934,29 @@ impl Open {
 }
 
 impl Log {
+    /// Lets go of `segment`, which this journal is done with: its name
+    /// removed first. Named and let go, it would read to a cleanup as an
+    /// ended journal's, and the partials it lists as left behind: one whose
+    /// name cannot be removed stays held.
+    fn retire(&mut self, segment: Held) {
+        if let Err((segment, _)) = segment.retire() {
+            // None is waiting: a roll begins only once the last is gone.
+            self.stale = Some(segment);
+        }
+    }
+
+    /// Removes the name of the segment still held from before, or says
+    /// why it stays.
+    fn retire_stale(&mut self) -> io::Result<()> {
+        match self.stale.take().map(Held::retire) {
+            Some(Err((segment, e))) => {
+                self.stale = Some(segment);
+                Err(e)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// A crash acted out by a test: nothing more is written, and the files
     /// are left as they are.
     #[cfg(test)]
@@ -865,6 +973,9 @@ impl Drop for Open {
         // A partial file still recorded is left for cleanup.
         if log.state.live.is_empty() && !log.keep {
             let _ = log.segment.delete();
+            if let Some(stale) = &log.stale {
+                let _ = stale.delete();
+            }
         }
     }
 }
@@ -937,6 +1048,17 @@ pub fn clean_up_keeping(
         let path = entry?.path();
         match path.extension().and_then(OsStr::to_str) {
             Some(EXTENSION) => old.push(path),
+            // The name a segment was being made under. Taken, it is held
+            // by nobody under that name: left by a crash, or a segment in
+            // the making that will take another name on losing this one.
+            // Held, it is in use and stays. It may be the second name of
+            // a journal's segment: let go at once, before that is taken.
+            #[cfg(unix)]
+            Some(NEW_EXTENSION) if new_name(&path) => {
+                if let Ok((file, _)) = files::take(&path, 0) {
+                    let _ = files::delete(&file, &path);
+                }
+            }
             Some(LOG_EXTENSION) => {
                 let Some((name, seq)) = log_name(&path) else {
                     continue;
@@ -1002,9 +1124,15 @@ pub fn clean_up_keeping(
             }
         }
         if in_use {
-            // One segment held: the transfer runs, or is not whole to read.
+            // One segment held, or let go since this folder was read: the
+            // transfer runs, or is not whole to read.
             continue;
         }
+        // Every segment taken is held here under its name. A running
+        // journal holds each segment it made from before the segment has
+        // its name until after that name is gone (see `Open::roll`): so
+        // none of these is a running journal's, whatever it did since
+        // this folder was read, and what they list is left behind.
         let mut again = false;
         for one in &taken {
             let Ok(segment) = read_segment(&one.bytes, settings) else {
@@ -1034,6 +1162,18 @@ pub fn clean_up_keeping(
     }
     cleaned.kept = kept.len();
     Ok(cleaned)
+}
+
+/// Whether `path` is named as a segment in the making is:
+/// `<process>-<count>.jnew`. No other name is a cleanup's to remove.
+#[cfg(unix)]
+fn new_name(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(OsStr::to_str)
+        .and_then(|stem| stem.split_once('-'))
+        .is_some_and(|(process, count)| {
+            process.parse::<u32>().is_ok() && count.parse::<u64>().is_ok()
+        })
 }
 
 /// A segment file's journal name and sequence number:
@@ -1280,6 +1420,56 @@ pub(crate) mod seams {
         pub static HOLD_OPENED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = unset();
     }
 
+    /// Where a test steps in while a segment is made, taken or let go.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Point {
+        /// A cleanup has opened a file and not yet locked it (Unix).
+        TakeOpened,
+        /// A new segment's temporary name is made and not yet locked.
+        #[cfg(unix)]
+        TempMade,
+        /// A new segment is made under its own name and not yet locked:
+        /// in a folder that gives a file no second name.
+        #[cfg(unix)]
+        Made,
+        /// The next segment is written and the old one still has its name.
+        Rolled,
+        /// The old segment's name is gone and the file is still held.
+        Unlinked,
+    }
+
+    /// A point and what a test does there.
+    type Hook = (Point, Box<dyn FnOnce()>);
+
+    thread_local! {
+        /// Run once, when this thread next comes to the point.
+        pub static AT: std::cell::RefCell<Option<Hook>> = unset();
+        /// The journals' folder acted out as one that gives a file no
+        /// second name.
+        #[cfg(unix)]
+        pub static NO_LINKS: Cell<bool> = unset();
+        /// The next segment's snapshot fails to be written, once.
+        pub static FAIL_SNAPSHOT: Cell<bool> = unset();
+        /// How many of this thread's next deletions of a segment fail.
+        pub static FAIL_DELETES: Cell<u32> = unset();
+    }
+
+    /// Runs `hook` once, when this thread next comes to `point`.
+    pub fn when(point: Point, hook: impl FnOnce() + 'static) {
+        AT.set(Some((point, Box::new(hook))));
+    }
+
+    /// This thread is at `point`: the hook set for it runs.
+    pub fn at(point: Point) {
+        let hook = AT.with_borrow_mut(|at| match at {
+            Some((set, _)) if *set == point => at.take().map(|(_, hook)| hook),
+            _ => None,
+        });
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     /// A reading of a held folder's present place, acted out.
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
     pub enum Place {
@@ -1295,5 +1485,7 @@ pub(crate) mod seams {
 
 #[cfg(test)]
 mod log_tests;
+#[cfg(test)]
+mod meet_tests;
 #[cfg(test)]
 mod tests;
