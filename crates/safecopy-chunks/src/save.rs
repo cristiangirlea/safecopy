@@ -9,8 +9,8 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, ready};
 
 use safecopy_folder::{
-    Applied, Directory, Finish, Marked, Meta, MetaRules, PublishError, PublishRules, Refusal,
-    refusal,
+    Applied, Directory, Finish, Marked, Meta, MetaRules, NAME_TRIES, PublishError, PublishRules,
+    Refusal, refusal,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinHandle;
@@ -141,6 +141,14 @@ pub struct SaveOptions<'a> {
     /// too before the save succeeds. The flush runs on tokio's blocking
     /// pool, never on a worker. On by default.
     pub sync: bool,
+    /// The most names tried for a new partial file: `name.part`, then
+    /// `name.2.part` and so on up to `name.N.part` for this N. When every
+    /// one is taken the save fails with [`ChunkError::NoPartialName`] and
+    /// creates nothing. 10 001 by default ([`NAME_TRIES`]), as far as a
+    /// file's own name is numbered: a partial name is taken only by
+    /// another save of that name under way or by one a crash left, so a
+    /// folder with more of them is not searched to its end.
+    pub partial_tries: usize,
 }
 
 static DEFAULT_PUBLISH: LazyLock<PublishRules> = LazyLock::new(PublishRules::default);
@@ -155,6 +163,7 @@ impl Default for SaveOptions<'_> {
             progress: &(),
             pace: &(),
             sync: true,
+            partial_tries: NAME_TRIES,
         }
     }
 }
@@ -188,7 +197,7 @@ pub struct Target<'a> {
 }
 
 /// The partial file's name: `name.part`, or `name.N.part` when taken.
-fn partial_name(name: &str, n: u64) -> OsString {
+fn partial_name(name: &str, n: usize) -> OsString {
     OsString::from(if n == 1 {
         format!("{name}.part")
     } else {
@@ -258,7 +267,8 @@ impl std::error::Error for Stopped {}
 /// [`save_resumable`] from [`Start::New`], keeping nothing.
 ///
 /// In order: [`Hooks::before_create`]; the partial file created new
-/// (`name.part`) and [`Hooks::created`]; the bytes written and hashed,
+/// (`name.part`, or `name.N.part` when that is taken, at most
+/// [`SaveOptions::partial_tries`] names tried) and [`Hooks::created`]; the bytes written and hashed,
 /// with [`Hooks::whole`] at each whole chunk; the trailer read and the
 /// stream's end checked; the hash compared; the bytes flushed to the disk
 /// ([`SaveOptions::sync`]); [`Hooks::before_publish`]; then
@@ -269,7 +279,14 @@ impl std::error::Error for Stopped {}
 /// a name. [`Hooks::ended`] hears the outcome, and whether that removal
 /// failed ([`PartialFate::Left`]).
 ///
-/// `cancel` is watched while the bytes come and while publishing.
+/// `cancel` is watched between the partial names tried, while the bytes
+/// come and while publishing. After each taken partial name the save
+/// yields to the runtime, so a cancel given by another task of its thread
+/// is seen there; a cancel between names, or every name taken
+/// ([`ChunkError::NoPartialName`]), ends the save with nothing created
+/// ([`PartialFate::NotCreated`]). Only the system's own "already exists"
+/// for a partial name moves to the next: an error of a hook, whatever its
+/// kind, ends the save with [`ChunkError::Hook`].
 ///
 /// Dropping the save's future ends its writing of the partial file: when
 /// the drop returns, no write to it is running and none can start, and
@@ -298,8 +315,10 @@ pub async fn save_verified<R: AsyncRead + Unpin + ?Sized>(
 /// keeps the partial file when it stops on an error `keep` names.
 ///
 /// From [`Start::New`] the stream carries all `target.size` bytes and the
-/// save goes as [`save_verified`] does. From [`Start::Resume`] it carries
-/// the bytes from the hasher's position (`have`) to the size: the partial
+/// save goes as [`save_verified`] does, its search for a free partial
+/// name included. [`Start::Resume`] creates no file and searches for no
+/// name. From it the stream carries the bytes from the hasher's
+/// position (`have`) to the size: the partial
 /// file is cut to `have` and the bytes appended from there, wherever the
 /// handle's position stood, and the hash compared with
 /// the trailer is of the whole file, the hasher handed in and the new
@@ -362,7 +381,7 @@ pub async fn save_resumable<R: AsyncRead + Unpin + ?Sized>(
                 hooks.ended(Err(&error), PartialFate::NotCreated);
                 return Err(Stopped { error, kept: None });
             }
-            match create(dir, name) {
+            match create(dir, name, options.partial_tries, &mut cancel).await {
                 Ok((file, partial)) => (file, partial, options.settings.receiving(), false),
                 Err(error) => {
                     hooks.ended(Err(&error), PartialFate::NotCreated);
@@ -444,16 +463,37 @@ fn discard(dir: &Directory, file: &File, partial: &OsStr) -> io::Result<()> {
     dir.discard(file, partial)
 }
 
-fn create(dir: &Directory, name: &str) -> Result<(File, OsString), ChunkError> {
-    for n in 1.. {
+/// Creates the partial file under the first free of at most `tries`
+/// names. No file is held across a wait: dropped or cancelled between
+/// names, it has created nothing.
+async fn create(
+    dir: &Directory,
+    name: &str,
+    tries: usize,
+    cancel: &mut Pin<&mut impl Future<Output = ()>>,
+) -> Result<(File, OsString), ChunkError> {
+    for n in 1..=tries {
+        if n > 1 {
+            #[cfg(test)]
+            crate::seams::name_taken(n - 1);
+            // Taken names are passed without a wait: the runtime gets its
+            // turn, or a cancel from this thread is never ready.
+            tokio::task::yield_now().await;
+            tokio::select! {
+                biased;
+                () = cancel.as_mut() => return Err(ChunkError::Cancelled),
+                () = std::future::ready(()) => {}
+            }
+        }
         let partial = partial_name(name, n);
         match dir.create(&partial) {
             Ok(file) => return Ok((file, partial)),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            // The system's word that the name is taken, and nothing else.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.into()),
         }
     }
-    unreachable!("the numbers never run out")
+    Err(ChunkError::NoPartialName { tried: tries })
 }
 
 /// The file being saved, with its partial file open.
@@ -632,6 +672,7 @@ async fn fill<R: AsyncRead + Unpin + ?Sized>(
         .map_err(|e| match e {
             PublishError::Cancelled => ChunkError::Cancelled,
             PublishError::Io(e) | PublishError::Name { error: e, .. } => e.into(),
+            PublishError::NoNameLeft { tried } => ChunkError::NoNameLeft { tried },
             _ => ChunkError::Io(io::ErrorKind::Other),
         })?;
     Ok(Saved {

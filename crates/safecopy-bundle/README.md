@@ -23,8 +23,11 @@ key and hash, so one bad file never spoils the others.
   destination): an equal file's partial is removed and it is
   `AlreadyThere`.
 - `Outcome` per file: `Saved`, `AlreadyThere`, `Damaged`, `Refused`,
-  `GivenUp`, `NotReceived`, `Failed(kind)`. A damaged, skipped, given-up or
-  failed file is read past and the bundle reads on. A stream that ends
+  `GivenUp`, `NotReceived`, `Failed(kind)`, `NoPartialName { tried }`
+  (every partial name tried for it was taken), `NoNameLeft { tried }`
+  (every name tried for the checked file was taken). A damaged, skipped,
+  given-up or failed file, or one left without a name, is read past and
+  the bundle reads on. A stream that ends
   early, a bad mark, a byte after the last hash (checked before the last
   file is published) or a cancel ends the bundle: the files published
   stay, every other partial file is removed, and the rest taken are
@@ -34,7 +37,8 @@ key and hash, so one bad file never spoils the others.
   dropped write) refuses every later call (`Torn`), so the stream only
   ever ends short, never misframed.
 - In a cut bundle, an entry the receiver skipped stays `Refused` and one
-  whose partial file could not be made stays `Failed`, where the design
+  whose partial file could not be made stays `Failed` or
+  `NoPartialName`, where the design
   note calls every entry not published `NotReceived`: the sender resends
   only the `NotReceived` ones, never what was refused.
 - `Gate`: at most `at_once` (2) bundles of one transfer read at a time.
@@ -73,6 +77,35 @@ The table and a whole bundle read are fuzzed:
 
 ## Changes
 
+- **The search for a free partial name has a limit and sees a cancel.**
+  Admission claims `name.part`, then `name.2.part` and so on for each
+  taken entry; it tried them without end, and looked at the cancel only
+  once every partial file was made. `ReadOptions` has a new field,
+  `partial_tries`, the most names tried for one entry, 10 001 by default
+  (`safecopy_folder::NAME_TRIES`). An entry whose names are all taken is
+  the new `Outcome::NoPartialName { tried }`, with nothing created for
+  it, and the bundle reads on as for an entry that is `Failed`
+  (`an_entry_tries_only_as_many_partial_names_as_the_options_say`). A
+  cancel given while names are taken ends the bundle with `Cancelled`
+  before the next name is tried and before `BundleHooks::admitted`: the
+  partial files made for earlier entries are removed and
+  `BundleHooks::ended` hears the report; after each taken name the read
+  yields to the runtime, so a cancel from another task of its thread is
+  seen too
+  (`a_cancel_between_partial_names_ends_the_bundle_with_nothing_created`,
+  `a_cancel_given_by_another_task_is_seen_between_partial_names`).
+  A checked entry for which every name up to
+  `PublishRules::name_tries` is taken is the new
+  `Outcome::NoNameLeft { tried }`, its partial removed
+  (`an_entry_whose_names_are_all_taken_says_how_many_it_tried`).
+  **Breaking** for a caller that writes `ReadOptions` out in full: add
+  `partial_tries: safecopy_folder::NAME_TRIES`, or end the literal with
+  `..ReadOptions::default()`.
+- **A hook's "already exists" is never a taken name.** Nothing changed
+  here, and a test now holds it: the hooks are called outside the
+  search, and `before_create` or `admitted` failing with that kind ends
+  the bundle with `Hook(AlreadyExists)`, nothing left on the disk
+  (`a_hook_that_says_already_exists_ends_the_bundle_and_is_no_taken_name`).
 - **A bundle that ends early leaves no write behind, and no partial
   file.** Each slice of a file is written on the blocking pool, and
   `Table::read` returned at a cut, a cancel or a stream error (or was

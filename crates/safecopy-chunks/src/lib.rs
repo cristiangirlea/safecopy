@@ -328,6 +328,19 @@ pub enum ChunkError {
         /// The bytes the file holds.
         len: u64,
     },
+    /// Every name tried for a new partial file was taken
+    /// ([`SaveOptions::partial_tries`]): none was created.
+    NoPartialName {
+        /// The names tried.
+        tried: usize,
+    },
+    /// Every name tried for the finished file was taken
+    /// (`safecopy_folder::PublishRules::name_tries`): it got none, and
+    /// its partial file was removed.
+    NoNameLeft {
+        /// The names tried.
+        tried: usize,
+    },
     /// One of the caller's [`Hooks`] refused, with its error's kind.
     Hook(io::ErrorKind),
     /// The system refused.
@@ -369,9 +382,23 @@ mod seams {
         pub static SYNC_ERROR: Cell<bool> = const { Cell::new(false) };
         /// The next publish of a checked file fails.
         pub static PUBLISH_ERROR: Cell<bool> = const { Cell::new(false) };
+        /// Told how many partial names a save of this thread found taken
+        /// so far, after each, before its cancel is looked at.
+        pub static NAME_TAKEN: RefCell<Option<Taken>> = const { RefCell::new(None) };
         /// Told of each step of the writes of the next save this thread
         /// starts, on the thread that takes the step.
         pub static WRITES: RefCell<Option<Writes>> = const { RefCell::new(None) };
+    }
+
+    /// What hears of each taken partial name.
+    pub type Taken = Box<dyn Fn(usize)>;
+
+    pub fn name_taken(taken: usize) {
+        NAME_TAKEN.with_borrow(|seam| {
+            if let Some(seam) = seam {
+                seam(taken);
+            }
+        });
     }
 
     /// What hears of a save's writes: it may hold a step for as long as a
