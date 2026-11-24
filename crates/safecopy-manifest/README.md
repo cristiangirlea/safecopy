@@ -77,6 +77,15 @@ original code behaved as below, this crate does not:
 
 ## Changes
 
+- **A listing keeps the extension of a name it cuts.** `Limits::names`
+  follows `safecopy-names`, which now cuts a long name in its stem: 250
+  letters and `.txt` are listed as 196 letters and `.txt`, where an
+  earlier version listed 200 letters. Two programs on different versions
+  list one long name differently, and each takes the other's list: a
+  receiver never cuts a listed name again, it refuses one that is not
+  safe and within the limits already, and both cuts are. The file is
+  saved under the name its sender listed
+  (`a_list_cut_by_an_older_or_a_newer_sender_is_taken_by_the_other`).
 - **A name over 200 bytes is refused in a list.** `Limits::names` follows
   `safecopy-names`, whose default rules now limit a name to 200 bytes of
   UTF-8 as well as 200 UTF-16 units. A listing cuts such a name (90

@@ -115,9 +115,16 @@ mod tests {
         let mut siblings = Siblings::default();
         let one = siblings.take(OsStr::new(&format!("{long}1.txt"))).unwrap();
         let two = siblings.take(OsStr::new(&format!("{long}2.txt"))).unwrap();
+        // Both are cut to the same stem and keep ".txt"; the number takes
+        // four more of the stem.
+        assert_eq!(one, format!("{}.txt", "x".repeat(MAX_NAME_UNITS - 4)));
+        assert_eq!(two, format!("{} (2).txt", "x".repeat(MAX_NAME_UNITS - 8)));
+        assert_eq!(two.encode_utf16().count(), MAX_NAME_UNITS);
+        // Without an extension the whole name is the stem.
+        let one = siblings.take(OsStr::new(&format!("{long}1"))).unwrap();
+        let two = siblings.take(OsStr::new(&format!("{long}2"))).unwrap();
         assert_eq!(one, "x".repeat(MAX_NAME_UNITS));
         assert_eq!(two, format!("{} (2)", "x".repeat(MAX_NAME_UNITS - 4)));
-        assert_eq!(two.encode_utf16().count(), MAX_NAME_UNITS);
     }
 
     /// A numbered name fits the bytes as well as the units, with its
@@ -131,13 +138,13 @@ mod tests {
         let two = siblings.take(OsStr::new(&name)).unwrap();
         assert_eq!(two, format!("{} (2).docx", "文".repeat(63)));
         assert!(fits(&two), "{two}");
-        // A longer name cut to the limit loses its extension, and is
-        // numbered within the limit too.
+        // A longer name is cut to that one, extension kept, and numbered
+        // as it is.
         let long = format!("{}.docx", "文".repeat(90));
         let mut siblings = Siblings::default();
-        assert_eq!(siblings.take(OsStr::new(&long)).unwrap(), "文".repeat(66));
+        assert_eq!(siblings.take(OsStr::new(&long)).unwrap(), name);
         let two = siblings.take(OsStr::new(&long)).unwrap();
-        assert_eq!(two, format!("{} (2)", "文".repeat(65)));
+        assert_eq!(two, format!("{} (2).docx", "文".repeat(63)));
         assert!(fits(&two), "{two}");
 
         let rules = NameRules::default();

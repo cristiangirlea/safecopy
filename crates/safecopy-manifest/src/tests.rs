@@ -284,6 +284,109 @@ fn without_a_check_of_the_callers_a_path_within_the_characters_is_taken() {
 
 // What a list may hold.
 
+/// A name cut as versions before a cut kept the extension cut it: at its
+/// end, between two characters, to 200 units and 200 bytes, then without
+/// the dots and spaces at its end.
+fn cut_at_its_end(name: &str) -> &str {
+    let (mut units, mut end) = (0, 0);
+    for c in name.chars() {
+        units += c.len_utf16();
+        if units > MAX_NAME_UNITS || end + c.len_utf8() > 200 {
+            break;
+        }
+        end += c.len_utf8();
+    }
+    name[..end].trim_end_matches(['.', ' '])
+}
+
+/// Two programs on different versions list one long name differently. A
+/// receiver never cuts a listed name again: it takes a name that is safe
+/// and within the limits as it is, and both cuts are, so a list goes
+/// either way.
+#[test]
+fn a_list_cut_by_an_older_or_a_newer_sender_is_taken_by_the_other() {
+    let x = |n: usize| "x".repeat(n);
+    // The name on disk, then twice in one folder as an older version
+    // listed it and as this one does.
+    let cases = [
+        (
+            format!("{}.txt", x(250)),
+            [x(200), format!("{} (2)", x(196))],
+            [format!("{}.txt", x(196)), format!("{} (2).txt", x(192))],
+        ),
+        (
+            format!("{}.pdf", "文".repeat(90)),
+            ["文".repeat(66), format!("{} (2)", "文".repeat(65))],
+            [
+                format!("{}.pdf", "文".repeat(65)),
+                format!("{} (2).pdf", "文".repeat(64)),
+            ],
+        ),
+        (
+            format!("{}.png", "😀".repeat(100)),
+            ["😀".repeat(50), format!("{} (2)", "😀".repeat(49))],
+            [
+                format!("{}.png", "😀".repeat(49)),
+                format!("{} (2).png", "😀".repeat(48)),
+            ],
+        ),
+        (
+            format!("NUL{}x.txt", " ".repeat(197)),
+            ["_NUL".to_string(), "_NUL (2)".to_string()],
+            ["_NUL.txt".to_string(), "_NUL (2).txt".to_string()],
+        ),
+    ];
+    // Rules that keep no extension cut a plain name as an older version
+    // did; a numbered one here has no extension left to differ by.
+    let older = Limits {
+        names: safecopy_names::NameRules::default().with_max_extension(0),
+        ..limits()
+    };
+    let listed = |names: &[String; 2]| {
+        vec![
+            folder("r"),
+            file(&format!("r/{}", names[0]), 1),
+            file(&format!("r/{}", names[1]), 1),
+            file(&names[0], 1),
+        ]
+    };
+    for (name, before, now) in cases {
+        // What each version makes of the name, the older one by hand.
+        let mut siblings = Siblings::default();
+        let mut older_siblings = Siblings::new(older.names.clone());
+        for n in 0..2 {
+            assert_eq!(siblings.take(OsStr::new(&name)).unwrap(), now[n]);
+            assert_eq!(older_siblings.take(OsStr::new(&name)).unwrap(), before[n]);
+        }
+        let first = cut_at_its_end(&name);
+        assert_eq!(before[0].trim_start_matches('_'), first, "{name}");
+        assert_ne!(before, now, "{name}");
+
+        // An older sender's list at this receiver.
+        let sent = Manifest::new(1, listed(&before), &older).unwrap();
+        let bytes = sent.encode(&older).unwrap();
+        assert_eq!(Manifest::decode(&bytes, &limits()).unwrap(), sent);
+        // This sender's list at an older receiver, which took a name it
+        // would not cut: within both limits, nothing at its end to drop.
+        let sent = new(listed(&now)).unwrap();
+        let bytes = sent.encode(&limits()).unwrap();
+        assert_eq!(Manifest::decode(&bytes, &older).unwrap(), sent);
+        for name in &now {
+            assert_eq!(cut_at_its_end(name), name);
+        }
+        // Either list's paths are created as they are listed.
+        for name in before.iter().chain(&now) {
+            let path = format!("r/{name}");
+            for names in [&older.names, &limits().names] {
+                let rules = PathRules::default().with_names(names.clone());
+                let taken = check_path(&path, &rules).expect(&path);
+                assert_eq!(taken.parts.join("/"), path);
+                assert_eq!(safe_name(name, names).as_deref(), Some(name.as_str()));
+            }
+        }
+    }
+}
+
 #[test]
 fn every_listed_path_is_one_the_receiver_takes_as_it_is() {
     let mut top = Siblings::default();

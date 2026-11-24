@@ -283,6 +283,22 @@ After a crash, cleanup:
 
 ## Changes
 
+- **Names cut with their extension kept need nothing new here.**
+  `safecopy-names` now cuts a long name in its stem and keeps the
+  extension. Recovery looks for the name the journal was given, cut by
+  whichever version gave it, and cuts only to make room for a number,
+  so a partial an older version recorded under a name cut at its end is
+  found as before, with or without a number
+  (`a_numbered_form_is_the_name_with_its_number_cut_or_whole`). One
+  case differs: a caller that numbers with `numbered` (a publish by
+  `safecopy-folder` does not: it cuts nothing) and published, with an
+  older version, a name that had to be cut for its number and ends in a
+  dot and more than 16 characters or text with a space. Its number
+  stood before that dot and now stands at the end, so that file is not
+  recognised as published and is fetched again;
+  `names: NameRules::default().with_max_extension(usize::MAX)` in the
+  journal's settings looks for the older form, instead of this
+  version's, where the ending has no space.
 - **A numbered file at the name limit is found again.** A publish puts
   the number after the whole name, and recovery looked for the name the
   rules cut to make room for it, so a published `name (2)` whose name
