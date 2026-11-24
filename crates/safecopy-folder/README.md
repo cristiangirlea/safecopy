@@ -77,6 +77,39 @@ original code behaved as below, this crate does not:
 
 ## Changes
 
+- **The search for a free name has a limit.** A publish tried
+  `name.ext`, `name (2).ext` and so on without end, and so did
+  `Directory::claim` for a folder and `unique`: in a folder holding very
+  many files of one name each tried them all. `PublishRules` has a new
+  field, `name_tries`, the most names tried, 10 001 by default
+  (`NAME_TRIES`: as far as the default rules of `safecopy-names` number
+  a name, which is also as far as a numbered name with `.part` is
+  proven to fit a system's 255). When every one is taken, `publish`,
+  `publish_with` and `publish_path` fail with the new
+  `PublishError::NoNameLeft { tried }`, nothing named and the partial
+  left to the caller as after any other error
+  (`a_publish_tries_only_as_many_names_as_its_rules_say`,
+  `by_path_a_publish_tries_only_as_many_names_as_its_rules_say`).
+  **Breaking** for a caller that writes `PublishRules` out in full: add
+  `name_tries: NAME_TRIES`, or end the literal with
+  `..PublishRules::default()`. A `match` on `PublishError` or `Refusal`
+  with no `_` arm does not build outside this crate already (both are
+  `#[non_exhaustive]`).
+  `Directory::claim` keeps its signature and tries `NAME_TRIES` names;
+  the new `Directory::claim_within(name, tries)` takes another limit,
+  and both fail with the new `Refusal::NoNameLeft { tried }`
+  (`a_folder_name_is_tried_only_as_often_as_the_limit_says`).
+  **Breaking:** `unique(dir, name, tries)` takes the limit and returns
+  `Option<PathBuf>`, `None` when every name is taken, where it took two
+  arguments and returned a `PathBuf`: write
+  `unique(dir, name, NAME_TRIES)` and handle `None`.
+- **A cancel given by another task is seen between names.** A publish
+  looked at its cancel before every name, but passed taken names without
+  ever waiting, so on a runtime of one thread a cancel that another
+  task had yet to give could not become ready until a name was free.
+  After each taken name the publish now yields to the runtime
+  (`a_cancel_given_by_another_task_while_names_are_taken_ends_the_publish`).
+  `publish_path`, `claim` and `unique` take no cancel.
 - **Nothing changes for a name cut with its extension kept.**
   `safecopy-names` now cuts a long name in its stem, so the longest safe
   name may end in an extension. `unique` and `publish` cut nothing and

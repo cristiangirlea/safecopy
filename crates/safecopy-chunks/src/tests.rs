@@ -83,6 +83,8 @@ fn the_framing_constants_and_defaults_are_the_designed_ones() {
     assert_eq!(*options.publish, PublishRules::default());
     assert_eq!(options.meta_rules, MetaRules::default());
     assert!(options.sync);
+    assert_eq!(options.partial_tries, 10_001);
+    assert_eq!(options.partial_tries, safecopy_folder::NAME_TRIES);
 }
 
 // The pace hook.
@@ -754,6 +756,318 @@ async fn a_save_that_cannot_create_its_partial_says_none_was_created() {
     assert!(files_in(&to).is_empty());
     drop(dir);
     std::fs::remove_dir_all(&to).unwrap();
+}
+
+// The search for a free partial name.
+
+/// Takes the first `count` partial names of `name` in `to`.
+fn take_partials(to: &Path, name: &str, count: usize) {
+    for n in 1..=count {
+        let partial = if n == 1 {
+            format!("{name}.part")
+        } else {
+            format!("{name}.{n}.part")
+        };
+        std::fs::write(to.join(partial), b"another save's").unwrap();
+    }
+}
+
+/// One new save of `stream` as `a.txt`, through `save_verified` or
+/// through `save_resumable` with a rule that keeps everything.
+async fn save_new(
+    resumable: bool,
+    stream: &[u8],
+    dir: &Directory,
+    options: &SaveOptions<'_>,
+    hooks: &dyn Hooks,
+    cancel: impl Future<Output = ()>,
+) -> Result<Saved, ChunkError> {
+    let mut stream = stream;
+    let size = stream.len() as u64 - DIGEST_LEN as u64;
+    if !resumable {
+        return save_verified(&mut stream, dir, "a.txt", size, options, hooks, cancel).await;
+    }
+    let target = Target {
+        dir,
+        name: "a.txt",
+        size,
+    };
+    let keep = |_: &ChunkError| true;
+    save_resumable(
+        &mut stream,
+        target,
+        Start::New,
+        &keep,
+        options,
+        hooks,
+        cancel,
+    )
+    .await
+    .map_err(|stopped| {
+        assert!(stopped.kept.is_none());
+        stopped.error
+    })
+}
+
+/// A folder where every partial name up to the limit is taken: the save
+/// fails with how many it tried and creates nothing. With a higher limit
+/// it takes the next name.
+#[tokio::test]
+async fn a_save_tries_only_as_many_partial_names_as_its_options_say() {
+    let stream = framed(b"ours").await;
+    for resumable in [false, true] {
+        let to = temp("partial-limit");
+        take_partials(&to, "a.txt", 3);
+        let before = files_in(&to);
+        let dir = Directory::open(&to).unwrap();
+        for tries in [0, 1, 3] {
+            let options = SaveOptions {
+                partial_tries: tries,
+                ..SaveOptions::default()
+            };
+            let hooks = Recorder::default();
+            let cancel = std::future::pending();
+            let saved = save_new(resumable, &stream, &dir, &options, &hooks, cancel).await;
+            assert_eq!(saved, Err(ChunkError::NoPartialName { tried: tries }));
+            assert_eq!(files_in(&to), before);
+            assert_eq!(
+                hooks.steps(),
+                [
+                    "before_create".to_string(),
+                    format!("ended Err(NoPartialName {{ tried: {tries} }}) NotCreated"),
+                ]
+            );
+        }
+        let options = SaveOptions {
+            partial_tries: 4,
+            ..SaveOptions::default()
+        };
+        let hooks = Recorder::default();
+        let cancel = std::future::pending();
+        let saved = save_new(resumable, &stream, &dir, &options, &hooks, cancel).await;
+        assert_eq!(saved.unwrap().path, to.join("a.txt"));
+        assert_eq!(
+            hooks.steps(),
+            [
+                "before_create",
+                "created a.txt.4.part",
+                "before_publish a.txt.4.part",
+                "ended Ok(a.txt) Published"
+            ]
+        );
+        drop(dir);
+        std::fs::remove_dir_all(&to).unwrap();
+    }
+}
+
+/// A cancel that is ready once `flag` is set. Nothing wakes it: the save
+/// sees it at its next look, so no timing is involved.
+fn on_flag(flag: &std::sync::atomic::AtomicBool) -> impl Future<Output = ()> + '_ {
+    std::future::poll_fn(move |_| {
+        if flag.load(Ordering::SeqCst) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+}
+
+/// A cancel given while partial names are taken ends the save before the
+/// next name is tried: nothing is created, and `created` never comes.
+#[tokio::test]
+async fn a_cancel_between_partial_names_ends_the_save_with_nothing_created() {
+    let stream = framed(b"ours").await;
+    for resumable in [false, true] {
+        let to = temp("cancel-names");
+        // The second name is free: only the cancel keeps the save from it.
+        take_partials(&to, "a.txt", 1);
+        let dir = Directory::open(&to).unwrap();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Given right after the first name was found taken.
+        crate::seams::NAME_TAKEN.set(Some(Box::new({
+            let flag = flag.clone();
+            move |taken| {
+                assert_eq!(taken, 1);
+                flag.store(true, Ordering::SeqCst);
+            }
+        })));
+        let hooks = Recorder::default();
+        let options = SaveOptions::default();
+        let saved = save_new(resumable, &stream, &dir, &options, &hooks, on_flag(&flag)).await;
+        crate::seams::NAME_TAKEN.set(None);
+        assert!(flag.load(Ordering::SeqCst));
+        assert_eq!(saved, Err(ChunkError::Cancelled));
+        assert_eq!(files_in(&to), ["a.txt.part"]);
+        assert_eq!(
+            hooks.steps(),
+            ["before_create", "ended Err(Cancelled) NotCreated"]
+        );
+        drop(dir);
+        std::fs::remove_dir_all(&to).unwrap();
+    }
+}
+
+/// A save dropped while partial names are taken has created nothing.
+#[tokio::test]
+async fn a_save_dropped_between_partial_names_has_created_nothing() {
+    let stream = framed(b"ours").await;
+    let to = temp("drop-names");
+    take_partials(&to, "a.txt", 1);
+    let dir = Directory::open(&to).unwrap();
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    crate::seams::NAME_TAKEN.set(Some(Box::new({
+        let flag = flag.clone();
+        move |_| flag.store(true, Ordering::SeqCst)
+    })));
+    let hooks = Recorder::default();
+    let options = SaveOptions::default();
+    // The save is polled until it waits between names, then dropped.
+    tokio::select! {
+        biased;
+        () = on_flag(&flag) => {}
+        saved = save_new(false, &stream, &dir, &options, &hooks, std::future::pending()) => {
+            panic!("{saved:?}")
+        }
+    }
+    crate::seams::NAME_TAKEN.set(None);
+    assert_eq!(files_in(&to), ["a.txt.part"]);
+    assert_eq!(hooks.steps(), ["before_create"]);
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// The save lets the runtime's other tasks run between taken names: a
+/// cancel one of them gives on the save's own thread is seen there.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cancel_given_by_another_task_is_seen_between_partial_names() {
+    let stream = framed(b"ours").await;
+    let to = temp("cancel-names-task");
+    take_partials(&to, "a.txt", 1);
+    let dir = Directory::open(&to).unwrap();
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Runs only once the save lets go of the thread.
+    let cancelling = tokio::spawn({
+        let flag = flag.clone();
+        async move { flag.store(true, Ordering::SeqCst) }
+    });
+    let hooks = Recorder::default();
+    let options = SaveOptions::default();
+    let saved = save_new(false, &stream, &dir, &options, &hooks, on_flag(&flag)).await;
+    assert_eq!(saved, Err(ChunkError::Cancelled));
+    assert_eq!(files_in(&to), ["a.txt.part"]);
+    assert_eq!(
+        hooks.steps(),
+        ["before_create", "ended Err(Cancelled) NotCreated"]
+    );
+    cancelling.await.unwrap();
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// Hooks that note each step and refuse at `at` with "already exists".
+struct Exists {
+    at: &'static str,
+    steps: Mutex<Vec<String>>,
+}
+
+impl Exists {
+    fn step(&self, step: &'static str, note: String) -> io::Result<()> {
+        self.steps.lock().unwrap().push(note);
+        if self.at == step {
+            return Err(io::ErrorKind::AlreadyExists.into());
+        }
+        Ok(())
+    }
+}
+
+impl Hooks for Exists {
+    fn before_create(&self) -> io::Result<()> {
+        self.step("before_create", "before_create".into())
+    }
+
+    fn created(&self, _: &File, partial: &OsStr) -> io::Result<()> {
+        self.step("created", format!("created {}", partial.to_string_lossy()))
+    }
+
+    fn ended(&self, outcome: Result<&Saved, &ChunkError>, partial: PartialFate) {
+        let note = format!("ended {:?} {partial:?}", outcome.err());
+        self.steps.lock().unwrap().push(note);
+    }
+}
+
+/// A hook's "already exists" is the hook's refusal, never a taken name:
+/// the save fails at once with it, tries no second partial name, and
+/// removes the partial it had made.
+#[tokio::test]
+async fn a_hook_that_says_already_exists_fails_the_save_and_is_no_taken_name() {
+    let stream = framed(b"ours").await;
+    let error = ChunkError::Hook(io::ErrorKind::AlreadyExists);
+    for resumable in [false, true] {
+        for (at, steps) in [
+            (
+                "before_create",
+                vec![
+                    "before_create",
+                    "ended Some(Hook(AlreadyExists)) NotCreated",
+                ],
+            ),
+            (
+                "created",
+                vec![
+                    "before_create",
+                    "created a.txt.part",
+                    "ended Some(Hook(AlreadyExists)) Removed",
+                ],
+            ),
+        ] {
+            let to = temp("hook-exists");
+            let dir = Directory::open(&to).unwrap();
+            let hooks = Exists {
+                at,
+                steps: Mutex::default(),
+            };
+            let options = SaveOptions::default();
+            let cancel = std::future::pending();
+            let saved = save_new(resumable, &stream, &dir, &options, &hooks, cancel).await;
+            assert_eq!(saved, Err(error), "{at}");
+            assert_eq!(*hooks.steps.lock().unwrap(), steps, "{at}");
+            assert!(files_in(&to).is_empty(), "{at}");
+            drop(dir);
+            std::fs::remove_dir_all(&to).unwrap();
+        }
+    }
+}
+
+/// A checked file for which every name up to the publish's limit is taken
+/// gets none: the save says how many were tried and removes its partial.
+#[tokio::test]
+async fn a_save_whose_names_are_all_taken_says_how_many_it_tried() {
+    let stream = framed(b"ours").await;
+    for resumable in [false, true] {
+        let to = temp("name-limit");
+        std::fs::write(to.join("a.txt"), b"theirs").unwrap();
+        std::fs::write(to.join("a (2).txt"), b"theirs").unwrap();
+        let dir = Directory::open(&to).unwrap();
+        let rules = PublishRules {
+            name_tries: 2,
+            ..PublishRules::default()
+        };
+        let options = SaveOptions {
+            publish: &rules,
+            ..SaveOptions::default()
+        };
+        let hooks = Recorder::default();
+        let cancel = std::future::pending();
+        let saved = save_new(resumable, &stream, &dir, &options, &hooks, cancel).await;
+        assert_eq!(saved, Err(ChunkError::NoNameLeft { tried: 2 }));
+        assert_eq!(files_in(&to), ["a (2).txt", "a.txt"]);
+        assert_eq!(
+            hooks.steps().last().unwrap(),
+            "ended Err(NoNameLeft { tried: 2 }) Removed"
+        );
+        drop(dir);
+        std::fs::remove_dir_all(&to).unwrap();
+    }
 }
 
 /// Where a partial is removed by its name, another file put under that

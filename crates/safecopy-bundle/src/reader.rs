@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::LazyLock;
 
 use safecopy_chunks::{DIGEST_LEN, Digest, Hasher, Pace, Progress, SLICE, Saved, read_version};
-use safecopy_folder::{Directory, Finish, Meta, MetaRules, PublishError, PublishRules};
+use safecopy_folder::{Directory, Finish, Meta, MetaRules, NAME_TRIES, PublishError, PublishRules};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::placed::Placed;
@@ -148,6 +148,13 @@ pub struct ReadOptions<'a> {
     /// Flush each file's bytes to the disk before it gets its name. On by
     /// default.
     pub sync: bool,
+    /// The most names tried for one entry's partial file: `name.part`,
+    /// then `name.2.part` and so on up to `name.N.part` for this N. When
+    /// every one is taken the entry is [`Outcome::NoPartialName`], with
+    /// nothing created for it. 10 001 by default ([`NAME_TRIES`]), as far
+    /// as a file's own name is numbered: a partial name is taken only by
+    /// another save of that name under way or by one a crash left.
+    pub partial_tries: usize,
 }
 
 static DEFAULT_PUBLISH: LazyLock<PublishRules> = LazyLock::new(PublishRules::default);
@@ -160,6 +167,7 @@ impl Default for ReadOptions<'_> {
             progress: &(),
             pace: &(),
             sync: true,
+            partial_tries: NAME_TRIES,
         }
     }
 }
@@ -172,7 +180,7 @@ pub struct Report {
     /// Why the bundle ended early, when it did: every taken entry not
     /// settled before it is [`Outcome::NotReceived`]; a skipped one stays
     /// [`Outcome::Refused`], and one whose partial file could not be
-    /// created [`Outcome::Failed`].
+    /// created [`Outcome::Failed`] or [`Outcome::NoPartialName`].
     pub error: Option<BundleError>,
 }
 
@@ -186,7 +194,8 @@ pub struct Table<R> {
 /// An entry as the read goes.
 enum Slot<'a> {
     Skip,
-    Failed(io::ErrorKind),
+    /// No partial file could be made for it: its outcome.
+    Failed(Outcome),
     Open(Open<'a>),
 }
 
@@ -225,10 +234,14 @@ impl<R: AsyncRead + Unpin> Table<R> {
     /// Reads the bundle's files with one decision per entry, in order.
     ///
     /// First, admission in one batch: [`BundleHooks::before_create`], every
-    /// taken entry's partial file created new (`name.part`), and
-    /// [`BundleHooks::admitted`], before any byte is read. Then each entry:
-    /// exactly its size in bytes, written to its partial file or thrown
-    /// away, its mark and its hash. A whole file whose hash matches is
+    /// taken entry's partial file created new (`name.part`, or
+    /// `name.N.part` when that is taken, at most
+    /// [`ReadOptions::partial_tries`] names tried), and
+    /// [`BundleHooks::admitted`], before any byte is read. Only the
+    /// system's own "already exists" for a partial name moves to the next
+    /// name; an error of a hook, whatever its kind, is the hook's. Then
+    /// each entry: exactly its size in bytes, written to its partial file
+    /// or thrown away, its mark and its hash. A whole file whose hash matches is
     /// flushed ([`ReadOptions::sync`]), passed to
     /// [`BundleHooks::before_publish`] and published under its name, or a
     /// numbered one, never replacing a file; with
@@ -242,10 +255,14 @@ impl<R: AsyncRead + Unpin> Table<R> {
     /// [`Outcome::NotReceived`] (see [`Report::error`]).
     /// [`BundleHooks::ended`] hears the report.
     ///
-    /// `cancel` is watched while bytes come, while [`ReadOptions::pace`]
-    /// holds a write, and while a file is flushed and published. Dropping
-    /// this future instead also removes every partial file not published,
-    /// but [`BundleHooks::ended`] is not called.
+    /// `cancel` is watched between the partial names tried, while bytes
+    /// come, while [`ReadOptions::pace`] holds a write, and while a file is
+    /// flushed and published. After each taken partial name the read yields
+    /// to the runtime, so a cancel given by another task of its thread is
+    /// seen there; it ends the bundle before [`BundleHooks::admitted`],
+    /// with every partial file made so far removed. Dropping this future
+    /// instead also removes every partial file not published, but
+    /// [`BundleHooks::ended`] is not called.
     ///
     /// No write is left behind. Each slice is written on the blocking
     /// pool, at its own offset in the file, behind a gate its entry's
@@ -310,10 +327,23 @@ impl<R: AsyncRead + Unpin> Table<R> {
                 error: Some(BundleError::Hook(e.kind())),
             };
         }
-        let mut slots: Vec<Slot<'_>> = decisions.into_iter().map(admit).collect();
-        for (entry, slot) in slots.iter().enumerate() {
-            if let Slot::Failed(kind) = slot {
-                outcomes[entry] = Outcome::Failed(*kind);
+        let mut slots: Vec<Slot<'_>> = Vec::with_capacity(count);
+        for (entry, take) in decisions.into_iter().enumerate() {
+            match admit(take, options.partial_tries, &mut cancel).await {
+                Ok(slot) => {
+                    if let Slot::Failed(outcome) = &slot {
+                        outcomes[entry] = outcome.clone();
+                    }
+                    slots.push(slot);
+                }
+                Err(e) => {
+                    // Dropping the slots removes the partials made so far.
+                    drop(slots);
+                    return Report {
+                        outcomes,
+                        error: Some(e),
+                    };
+                }
             }
         }
         let partials: Vec<Partial<'_>> = slots
@@ -359,7 +389,7 @@ impl<R: AsyncRead + Unpin> Table<R> {
             };
             let outcome = match slot {
                 Slot::Skip => Outcome::Refused,
-                Slot::Failed(kind) => Outcome::Failed(kind),
+                Slot::Failed(outcome) => outcome,
                 Slot::Open(open) => {
                     let settled = settle(
                         entry,
@@ -507,40 +537,54 @@ async fn read_some<R: AsyncRead + Unpin>(
     }
 }
 
-/// Creates a taken entry's partial file.
-fn admit(take: Take<'_>) -> Slot<'_> {
+/// Creates a taken entry's partial file under the first free of at most
+/// `tries` names: `name.part`, or `name.N.part` when taken. `Err` is a
+/// cancel between names, which ends the bundle. No file is held across a
+/// wait: dropped or cancelled there, this has created nothing.
+async fn admit<'a>(
+    take: Take<'a>,
+    tries: usize,
+    cancel: &mut Pin<&mut impl Future<Output = ()>>,
+) -> Result<Slot<'a>, BundleError> {
     let (target, unless) = match take {
-        Take::Skip => return Slot::Skip,
+        Take::Skip => return Ok(Slot::Skip),
         Take::Save(target) => (target, None),
         Take::SaveUnlessSame(target, digest) => (target, Some(digest)),
     };
-    match create(target.dir, &target.name) {
-        Ok((file, partial)) => Slot::Open(Open {
-            target,
-            unless,
-            file,
-            partial,
-            published: false,
-        }),
-        Err(e) => Slot::Failed(e.kind()),
-    }
-}
-
-/// The partial file's name: `name.part`, or `name.N.part` when taken.
-fn create(dir: &Directory, name: &str) -> io::Result<(File, OsString)> {
-    for n in 1u64.. {
+    for n in 1..=tries {
+        if n > 1 {
+            #[cfg(test)]
+            crate::seams::name_taken(n - 1);
+            // Taken names are passed without a wait: the runtime gets its
+            // turn, or a cancel from this thread is never ready.
+            tokio::task::yield_now().await;
+            tokio::select! {
+                biased;
+                () = cancel.as_mut() => return Err(BundleError::Cancelled),
+                () = std::future::ready(()) => {}
+            }
+        }
         let partial = OsString::from(if n == 1 {
-            format!("{name}.part")
+            format!("{}.part", target.name)
         } else {
-            format!("{name}.{n}.part")
+            format!("{}.{n}.part", target.name)
         });
-        match dir.create(&partial) {
-            Ok(file) => return Ok((file, partial)),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
+        match target.dir.create(&partial) {
+            Ok(file) => {
+                return Ok(Slot::Open(Open {
+                    target,
+                    unless,
+                    file,
+                    partial,
+                    published: false,
+                }));
+            }
+            // The system's word that the name is taken, and nothing else.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Ok(Slot::Failed(Outcome::Failed(e.kind()))),
         }
     }
-    unreachable!("the numbers never run out")
+    Ok(Slot::Failed(Outcome::NoPartialName { tried: tries }))
 }
 
 /// Removes the partial files of the entries from `first` on.
@@ -650,6 +694,7 @@ async fn publish(
         }),
         Err(PublishError::Cancelled) => Err(Err(BundleError::Cancelled)),
         Err(PublishError::Io(e) | PublishError::Name { error: e, .. }) => failed(e.kind()),
+        Err(PublishError::NoNameLeft { tried }) => Err(Ok(Outcome::NoNameLeft { tried })),
         Err(_) => failed(io::ErrorKind::Other),
     }
 }

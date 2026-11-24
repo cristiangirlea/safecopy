@@ -184,6 +184,20 @@ pub enum Outcome {
     /// the publish, or a hook refused (its error's kind). Its bytes were
     /// read past; nothing of it is kept.
     Failed(io::ErrorKind),
+    /// Every name tried for its partial file was taken
+    /// ([`ReadOptions::partial_tries`]): none was created. Its bytes were
+    /// read past.
+    NoPartialName {
+        /// The names tried.
+        tried: usize,
+    },
+    /// Its hash matched, and every name tried for it was taken
+    /// (`safecopy_folder::PublishRules::name_tries`): it got none, and
+    /// its partial file was removed.
+    NoNameLeft {
+        /// The names tried.
+        tried: usize,
+    },
 }
 
 /// Why a bundle was refused or ended early.
@@ -342,6 +356,20 @@ pub(crate) mod seams {
         /// The write that would pass this byte of the next partial file
         /// this thread writes fails, with nothing of it written.
         pub static WRITE_ERROR_AT: Cell<Option<u64>> = const { Cell::new(None) };
+        /// Told how many partial names of an entry a read of this thread
+        /// found taken so far, after each, before its cancel is looked at.
+        pub static NAME_TAKEN: RefCell<Option<Taken>> = const { RefCell::new(None) };
+    }
+
+    /// What hears of each taken partial name.
+    pub type Taken = Box<dyn Fn(usize)>;
+
+    pub fn name_taken(taken: usize) {
+        NAME_TAKEN.with_borrow(|seam| {
+            if let Some(seam) = seam {
+                seam(taken);
+            }
+        });
     }
 
     /// What hears of a read's writes: it may hold a step for as long as a

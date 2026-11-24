@@ -25,6 +25,11 @@ pub struct PublishRules {
     pub retries: u32,
     /// How long to wait before each of those tries.
     pub retry_wait: Duration,
+    /// The most names tried for the file: the one asked for and its
+    /// numbers ("name (2).ext" and so on). When every one is taken the
+    /// publish fails with [`PublishError::NoNameLeft`].
+    /// [`NAME_TRIES`](crate::NAME_TRIES) by default.
+    pub name_tries: usize,
 }
 
 impl Default for PublishRules {
@@ -33,6 +38,7 @@ impl Default for PublishRules {
             mark: false,
             retries: 5,
             retry_wait: Duration::from_millis(50),
+            name_tries: crate::NAME_TRIES,
         }
     }
 }
@@ -272,6 +278,13 @@ pub enum PublishError {
         /// What the system said, with its kind and its own code.
         error: io::Error,
     },
+    /// Every name tried was taken ([`PublishRules::name_tries`]). Nothing
+    /// was published; the partial file is still there for the caller to
+    /// discard.
+    NoNameLeft {
+        /// The names tried.
+        tried: usize,
+    },
 }
 
 impl fmt::Display for PublishError {
@@ -281,6 +294,7 @@ impl fmt::Display for PublishError {
             Self::Cancelled => f.write_str("Cancelled"),
             Self::Io(e) => write!(f, "Io({:?})", e.kind()),
             Self::Name { error, .. } => write!(f, "Name({:?})", error.kind()),
+            Self::NoNameLeft { tried } => write!(f, "NoNameLeft({tried})"),
         }
     }
 }
@@ -288,7 +302,7 @@ impl fmt::Display for PublishError {
 impl std::error::Error for PublishError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Cancelled => None,
+            Self::Cancelled | Self::NoNameLeft { .. } => None,
             Self::Io(e) | Self::Name { error: e, .. } => Some(e),
         }
     }
@@ -310,15 +324,17 @@ pub fn part(path: &Path) -> PathBuf {
 }
 
 /// `name` in `dir`, or "name (2).ext" and so on when that or its
-/// [`part`] exists. Only a wish: another file may take it before it is
+/// [`part`] exists: the first free of at most `tries` names
+/// ([`NAME_TRIES`](crate::NAME_TRIES) is the default elsewhere), `None`
+/// when every one is taken. Only a wish: another file may take it before it is
 /// published, which [`publish_path`] allows for. Nothing is cut: a number
 /// makes `name` longer by " (N)", which the caller's limit on a name leaves
 /// room for, as it does for [`part`].
-pub fn unique(dir: &Path, name: &str) -> PathBuf {
+pub fn unique(dir: &Path, name: &str, tries: usize) -> Option<PathBuf> {
     candidates(name)
+        .take(tries)
         .map(|name| dir.join(name))
         .find(|p| !p.exists() && !part(p).exists())
-        .expect("the numbers never run out")
 }
 
 /// Marks the file at `path` as downloaded, as [`Directory::mark`] does.
@@ -409,7 +425,9 @@ impl Directory {
     }
 
     /// Gives `file`, created here as `partial` ([`Self::create`]), its
-    /// final name: `name`, or "name (2).ext" and so on when that is taken.
+    /// final name: `name`, or "name (2).ext" and so on when that is taken,
+    /// at most [`PublishRules::name_tries`] names; when every one is taken
+    /// it fails with [`PublishError::NoNameLeft`] and names nothing.
     /// A file that took a name is never replaced, however late it came.
     /// With [`PublishRules::mark`] the file is marked before it gets a name.
     ///
@@ -422,7 +440,9 @@ impl Directory {
     /// linking fails for the folder (no procfs, procfs denied), this handle
     /// remembers it and later names go straight to the rename. A file that
     /// took `partial`'s name meanwhile is never removed.
-    /// `cancel` is checked before each step and while waiting. After an
+    /// `cancel` is checked before each step and while waiting, and after
+    /// each taken name the publish yields to the runtime, so a cancel
+    /// given by another task of its thread is seen between names. After an
     /// error or a cancel, `partial` is left for the caller to discard. An
     /// error at a name says which ([`PublishError::Name`]).
     ///
@@ -491,7 +511,12 @@ impl Directory {
         };
         // After the mark: writing it changes the time on Windows.
         let mut applied = self.apply(file, meta, meta_rules)?;
-        for target in candidates(name) {
+        for (taken, target) in candidates(name).take(rules.name_tries).enumerate() {
+            if taken > 0 {
+                // Taken names are passed without a wait: the runtime gets
+                // its turn, or a cancel from this thread is never ready.
+                tokio::task::yield_now().await;
+            }
             let leaf = OsStr::new(&target);
             let published = |marked, applied| {
                 (
@@ -613,12 +638,15 @@ impl Directory {
             let _ = self.discard(file, partial);
             return Ok(published(marked, applied));
         }
-        unreachable!("the numbers never run out")
+        Err(PublishError::NoNameLeft {
+            tried: rules.name_tries,
+        })
     }
 }
 
 /// Gives the closed file at `partial` its final name, by path: `wanted` if
-/// still free, else the next free name for `name` in `dir`. A file that took
+/// still free, else the next free name for `name` in `dir`, at most
+/// [`PublishRules::name_tries`] names with `wanted`. A file that took
 /// the name meanwhile is never replaced. With [`PublishRules::mark`] the
 /// file is marked first.
 ///
@@ -631,8 +659,9 @@ impl Directory {
 ///
 /// By path, links on the way are followed: prefer [`Directory::publish`].
 ///
-/// Every error is a [`PublishError::Name`]: the name being tried when the
-/// system refused, which is `wanted` or a numbered one after it.
+/// An error of the system is a [`PublishError::Name`]: the name being tried
+/// when it refused, which is `wanted` or a numbered one after it. Every
+/// name taken is [`PublishError::NoNameLeft`], the partial left as it is.
 pub async fn publish_path(
     partial: &Path,
     wanted: &Path,
@@ -649,7 +678,8 @@ pub async fn publish_path(
     let others = candidates(name)
         .map(|name| dir.join(name))
         .filter(move |p| *p != own);
-    for target in std::iter::once(wanted.to_path_buf()).chain(others) {
+    let targets = std::iter::once(wanted.to_path_buf()).chain(others);
+    for target in targets.take(rules.name_tries) {
         let at_name = |error: io::Error| PublishError::Name {
             path: target.clone(),
             error,
@@ -712,7 +742,9 @@ pub async fn publish_path(
             marked,
         });
     }
-    unreachable!("the numbers never run out")
+    Err(PublishError::NoNameLeft {
+        tried: rules.name_tries,
+    })
 }
 
 async fn hard_link(from: &Path, to: &Path) -> io::Result<()> {
@@ -762,6 +794,16 @@ pub(crate) mod tests {
         assert!(!rules.mark);
         assert_eq!(rules.retries, 5);
         assert_eq!(rules.retry_wait, Duration::from_millis(50));
+    }
+
+    /// A name is tried as far as the default name rules number one.
+    #[test]
+    fn the_default_rules_try_as_many_names_as_the_name_rules_number() {
+        assert_eq!(PublishRules::default().name_tries, 10_001);
+        assert_eq!(
+            crate::NAME_TRIES,
+            safecopy_names::NameRules::default().max_number
+        );
     }
 
     #[test]

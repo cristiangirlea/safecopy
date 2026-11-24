@@ -81,6 +81,12 @@ pub use publish::{
     Finish, Marked, PublishError, PublishRules, Published, mark_path, part, publish_path, unique,
 };
 
+/// How many names a search for a free one tries where the caller sets no
+/// other limit ([`PublishRules::name_tries`], [`Directory::claim`]): the
+/// name asked for and its numbers up to 10 001, as far as the default
+/// `safecopy_names::NameRules` number a name.
+pub const NAME_TRIES: usize = 10_001;
+
 /// Why this crate refused to open, create or name something.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -106,6 +112,12 @@ pub enum Refusal {
     /// The name no longer refers to the open file it was given for: another
     /// file took it, and was left as it is.
     Replaced,
+    /// Every name tried for a new folder was taken
+    /// ([`Directory::claim_within`]).
+    NoNameLeft {
+        /// The names tried.
+        tried: usize,
+    },
 }
 
 impl fmt::Display for Refusal {
@@ -272,9 +284,17 @@ impl Directory {
     /// name is taken, by a file or a folder. It is created in one step that
     /// fails when it exists, so two folders of one name created at once
     /// each get their own. A folder's name has no extension: the number
-    /// goes last.
+    /// goes last. At most [`NAME_TRIES`] names are tried:
+    /// [`Self::claim_within`] takes another limit.
     pub fn claim(&self, name: &str) -> io::Result<Self> {
-        for n in 1u64.. {
+        self.claim_within(name, NAME_TRIES)
+    }
+
+    /// [`Self::claim`], trying at most `tries` names: `name` and its
+    /// numbers up to `tries`. When all are taken nothing is created and it
+    /// fails with [`Refusal::NoNameLeft`].
+    pub fn claim_within(&self, name: &str, tries: usize) -> io::Result<Self> {
+        for n in 1..=tries {
             let name = if n == 1 {
                 name.to_string()
             } else {
@@ -287,7 +307,7 @@ impl Directory {
                 Err(e) => return Err(e),
             }
         }
-        unreachable!("the numbers never run out")
+        Err(refused(Refusal::NoNameLeft { tried: tries }))
     }
 
     /// The names in this folder, at most `limit`, without `.` and `..`. A

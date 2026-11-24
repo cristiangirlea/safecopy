@@ -133,16 +133,178 @@ fn a_taken_folder_name_gets_a_number() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A folder whose names are all taken up to the limit gets none, and the
+/// refusal says how many were tried; a higher limit takes the next.
+#[test]
+fn a_folder_name_is_tried_only_as_often_as_the_limit_says() {
+    let dir = temp("claim-limit");
+    let held = Directory::destination(&dir).unwrap();
+    held.claim("Photos").unwrap();
+    std::fs::write(dir.join("Photos (2)"), "a file").unwrap();
+    let before = files_in(&dir);
+    for tries in [0, 1, 2] {
+        let refused = held.claim_within("Photos", tries).unwrap_err();
+        assert_eq!(
+            refusal(&refused),
+            Some(Refusal::NoNameLeft { tried: tries })
+        );
+    }
+    assert_eq!(files_in(&dir), before);
+    let third = held.claim_within("Photos", 3).unwrap();
+    assert_eq!(third.path(), dir.join("Photos (3)"));
+    drop((held, third));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn a_taken_name_gets_a_number() {
     let dir = temp("unique");
-    assert_eq!(unique(&dir, "a.txt"), dir.join("a.txt"));
+    let unique = |name: &str| unique(&dir, name, crate::NAME_TRIES).unwrap();
+    assert_eq!(unique("a.txt"), dir.join("a.txt"));
     std::fs::write(dir.join("a.txt"), "1").unwrap();
-    assert_eq!(unique(&dir, "a.txt"), dir.join("a (2).txt"));
+    assert_eq!(unique("a.txt"), dir.join("a (2).txt"));
     std::fs::write(dir.join("a (2).txt.part"), "").unwrap();
-    assert_eq!(unique(&dir, "a.txt"), dir.join("a (3).txt"));
-    assert_eq!(unique(&dir, ".hidden"), dir.join(".hidden"));
+    assert_eq!(unique("a.txt"), dir.join("a (3).txt"));
+    assert_eq!(unique(".hidden"), dir.join(".hidden"));
+    // No further than the limit.
+    for tries in [0, 1, 2] {
+        assert_eq!(super::unique(&dir, "a.txt", tries), None);
+    }
+    assert_eq!(super::unique(&dir, "a.txt", 3), Some(dir.join("a (3).txt")));
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A publish in a folder where every name up to the limit is taken names
+/// nothing, says how many it tried and leaves the partial to its caller;
+/// with a higher limit it takes the next name.
+#[tokio::test]
+async fn a_publish_tries_only_as_many_names_as_its_rules_say() {
+    let to = temp("publish-limit");
+    let dir = Directory::open(&to).unwrap();
+    std::fs::write(to.join("a.txt"), "theirs").unwrap();
+    std::fs::write(to.join("a (2).txt"), "theirs").unwrap();
+    let file = partial(&dir, "a.part", b"ours");
+    let before = files_in(&to);
+    for tries in [0, 1, 2] {
+        let rules = PublishRules {
+            name_tries: tries,
+            ..PublishRules::default()
+        };
+        let failed = dir
+            .publish(&file, os("a.part"), "a.txt", &rules, std::future::pending())
+            .await;
+        assert!(
+            matches!(failed, Err(PublishError::NoNameLeft { tried }) if tried == tries),
+            "{failed:?}"
+        );
+        assert_eq!(files_in(&to), before);
+    }
+    // Without links the copy's claim of a name is counted the same way.
+    for (no_links, no_rename) in [(true, false), (true, true)] {
+        let rules = PublishRules {
+            name_tries: 2,
+            ..PublishRules::default()
+        };
+        NO_HARD_LINKS.set(no_links);
+        NO_RENAME.set(no_rename);
+        let failed = dir
+            .publish(&file, os("a.part"), "a.txt", &rules, std::future::pending())
+            .await;
+        NO_HARD_LINKS.set(false);
+        NO_RENAME.set(false);
+        assert!(
+            matches!(failed, Err(PublishError::NoNameLeft { tried: 2 })),
+            "{failed:?}"
+        );
+        assert_eq!(files_in(&to), before);
+    }
+    let rules = PublishRules {
+        name_tries: 3,
+        ..PublishRules::default()
+    };
+    let published = dir
+        .publish(&file, os("a.part"), "a.txt", &rules, std::future::pending())
+        .await
+        .unwrap();
+    assert_eq!(published.path, to.join("a (3).txt"));
+    assert_eq!(std::fs::read(to.join("a (3).txt")).unwrap(), b"ours");
+    assert_eq!(std::fs::read(to.join("a.txt")).unwrap(), b"theirs");
+    drop((file, dir));
+    std::fs::remove_dir_all(to).unwrap();
+}
+
+/// By path the limit counts `wanted` and the numbered names after it, with
+/// hard links and without.
+#[tokio::test]
+async fn by_path_a_publish_tries_only_as_many_names_as_its_rules_say() {
+    for no_links in [false, true] {
+        let to = temp("path-limit");
+        let partial = to.join("a.txt.part");
+        std::fs::write(&partial, "ours").unwrap();
+        std::fs::write(to.join("a.txt"), "theirs").unwrap();
+        std::fs::write(to.join("a (2).txt"), "theirs").unwrap();
+        let before = files_in(&to);
+        let publish = async |tries: usize| {
+            let rules = PublishRules {
+                name_tries: tries,
+                ..PublishRules::default()
+            };
+            NO_HARD_LINKS.set(no_links);
+            let published = publish_path(&partial, &to.join("a.txt"), &to, "a.txt", &rules).await;
+            NO_HARD_LINKS.set(false);
+            published
+        };
+        for tries in [0, 1, 2] {
+            let failed = publish(tries).await;
+            assert!(
+                matches!(failed, Err(PublishError::NoNameLeft { tried }) if tried == tries),
+                "{failed:?}"
+            );
+            assert_eq!(files_in(&to), before);
+        }
+        let published = publish(3).await.unwrap();
+        assert_eq!(published.path, to.join("a (3).txt"));
+        assert_eq!(std::fs::read(to.join("a (3).txt")).unwrap(), b"ours");
+        assert!(!partial.exists());
+        std::fs::remove_dir_all(&to).unwrap();
+    }
+}
+
+/// A publish that passes taken names lets the runtime's other tasks run
+/// between them: a cancel one of them gives is seen before the next name,
+/// which stays free.
+#[tokio::test]
+async fn a_cancel_given_by_another_task_while_names_are_taken_ends_the_publish() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let to = temp("cancel-between-names");
+    let dir = Directory::open(&to).unwrap();
+    std::fs::write(to.join("a.txt"), "theirs").unwrap();
+    let file = partial(&dir, "a.part", b"ours");
+    let flag = Arc::new(AtomicBool::new(false));
+    // Runs only once the publish lets go of the thread.
+    let cancelling = tokio::spawn({
+        let flag = flag.clone();
+        async move { flag.store(true, Ordering::SeqCst) }
+    });
+    let cancel = std::future::poll_fn(|_| {
+        if flag.load(Ordering::SeqCst) {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    });
+    let rules = PublishRules::default();
+    let result = dir
+        .publish(&file, os("a.part"), "a.txt", &rules, cancel)
+        .await;
+    assert!(matches!(result, Err(PublishError::Cancelled)), "{result:?}");
+    assert_eq!(files_in(&to), ["a.part", "a.txt"]);
+    cancelling.await.unwrap();
+    dir.discard(&file, os("a.part")).unwrap();
+    drop((file, dir));
+    std::fs::remove_dir_all(to).unwrap();
 }
 
 #[test]

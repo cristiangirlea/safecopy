@@ -100,6 +100,42 @@ The framing is fuzzed: `fuzz/fuzz_targets/framing.rs`.
 
 ## Changes
 
+- **The search for a free partial name has a limit and sees a cancel.**
+  A new save claims `name.part`, then `name.2.part` and so on; it tried
+  them without end and looked at its cancel only once a name was found,
+  so in a folder holding very many partial files of one name it tried
+  them all before its first byte. `SaveOptions` has a new field,
+  `partial_tries`, the most names tried, 10 001 by default
+  (`safecopy_folder::NAME_TRIES`, as far as a file's own name is
+  numbered: a partial name is taken only by another save of that name
+  under way or by one a crash left). When every one is taken the save
+  fails with the new `ChunkError::NoPartialName { tried }`, and a
+  cancel given while names are taken ends it with `Cancelled` before
+  the next name is tried; after each taken name the save yields to the
+  runtime, so a cancel from another task of its thread is seen too.
+  Either way nothing was created: `Hooks::created` is not called and
+  `Hooks::ended` hears `PartialFate::NotCreated`
+  (`a_save_tries_only_as_many_partial_names_as_its_options_say`,
+  `a_cancel_between_partial_names_ends_the_save_with_nothing_created`,
+  `a_cancel_given_by_another_task_is_seen_between_partial_names`).
+  `save_verified` and `save_resumable` from `Start::New` alike;
+  `Start::Resume` creates no file and searches for no name.
+  The publish's own search is bounded by
+  `PublishRules::name_tries` (see `safecopy-folder`); when it runs out
+  the save fails with the new `ChunkError::NoNameLeft { tried }` and its
+  partial is removed
+  (`a_save_whose_names_are_all_taken_says_how_many_it_tried`); it was
+  `Io(Other)` for any publish error this crate did not know.
+  **Breaking** for a caller that writes `SaveOptions` out in full: add
+  `partial_tries: safecopy_folder::NAME_TRIES`, or end the literal with
+  `..SaveOptions::default()`.
+- **A hook's "already exists" is never a taken name.** Nothing changed
+  here, and a test now holds it: the search moves to the next name only
+  on the system's own "already exists" for the partial file; the hooks
+  are called outside it, and an error of `before_create` or `created`
+  of that kind ends the save with `Hook(AlreadyExists)` at once, the
+  partial just made removed and no second one tried
+  (`a_hook_that_says_already_exists_fails_the_save_and_is_no_taken_name`).
 - **`save_resumable` takes a `Target { dir, name, size }`** where it took
   the three as arguments: `save_resumable(reader, target, start, keep,
   options, hooks, cancel)`. `save_verified` is as it was.

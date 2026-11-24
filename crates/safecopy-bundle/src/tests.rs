@@ -1681,3 +1681,248 @@ async fn a_hook_that_moves_a_partial_files_position_moves_no_byte() {
     assert!(std::fs::read(path.join("b")).unwrap() == files[1]);
     assert_eq!(files_in(&path), ["a", "b"]);
 }
+
+// The search for a free partial name.
+
+/// A bundle of two small files read into `dir` as `first` and `second`.
+async fn read_two(
+    dir: &Directory,
+    [first, second]: [&str; 2],
+    options: &ReadOptions<'_>,
+    hooks: &dyn BundleHooks,
+    cancel: impl std::future::Future<Output = ()>,
+) -> Report {
+    let files = [data(10, 1), data(20, 2)];
+    let refs: Vec<&[u8]> = files.iter().map(|f| &f[..]).collect();
+    let table = BundleReader::open(stream(bundle(&refs).await), &BundleLimits::default())
+        .await
+        .unwrap();
+    let decisions = vec![save(dir, first), save(dir, second)];
+    table.read(decisions, options, hooks, cancel).await
+}
+
+#[test]
+fn a_partial_name_is_tried_as_far_as_a_name_is_numbered_by_default() {
+    assert_eq!(ReadOptions::default().partial_tries, 10_001);
+    assert_eq!(
+        ReadOptions::default().partial_tries,
+        safecopy_folder::NAME_TRIES
+    );
+}
+
+/// An entry whose partial names are all taken up to the limit gets none
+/// and says how many were tried; the others are saved. With a higher
+/// limit it takes the next name.
+#[tokio::test]
+async fn an_entry_tries_only_as_many_partial_names_as_the_options_say() {
+    let path = temp("partial-limit");
+    std::fs::write(path.join("a.part"), b"another's").unwrap();
+    std::fs::write(path.join("a.2.part"), b"another's").unwrap();
+    let dir = Directory::open(&path).unwrap();
+    for tries in [0, 1, 2] {
+        let options = ReadOptions {
+            partial_tries: tries,
+            ..quick()
+        };
+        let hooks = Calls::default();
+        let report = read_two(&dir, ["a", "b"], &options, &hooks, std::future::pending()).await;
+        assert_eq!(report.error, None);
+        assert_eq!(report.outcomes[0], Outcome::NoPartialName { tried: tries });
+        if tries == 0 {
+            // Not one name is tried, for the entry whose name is free either.
+            assert_eq!(report.outcomes[1], Outcome::NoPartialName { tried: 0 });
+            assert_eq!(*hooks.admitted.lock().unwrap(), [vec![]]);
+            assert_eq!(files_in(&path), ["a.2.part", "a.part"]);
+        } else {
+            assert!(matches!(report.outcomes[1], Outcome::Saved(_)));
+            assert_eq!(
+                *hooks.admitted.lock().unwrap(),
+                [vec![(1, "b.part".to_string())]]
+            );
+            assert_eq!(files_in(&path), ["a.2.part", "a.part", "b"]);
+            std::fs::remove_file(path.join("b")).unwrap();
+        }
+        assert_eq!(hooks.ended.lock().unwrap().len(), 1);
+    }
+    let options = ReadOptions {
+        partial_tries: 3,
+        ..quick()
+    };
+    let hooks = Calls::default();
+    let report = read_two(&dir, ["a", "b"], &options, &hooks, std::future::pending()).await;
+    assert_eq!(report.error, None);
+    assert!(matches!(report.outcomes[0], Outcome::Saved(_)));
+    assert_eq!(
+        *hooks.admitted.lock().unwrap(),
+        [vec![(0, "a.3.part".to_string()), (1, "b.part".to_string())]]
+    );
+    assert_eq!(files_in(&path), ["a", "a.2.part", "a.part", "b"]);
+    drop(dir);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+/// A cancel given while an entry's partial names are taken ends the
+/// bundle before the next name is tried and before admission: the partial
+/// made for an earlier entry is removed, and none is made after.
+#[tokio::test]
+async fn a_cancel_between_partial_names_ends_the_bundle_with_nothing_created() {
+    let path = temp("cancel-names");
+    // The second name of `a` is free: only the cancel keeps the read from it.
+    std::fs::write(path.join("a.part"), b"another's").unwrap();
+    let dir = Directory::open(&path).unwrap();
+    let flag = Arc::new(AtomicBool::new(false));
+    // Given right after the first name of `a` was found taken, with the
+    // first entry's partial on the disk.
+    crate::seams::NAME_TAKEN.set(Some(Box::new({
+        let (flag, path) = (flag.clone(), path.clone());
+        move |taken| {
+            assert_eq!(taken, 1);
+            assert_eq!(files_in(&path), ["a.part", "b.part"]);
+            flag.store(true, Ordering::SeqCst);
+        }
+    })));
+    let hooks = Calls::default();
+    let report = read_two(&dir, ["b", "a"], &quick(), &hooks, on_flag(&flag)).await;
+    crate::seams::NAME_TAKEN.set(None);
+    assert!(flag.load(Ordering::SeqCst));
+    assert_eq!(report.error, Some(BundleError::Cancelled));
+    assert_eq!(report.outcomes, vec![Outcome::NotReceived; 2]);
+    assert_eq!(files_in(&path), ["a.part"]);
+    assert_eq!(hooks.before_create.lock().unwrap().len(), 1);
+    assert!(hooks.admitted.lock().unwrap().is_empty());
+    assert_eq!(*hooks.ended.lock().unwrap(), [report]);
+    drop(dir);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+/// A read dropped while an entry's partial names are taken leaves no
+/// partial of an earlier entry behind, and has admitted nothing.
+#[tokio::test]
+async fn a_read_dropped_between_partial_names_removes_the_partials_it_made() {
+    let path = temp("drop-names");
+    std::fs::write(path.join("a.part"), b"another's").unwrap();
+    let dir = Directory::open(&path).unwrap();
+    let flag = Arc::new(AtomicBool::new(false));
+    crate::seams::NAME_TAKEN.set(Some(Box::new({
+        let (flag, path) = (flag.clone(), path.clone());
+        move |_| {
+            assert_eq!(files_in(&path), ["a.part", "b.part"]);
+            flag.store(true, Ordering::SeqCst);
+        }
+    })));
+    let hooks = Calls::default();
+    let options = quick();
+    // The read is polled until it waits between names, then dropped.
+    tokio::select! {
+        biased;
+        () = on_flag(&flag) => {}
+        report = read_two(&dir, ["b", "a"], &options, &hooks, std::future::pending()) => {
+            panic!("{report:?}")
+        }
+    }
+    crate::seams::NAME_TAKEN.set(None);
+    assert_eq!(files_in(&path), ["a.part"]);
+    assert!(hooks.admitted.lock().unwrap().is_empty());
+    assert!(hooks.ended.lock().unwrap().is_empty());
+    drop(dir);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+/// The read lets the runtime's other tasks run between taken names: a
+/// cancel one of them gives on the read's own thread is seen there.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cancel_given_by_another_task_is_seen_between_partial_names() {
+    let path = temp("cancel-names-task");
+    std::fs::write(path.join("a.part"), b"another's").unwrap();
+    let dir = Directory::open(&path).unwrap();
+    let files = [data(10, 1)];
+    let refs: Vec<&[u8]> = files.iter().map(|f| &f[..]).collect();
+    // The whole bundle is at hand: no task of the test's is needed to read it.
+    let bytes = bundle(&refs).await;
+    let table = BundleReader::open(&bytes[..], &BundleLimits::default())
+        .await
+        .unwrap();
+    let flag = Arc::new(AtomicBool::new(false));
+    // Runs only once the read lets go of the thread.
+    let cancelling = tokio::spawn({
+        let flag = flag.clone();
+        async move { flag.store(true, Ordering::SeqCst) }
+    });
+    let hooks = Calls::default();
+    let report = table
+        .read(vec![save(&dir, "a")], &quick(), &hooks, on_flag(&flag))
+        .await;
+    assert_eq!(report.error, Some(BundleError::Cancelled));
+    assert_eq!(report.outcomes, [Outcome::NotReceived]);
+    assert_eq!(files_in(&path), ["a.part"]);
+    // Seen in the search itself: no second name was made and admitted.
+    assert!(hooks.admitted.lock().unwrap().is_empty());
+    cancelling.await.unwrap();
+    drop(dir);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+/// A hook's "already exists" is the hook's refusal, never a taken name:
+/// the bundle ends at once with it and no second partial name is tried.
+#[tokio::test]
+async fn a_hook_that_says_already_exists_ends_the_bundle_and_is_no_taken_name() {
+    struct Exists(&'static str, Mutex<Vec<String>>);
+    impl BundleHooks for Exists {
+        fn before_create(&self, _: &[usize]) -> io::Result<()> {
+            if self.0 == "before_create" {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
+            Ok(())
+        }
+        fn admitted(&self, partials: &[Partial<'_>]) -> io::Result<()> {
+            let names = partials.iter().map(|p| p.name.to_string_lossy().into());
+            self.1.lock().unwrap().extend(names);
+            Err(io::ErrorKind::AlreadyExists.into())
+        }
+    }
+    for (at, admitted) in [
+        ("before_create", vec![]),
+        ("admitted", vec!["a.part", "b.part"]),
+    ] {
+        let path = temp("hook-exists");
+        let dir = Directory::open(&path).unwrap();
+        let hooks = Exists(at, Mutex::default());
+        let report = read_two(&dir, ["a", "b"], &quick(), &hooks, std::future::pending()).await;
+        assert_eq!(
+            report.error,
+            Some(BundleError::Hook(io::ErrorKind::AlreadyExists)),
+            "{at}"
+        );
+        assert_eq!(report.outcomes, vec![Outcome::NotReceived; 2], "{at}");
+        assert_eq!(*hooks.1.lock().unwrap(), admitted, "{at}");
+        assert!(files_in(&path).is_empty(), "{at}");
+        drop(dir);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+/// A checked entry for which every name up to the publish's limit is taken
+/// gets none and says how many were tried: its partial is removed, and
+/// the bundle reads on.
+#[tokio::test]
+async fn an_entry_whose_names_are_all_taken_says_how_many_it_tried() {
+    let path = temp("name-limit");
+    std::fs::write(path.join("a"), b"theirs").unwrap();
+    std::fs::write(path.join("a (2)"), b"theirs").unwrap();
+    let dir = Directory::open(&path).unwrap();
+    let rules = safecopy_folder::PublishRules {
+        name_tries: 2,
+        ..Default::default()
+    };
+    let options = ReadOptions {
+        publish: &rules,
+        ..quick()
+    };
+    let report = read_two(&dir, ["a", "b"], &options, &(), std::future::pending()).await;
+    assert_eq!(report.error, None);
+    assert_eq!(report.outcomes[0], Outcome::NoNameLeft { tried: 2 });
+    assert!(matches!(report.outcomes[1], Outcome::Saved(_)));
+    assert_eq!(files_in(&path), ["a", "a (2)", "b"]);
+    drop(dir);
+    std::fs::remove_dir_all(path).unwrap();
+}
