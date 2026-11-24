@@ -67,8 +67,9 @@ pub struct Skipped {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Skip {
-    /// It could not be read. A folder that could not be read still goes,
-    /// empty.
+    /// It could not be read, or `safecopy-folder` refused it for another
+    /// reason than the ones below. A folder that could not be read still
+    /// goes, empty.
     Unreadable,
     /// A link or junction, which is not followed.
     Link,
@@ -98,7 +99,7 @@ impl Listing {
             .ok_or(ManifestError::WholeDrive)?
             .to_string_lossy()
             .into_owned();
-        let opened = Directory::open(root).map_err(|e| unreadable(root, &e))?;
+        let opened = Directory::open(root).map_err(|e| unreadable(root, (0, 0), &e))?;
         let most = limits.entries;
         let mut listing = Listing {
             name: name.clone(),
@@ -130,7 +131,7 @@ impl Listing {
                 });
             let (directory, read) = match read {
                 Ok(read) => read,
-                Err(e) if depth == 1 => return Err(unreadable(root, &e)),
+                Err(e) if depth == 1 => return Err(unreadable(root, (0, 0), &e)),
                 Err(_) => {
                     listing.skipped.push(Skipped {
                         path: format!("{at}/"),
@@ -163,9 +164,9 @@ impl Listing {
                         continue;
                     }
                 };
-                let meta = file
-                    .metadata()
-                    .map_err(|e| unreadable(&source(root, &child_parts), &e))?;
+                let meta = file.metadata().map_err(|e| {
+                    unreadable(&source(root, &child_parts), (0, child_parts.len()), &e)
+                })?;
                 if depth + 1 > limits.depth || path.chars().count() >= limits.path_chars {
                     listing.skipped.push(Skipped {
                         path,
@@ -215,11 +216,15 @@ impl Listing {
     /// entry: [`ManifestError::Link`] names the folder on the way that is
     /// a link now, or the entry itself when it is the link, so the two are
     /// told apart by comparing `at` with the entry's path (the listed
-    /// folder's and [`Listed::parts`]).
+    /// folder's and [`Listed::parts`]). Any other refusal of the folder
+    /// crate's is [`ManifestError::Refused`], whose `part` counts the
+    /// parts that lead to what was refused.
     pub fn open_entry(&self, entry: &Listed) -> Result<Option<(File, u64)>, ManifestError> {
         // Where the entry's first `count` parts are.
         let at = |count: usize| source(self.root.path(), &entry.parts[..count]);
-        let on_the_way = |(count, e): (usize, io::Error)| unreadable(&at(count), &e);
+        // What failed is `count` parts below the one folder listed.
+        let failed = |count: usize, e: &io::Error| unreadable(&at(count), (0, count), e);
+        let on_the_way = |(count, e): (usize, io::Error)| failed(count, &e);
         if entry.folder {
             open_directory(&self.root, &entry.parts).map_err(on_the_way)?;
             return Ok(None);
@@ -227,13 +232,17 @@ impl Listing {
         let (last, within) = entry.parts.split_last().ok_or(ManifestError::Changed)?;
         let parent = open_directory(&self.root, within).map_err(on_the_way)?;
         let whole = || at(entry.parts.len());
-        let file = parent.entry(last).map_err(|e| match refusal(&e) {
-            Some(safecopy_folder::Refusal::NotFileOrFolder) => {
-                ManifestError::NotAFile { at: whole() }
-            }
-            _ => unreadable(&whole(), &e),
-        })?;
-        let meta = file.metadata().map_err(|e| unreadable(&whole(), &e))?;
+        let itself = |e: io::Error| failed(entry.parts.len(), &e);
+        let file =
+            again(last)
+                .and_then(|()| parent.entry(last))
+                .map_err(|e| match refusal(&e) {
+                    Some(safecopy_folder::Refusal::NotFileOrFolder) => {
+                        ManifestError::NotAFile { at: whole() }
+                    }
+                    _ => itself(e),
+                })?;
+        let meta = file.metadata().map_err(itself)?;
         if !meta.is_file() {
             return Err(ManifestError::NotAFile { at: whole() });
         }
@@ -273,9 +282,23 @@ fn skip_for(e: &io::Error) -> Skip {
 fn open_directory(root: &Directory, parts: &[OsString]) -> Result<Directory, (usize, io::Error)> {
     let mut dir = root.try_clone().map_err(|e| (0, e))?;
     for (n, part) in parts.iter().enumerate() {
-        dir = dir.directory(part).map_err(|e| (n + 1, e))?;
+        dir = again(part)
+            .and_then(|()| dir.directory(part))
+            .map_err(|e| (n + 1, e))?;
     }
     Ok(dir)
+}
+
+/// Tests refuse a name here as the folder crate would, for the refusals
+/// no system gives for a name it listed itself.
+pub(crate) fn again(name: &std::ffi::OsStr) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(why) = crate::seams::REFUSED.with_borrow(|refused| refused.get(name).copied()) {
+        return Err(io::Error::other(why));
+    }
+    #[cfg(not(test))]
+    let _ = name;
+    Ok(())
 }
 
 /// The names of one folder as they are read, each counted in `found`: past

@@ -19,6 +19,10 @@
 //!   execute bit ([`Listed::meta`]). An entry that does not open
 //!   again names the part of its path that failed: the folder on the way
 //!   that became a link ([`ManifestError::Link`]), or the entry itself.
+//! - What `safecopy-folder` refuses is never
+//!   [`ManifestError::Unreadable`]: a link and a special file have kinds
+//!   of their own, and every other [`safecopy_folder::Refusal`] is
+//!   [`ManifestError::Refused`] with the refusal in it.
 //! - [`groups`] cuts a list into groups, which a transfer goes through in
 //!   order, at most [`GroupLimits::open`] at once; [`Progress`] counts what
 //!   is done in them, bounded whatever the list's length.
@@ -57,6 +61,7 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+use safecopy_folder::Refusal;
 use safecopy_names::{NameError, NameRules, PathError, entry_name, fold, reserved};
 
 /// What an entry of a list is.
@@ -201,7 +206,24 @@ pub enum ManifestError {
         /// Where it is.
         at: PathBuf,
     },
-    /// A file or folder that could not be read.
+    /// A name, or what is under it, that `safecopy-folder` refused to open
+    /// or list for a reason with no kind of its own here. A link is
+    /// [`Self::Link`] and a device, a pipe or a socket
+    /// [`Self::NotFileOrFolder`] or [`Self::NotAFile`], never this.
+    Refused {
+        /// Why.
+        why: Refusal,
+        /// Which of the picked paths it was for, counted from 0. A
+        /// [`Listing`] has one folder: 0.
+        root: usize,
+        /// How many names lead to what was refused, from the folder held
+        /// open. For a [`Listing`] that is the listed folder: 0 is the
+        /// folder itself, and otherwise that many of [`Listed::parts`].
+        /// For [`Sources::list`] it is the folder the picked path is in:
+        /// 0 is that folder, 1 the picked file or folder, 2 a name in it.
+        part: usize,
+    },
+    /// A file or folder the system could not open or read.
     Unreadable {
         /// Where it is: for [`Listing::open_entry`], the part of the
         /// entry's path that could not be opened.
@@ -437,6 +459,9 @@ mod seams {
         pub static GONE_BEFORE_OPEN: RefCell<HashSet<OsString>> = RefCell::new(HashSet::new());
         /// Inspecting these names in the kept-out walk fails with this kind.
         pub static INSPECT_FAILS: RefCell<HashMap<OsString, std::io::ErrorKind>> =
+            RefCell::new(HashMap::new());
+        /// Opening these names while listing, or again for a listed entry, is refused so.
+        pub static REFUSED: RefCell<HashMap<OsString, safecopy_folder::Refusal>> =
             RefCell::new(HashMap::new());
         /// Files of these names get these Windows attributes.
         pub static ATTRIBUTES: RefCell<HashMap<OsString, u32>> = RefCell::new(HashMap::new());

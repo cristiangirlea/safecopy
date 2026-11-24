@@ -10,6 +10,7 @@ use std::time::SystemTime;
 use safecopy_folder::{Directory, FileId, Meta, Refusal, Time, Unfit, identity, is_link, refusal};
 use safecopy_names::Siblings;
 
+use crate::listing::again;
 use crate::{Entry, Kind, Limits, Manifest, ManifestError, add_within, check};
 
 // Windows' attributes of a file kept by a cloud or storage service.
@@ -335,10 +336,12 @@ pub(crate) fn list_within<P: AsRef<Path>>(
         sources: Vec::new(),
         bytes: 0,
         pending: 0,
+        root: 0,
     };
     let mut top = Siblings::new(limits.names.clone());
-    for root in roots {
+    for (n, root) in roots.iter().enumerate() {
         let root = root.as_ref();
+        walk.root = n;
         let name = root.file_name().ok_or(ManifestError::WholeDrive)?;
         let parent = root
             .parent()
@@ -353,7 +356,8 @@ pub(crate) fn list_within<P: AsRef<Path>>(
                     });
                 }
                 // Not part of the list, and held open from here: links to it are fine.
-                let dir = Directory::followed(parent).map_err(|e| unreadable(parent, &e))?;
+                let dir =
+                    Directory::followed(parent).map_err(|e| unreadable(parent, (n, 0), &e))?;
                 if kept.is_some_and(|kept| kept.holds(&dir)) {
                     return Err(ManifestError::KeptOut);
                 }
@@ -390,13 +394,17 @@ pub(crate) fn list_within<P: AsRef<Path>>(
     ))
 }
 
-/// Why `at` could not be listed.
-pub(crate) fn unreadable(at: &Path, e: &io::Error) -> ManifestError {
+/// Why `at` could not be opened or read: the one place an error of the
+/// folder crate becomes this crate's, so no refusal is left without its
+/// kind. `root` and `part` say where in numbers, as
+/// [`ManifestError::Refused`] has them.
+pub(crate) fn unreadable(at: &Path, (root, part): (usize, usize), e: &io::Error) -> ManifestError {
     let at = at.to_path_buf();
     match refusal(e) {
         Some(Refusal::Link) => ManifestError::Link { at },
         Some(Refusal::NotFileOrFolder) => ManifestError::NotFileOrFolder { at },
-        _ => ManifestError::Unreadable {
+        Some(why) => ManifestError::Refused { why, root, part },
+        None => ManifestError::Unreadable {
             at,
             kind: e.kind(),
             raw: e.raw_os_error(),
@@ -413,6 +421,8 @@ struct Walk<'a> {
     bytes: u64,
     /// Names read from folders above and not listed yet: they count too.
     pending: usize,
+    /// Which of the picked paths is being walked.
+    root: usize,
 }
 
 impl Walk<'_> {
@@ -445,9 +455,14 @@ impl Walk<'_> {
             return Err(ManifestError::TooMany { most });
         }
         let name = names.last().expect("a name");
-        let file = parent.inspect(name).map_err(|e| unreadable(at, &e))?;
-        let meta = file.metadata().map_err(|e| unreadable(at, &e))?;
-        let id = identity(&file).map_err(|e| unreadable(at, &e))?;
+        // The names from the held folder to this one.
+        let place = (self.root, names.len());
+        let unreadable = |e: io::Error| unreadable(at, place, &e);
+        let file = again(name)
+            .and_then(|()| parent.inspect(name))
+            .map_err(unreadable)?;
+        let meta = file.metadata().map_err(unreadable)?;
+        let id = identity(&file).map_err(unreadable)?;
         if self.kept.is_some_and(|kept| kept.contains(&id)) {
             return Err(ManifestError::KeptOut);
         }
@@ -477,7 +492,7 @@ impl Walk<'_> {
             return Ok(());
         }
         drop(file);
-        let dir = parent.directory(name).map_err(|e| unreadable(at, &e))?;
+        let dir = parent.directory(name).map_err(unreadable)?;
         // Put in another's place between the look and the open.
         if dir.identity().ok() != Some(id) {
             return Err(ManifestError::ChangedWhileListed {
@@ -502,11 +517,8 @@ impl Walk<'_> {
         });
         let room = most.saturating_sub(self.entries.len() + self.pending);
         let mut children = Vec::new();
-        for child in dir
-            .names(room.saturating_add(1))
-            .map_err(|e| unreadable(at, &e))?
-        {
-            children.push(child.map_err(|e| unreadable(at, &e))?);
+        for child in dir.names(room.saturating_add(1)).map_err(unreadable)? {
+            children.push(child.map_err(unreadable)?);
         }
         if children.len() > room {
             return Err(ManifestError::TooMany { most });
