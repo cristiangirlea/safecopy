@@ -154,6 +154,20 @@
 //!   first segment's) or the next number (a later one's). The empty file
 //!   stays until a cleanup takes it with no journal running under its
 //!   name.
+//! - **A child process started just as a journal is let go** (Unix). The
+//!   lock is the open file's, and a child a program starts holds a copy
+//!   of every open file of that program from the moment it is made until
+//!   it becomes its own program, the files marked to be closed then
+//!   among them. A journal dropped in that moment is closed here and
+//!   still locked there. [`clean_up`] and [`recover`] then read it as a
+//!   running journal's: they remove nothing and report nothing for it,
+//!   and leave it whole. That is safe, as it is for any running journal:
+//!   no partial is removed and no record is lost, and the next call
+//!   after the child has started finds the journal let go. A caller that
+//!   needs it at once, to continue its transfer, calls again. A child
+//!   that never becomes another program (a fork that goes on as the same
+//!   one) keeps its copies, and the journals with them, until it closes
+//!   them or ends. Windows gives a child no handle of a journal.
 //! - **A journals folder on a network file system** has weaker locks on
 //!   Unix: Linux turns this lock into a lock a process holds. A cleanup
 //!   in the process that runs the journal is given it too, and the

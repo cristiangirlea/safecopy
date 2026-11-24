@@ -102,6 +102,22 @@ original code behaved as below, this crate does not:
   neither hard links nor renames) removes that copy, as a cancel already
   did: nothing is left under the final name
   (`a_publish_dropped_during_a_folder_copy_fallback_leaves_no_copy`).
+- **That drop leaves no slice of the copy behind.** Each slice is copied
+  on the blocking pool, and one handed there outlived the dropped
+  publish, holding the file and the copy open: on Windows, where a name
+  goes only with its file's last handle, the copy stayed under the final
+  name until the slice had run, and the partial could not be removed
+  from its folder until then either; under a busy pool that is as long
+  as the pool takes. The copy's slices now share a gate with its claim:
+  a slice takes it, copies nothing when it is shut, and holds it while it
+  copies; dropping the publish shuts it and closes both handles before
+  the copy is removed. The drop so waits for a slice under way, 64 KiB,
+  where it never waited before: on a disk that stalls, for as long as it
+  stalls (the same test, which holds a slice on the pool, and
+  `a_slice_still_waiting_when_its_publish_is_dropped_copies_nothing`).
+  The flush of a finished copy is not behind the gate: one still on the
+  pool at a drop or a cancel ends there, and on Windows the removed copy
+  stays in the folder until it has.
 - **A publish that fails says which name it was trying.**
   `PublishError::Name { path, error }` is new: the name being tried when
   the system refused (the one asked for, or `name (2).ext` and so on once

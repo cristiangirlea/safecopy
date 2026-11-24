@@ -752,51 +752,112 @@ async fn a_clone_moved_during_a_folder_copy_fallback_changes_no_byte() {
     std::fs::remove_dir_all(to).unwrap();
 }
 
+/// Lets a held slice go when the test ends, however it ends.
+struct Release(std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>>);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().take();
+    }
+}
+
+/// Hears every step of the slices of this thread's next copy into a name,
+/// and holds each slice at `held` until the test lets go or the copy's
+/// claim is dropped.
+fn hold_slices_at(
+    held: crate::seams::Step,
+) -> (std::sync::mpsc::Receiver<crate::seams::Step>, Release) {
+    use crate::seams::Step;
+    use std::sync::{Arc, Mutex, mpsc};
+    let (heard, steps) = mpsc::channel();
+    let (release, go) = mpsc::channel::<()>();
+    let go = Mutex::new(go);
+    let release = Arc::new(Mutex::new(Some(release)));
+    let guard = Release(release.clone());
+    crate::seams::COPIES.set(Some(Arc::new(move |step| {
+        let _ = heard.send(step);
+        if step == held {
+            let _ = go.lock().unwrap().recv();
+        } else if step == Step::Closing && held == Step::Copying {
+            // Let go only once the drop is at the gate.
+            drop(release.lock().unwrap().take());
+        }
+    })));
+    (steps, guard)
+}
+
+/// A publish copying `a.txt.part` into `a.txt`, polled once: the first
+/// slice is handed to the blocking pool, and the publish waits for it.
+macro_rules! copying_into_its_name {
+    ($to:expr, $dir:ident, $file:ident, $publishing:ident) => {
+        let $dir = Directory::open($to).unwrap();
+        let $file = partial(&$dir, "a.txt.part", &vec![7; 1 << 20]);
+        NO_HARD_LINKS.set(true);
+        NO_RENAME.set(true);
+        let rules = PublishRules::default();
+        let finish = Finish::default();
+        // Never cancelled: only the drop ends it.
+        let mut $publishing = Box::pin($dir.publish_with(
+            &$file,
+            os("a.txt.part"),
+            "a.txt",
+            &rules,
+            &finish,
+            std::future::pending(),
+        ));
+        let polled =
+            std::future::poll_fn(|cx| std::task::Poll::Ready($publishing.as_mut().poll(cx))).await;
+        NO_RENAME.set(false);
+        NO_HARD_LINKS.set(false);
+        assert!(polled.is_pending(), "its first slice is still to be copied");
+    };
+}
+
+/// A slice of the copy is under way on the blocking pool, where it holds
+/// the file and the copy open, when the publish is dropped. The drop
+/// waits for it: when it returns, the copy is gone and nothing holds the
+/// partial.
 #[tokio::test]
 async fn a_publish_dropped_during_a_folder_copy_fallback_leaves_no_copy() {
-    use std::task::Poll;
+    use crate::seams::Step;
     let to = temp("folder-copy-drop");
-    let dir = Directory::open(&to).unwrap();
-    // Large enough that the copy takes many steps on the blocking pool.
-    let file = partial(&dir, "a.txt.part", &vec![7; 8 << 20]);
-    NO_HARD_LINKS.set(true);
-    NO_RENAME.set(true);
-    let rules = PublishRules::default();
-    let finish = Finish::default();
-    // Never cancelled: only the drop ends it.
-    let mut publishing = Box::pin(dir.publish_with(
-        &file,
-        os("a.txt.part"),
-        "a.txt",
-        &rules,
-        &finish,
-        std::future::pending(),
-    ));
-    // Driven by hand and dropped at the first pause after the copy has its name.
-    loop {
-        let polled = std::future::poll_fn(|cx| Poll::Ready(publishing.as_mut().poll(cx))).await;
-        assert!(
-            polled.is_pending(),
-            "the copy finished before it could be dropped"
-        );
-        if to.join("a.txt").exists() {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    let (steps, _release) = hold_slices_at(Step::Copying);
+    copying_into_its_name!(&to, dir, file, publishing);
+    assert_eq!(steps.recv().unwrap(), Step::Queued);
+    assert_eq!(steps.recv().unwrap(), Step::Copying);
+    assert_eq!(files_in(&to), ["a.txt", "a.txt.part"]);
     drop(publishing);
-    NO_RENAME.set(false);
-    NO_HARD_LINKS.set(false);
-    // A step still on the blocking pool holds the copy open; it goes when that ends.
-    for _ in 0..500 {
-        if files_in(&to) == ["a.txt.part"] {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // Read at once, with no wait for the pool: the slice had ended.
+    let heard: Vec<Step> = steps.try_iter().collect();
+    assert_eq!(heard, [Step::Closing, Step::Ended]);
+    assert_eq!(files_in(&to), ["a.txt.part"]);
+    // The partial is the caller's again: no slice holds it open.
+    dir.discard(&file, os("a.txt.part")).unwrap();
+    drop(file);
+    assert_eq!(files_in(&to), [""; 0]);
+    drop(dir);
+    std::fs::remove_dir_all(to).unwrap();
+}
+
+/// A slice that had not started when its publish was dropped copies
+/// nothing, however late it runs, and holds neither file open meanwhile.
+#[tokio::test]
+async fn a_slice_still_waiting_when_its_publish_is_dropped_copies_nothing() {
+    use crate::seams::Step;
+    let to = temp("folder-copy-drop-waiting");
+    let (steps, release) = hold_slices_at(Step::Queued);
+    copying_into_its_name!(&to, dir, file, publishing);
+    assert_eq!(steps.recv().unwrap(), Step::Queued);
+    drop(publishing);
+    assert_eq!(steps.recv().unwrap(), Step::Closing);
+    // The slice is still held on the pool, and the folder is as it was.
     assert_eq!(files_in(&to), ["a.txt.part"]);
     dir.discard(&file, os("a.txt.part")).unwrap();
     drop(file);
+    assert_eq!(files_in(&to), [""; 0]);
+    drop(release);
+    assert_eq!(steps.recv().unwrap(), Step::Ended, "it never copied");
+    assert!(steps.try_recv().is_err());
     drop(dir);
     std::fs::remove_dir_all(to).unwrap();
 }

@@ -1472,3 +1472,212 @@ async fn a_byte_past_the_end_after_a_skipped_last_entry_is_too_long() {
     assert!(matches!(report.outcomes[0], Outcome::Saved(_)));
     assert_eq!(report.outcomes[1], Outcome::Refused);
 }
+
+// A write still on the blocking pool when a read ends.
+
+/// Lets a held write go when the test ends, however it ends.
+struct Release(Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().take();
+    }
+}
+
+/// Hears every step of this thread's writes, and holds each write at
+/// `held` until the test lets go, or until its reader reaches `until`.
+fn hold_writes(
+    held: crate::seams::Step,
+    until: Option<crate::seams::Step>,
+) -> (std::sync::mpsc::Receiver<crate::seams::Step>, Release) {
+    use std::sync::mpsc;
+    let (heard, steps) = mpsc::channel();
+    let (release, go) = mpsc::channel::<()>();
+    let go = Mutex::new(go);
+    let release = Arc::new(Mutex::new(Some(release)));
+    let guard = Release(release.clone());
+    crate::seams::WRITES.set(Some(Arc::new(move |step| {
+        let _ = heard.send(step);
+        if step == held {
+            let _ = go.lock().unwrap().recv();
+        } else if Some(step) == until {
+            drop(release.lock().unwrap().take());
+        }
+    })));
+    (steps, guard)
+}
+
+/// A cut comes while the last write is still on the blocking pool, where
+/// it holds the partial file open. The read waits for it: when it
+/// returns, nothing of it is still to be written and the partial is gone.
+#[tokio::test]
+async fn a_cut_bundle_returns_with_its_last_write_done_and_no_partial_left() {
+    use crate::seams::Step;
+    let path = temp("cut-writing");
+    let dir = Directory::open(&path).unwrap();
+    let file = data(1000, 1);
+    let mut bytes = bundle(&[&file[..]]).await;
+    bytes.truncate(offsets(&[&file[..]])[0] + 500);
+    // Read from memory: the half file comes in one read, so in one write.
+    let table = BundleReader::open(&bytes[..], &BundleLimits::default())
+        .await
+        .unwrap();
+    let (steps, _release) = hold_writes(Step::Writing, Some(Step::Settling));
+    let report = table
+        .read(
+            vec![save(&dir, "a.bin")],
+            &quick(),
+            &(),
+            std::future::pending(),
+        )
+        .await;
+    // Read at once, with no wait for the pool.
+    assert_eq!(files_in(&path), [""; 0]);
+    let heard: Vec<Step> = steps.try_iter().collect();
+    assert_eq!(report.error, Some(BundleError::CutShort { entry: 0 }));
+    assert_eq!(report.outcomes, [Outcome::NotReceived]);
+    let at = |step| {
+        let found = heard.iter().position(|s| *s == step);
+        found.unwrap_or_else(|| panic!("no {step:?} in {heard:?}"))
+    };
+    // The write was held until the read waited for it, and ended first.
+    assert!(at(Step::Writing) < at(Step::Ended), "{heard:?}");
+    assert!(at(Step::Settling) < at(Step::Ended), "{heard:?}");
+    assert_eq!(heard.last(), Some(&Step::Closing), "{heard:?}");
+}
+
+/// A read of `a.bin` whose stream stays open after half the file, polled
+/// once: that half is handed to the blocking pool, and the read waits
+/// for more.
+macro_rules! half_a_file_in {
+    ($path:expr, $dir:ident, $theirs:ident, $reading:ident) => {
+        let $dir = Directory::open($path).unwrap();
+        let file = data(1000, 1);
+        let bytes = bundle(&[&file[..]]).await;
+        let (ours, mut $theirs) = tokio::io::duplex(64 << 10);
+        $theirs
+            .write_all(&bytes[..offsets(&[&file[..]])[0] + 500])
+            .await
+            .unwrap();
+        let table = BundleReader::open(ours, &BundleLimits::default())
+            .await
+            .unwrap();
+        let options = quick();
+        let mut $reading = Box::pin(table.read(
+            vec![save(&$dir, "a.bin")],
+            &options,
+            &(),
+            std::future::pending(),
+        ));
+        let polled = std::future::poll_fn(|cx| Poll::Ready($reading.as_mut().poll(cx))).await;
+        assert!(polled.is_pending(), "its stream is still open");
+    };
+}
+
+/// The same when the read is dropped instead: the drop waits for the
+/// write under way.
+#[tokio::test]
+async fn a_read_dropped_with_a_write_under_way_leaves_no_partial_behind() {
+    use crate::seams::Step;
+    let path = temp("dropped-writing");
+    let (steps, _release) = hold_writes(Step::Writing, Some(Step::Closing));
+    half_a_file_in!(&path, dir, theirs, reading);
+    assert_eq!(steps.recv().unwrap(), Step::Queued);
+    assert_eq!(steps.recv().unwrap(), Step::Writing);
+    assert_eq!(files_in(&path), ["a.bin.part"]);
+    drop(reading);
+    // Read at once, with no wait for the pool: the write had ended.
+    let heard: Vec<Step> = steps.try_iter().collect();
+    assert_eq!(heard, [Step::Closing, Step::Ended]);
+    assert_eq!(files_in(&path), [""; 0]);
+    drop(theirs);
+}
+
+/// A write that had not started when its read was dropped writes
+/// nothing, however late it runs, and holds no file open meanwhile.
+#[tokio::test]
+async fn a_write_still_waiting_when_its_read_is_dropped_writes_nothing() {
+    use crate::seams::Step;
+    let path = temp("dropped-waiting");
+    let (steps, release) = hold_writes(Step::Queued, None);
+    half_a_file_in!(&path, dir, theirs, reading);
+    assert_eq!(steps.recv().unwrap(), Step::Queued);
+    drop(reading);
+    assert_eq!(steps.recv().unwrap(), Step::Closing);
+    // The write is still held on the pool, and the partial is gone.
+    assert_eq!(files_in(&path), [""; 0]);
+    drop(release);
+    // No `Writing` came before it: the gate was shut.
+    assert_eq!(steps.recv().unwrap(), Step::Ended, "it never wrote");
+    assert!(steps.try_recv().is_err());
+    drop(theirs);
+}
+
+/// A write that fails on the blocking pool is heard of with the next
+/// write, or with the end of the file's bytes: the file is `Failed`, its
+/// partial removed, and the bundle reads on.
+#[tokio::test]
+async fn a_write_that_fails_on_the_pool_fails_only_its_file() {
+    const SLICE: usize = safecopy_chunks::SLICE;
+    // In the second slice of three, and in the last.
+    for (case, fail_at) in [SLICE as u64 + 1, 2 * SLICE as u64 + 1]
+        .into_iter()
+        .enumerate()
+    {
+        let path = temp(&format!("failed-write-{case}"));
+        let dir = Directory::open(&path).unwrap();
+        let files = [data(2 * SLICE + 5, 1), data(40, 2)];
+        let refs: Vec<&[u8]> = files.iter().map(|f| &f[..]).collect();
+        let bytes = bundle(&refs).await;
+        let table = BundleReader::open(&bytes[..], &BundleLimits::default())
+            .await
+            .unwrap();
+        crate::seams::WRITE_ERROR_AT.set(Some(fail_at));
+        let report = table
+            .read(
+                vec![save(&dir, "a"), save(&dir, "b")],
+                &quick(),
+                &(),
+                std::future::pending(),
+            )
+            .await;
+        assert_eq!(report.error, None);
+        assert_eq!(
+            report.outcomes[0],
+            Outcome::Failed(io::ErrorKind::StorageFull)
+        );
+        assert!(matches!(report.outcomes[1], Outcome::Saved(_)));
+        assert_eq!(files_in(&path), ["b"]);
+    }
+}
+
+/// The handle a hook is given shares its position with every clone of
+/// it: the writer goes by its own offsets, not by that position.
+#[tokio::test]
+async fn a_hook_that_moves_a_partial_files_position_moves_no_byte() {
+    use std::io::{Seek, SeekFrom};
+    struct Moves;
+    impl BundleHooks for Moves {
+        fn admitted(&self, partials: &[Partial<'_>]) -> io::Result<()> {
+            for partial in partials {
+                let mut file = partial.file;
+                file.seek(SeekFrom::Start(7))?;
+            }
+            Ok(())
+        }
+    }
+    let path = temp("moved-position");
+    let dir = Directory::open(&path).unwrap();
+    let files = [data(100, 1), data(3 * safecopy_chunks::SLICE + 5, 2)];
+    let refs: Vec<&[u8]> = files.iter().map(|f| &f[..]).collect();
+    let report = read_all(
+        bundle(&refs).await,
+        || vec![save(&dir, "a"), save(&dir, "b")],
+        &Moves,
+    )
+    .await;
+    assert_eq!(report.error, None);
+    assert!(std::fs::read(path.join("a")).unwrap() == files[0]);
+    assert!(std::fs::read(path.join("b")).unwrap() == files[1]);
+    assert_eq!(files_in(&path), ["a", "b"]);
+}

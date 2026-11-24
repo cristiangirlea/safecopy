@@ -5,21 +5,10 @@
 
 use super::*;
 use crate::seams::{Point, when};
-use crate::tests::partial;
+use crate::tests::{Scratch, partial};
 #[cfg(unix)]
 use std::cell::RefCell;
 use std::rc::Rc;
-
-fn temp(name: &str) -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let target = exe.ancestors().nth(3).unwrap();
-    let dir = target
-        .join("test-tmp")
-        .join(format!("jmeet-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 /// A journal that starts its next segment each time a partial ends.
 fn rolling() -> Settings {
@@ -51,29 +40,9 @@ fn cleaned(removed: usize, left: usize) -> Cleaned {
     }
 }
 
-/// A test's folders, removed with it, and no child process started while
-/// it runs: every lock a test here lets go of is then let go of in fact.
-struct Scratch {
-    base: PathBuf,
-    _no_child: std::sync::RwLockReadGuard<'static, ()>,
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.base);
-    }
-}
-
 /// The folders of a run: one to write into and one for journals.
 fn scratch(name: &str) -> (Scratch, PathBuf, PathBuf) {
-    let _no_child = crate::tests::CHILD_START
-        .read()
-        .unwrap_or_else(PoisonError::into_inner);
-    let base = temp(name);
-    let (place, journal_dir) = (base.join("Work"), base.join("journals"));
-    std::fs::create_dir_all(&place).unwrap();
-    std::fs::create_dir_all(&journal_dir).unwrap();
-    (Scratch { base, _no_child }, place, journal_dir)
+    Scratch::folders("jmeet", name)
 }
 
 /// A running journal and where it writes.

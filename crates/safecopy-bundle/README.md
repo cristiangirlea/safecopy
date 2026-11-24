@@ -71,6 +71,40 @@ of this crate.
 The table and a whole bundle read are fuzzed:
 `fuzz/fuzz_targets/bundle_table.rs`.
 
+## Changes
+
+- **A bundle that ends early leaves no write behind, and no partial
+  file.** Each slice of a file is written on the blocking pool, and
+  `Table::read` returned at a cut, a cancel or a stream error (or was
+  dropped) while its last write was still there, holding the partial
+  file open. On Windows, where a name goes only with its file's last
+  handle, the partial file that had just been removed was still in its
+  folder when the read returned, until that write had run; under a busy
+  pool that is as long as the pool takes. On every system the write
+  could still start after the read was over. Each entry's writer now
+  shares a gate with its writes: a write takes it, writes nothing when
+  it is shut, and holds it while it writes. A read that ends early waits
+  for the write under way before it removes the partial file, and a
+  dropped read shuts the gate, which waits for that write too: one slice
+  (64 KiB) at most, where neither waited before, and on a disk that
+  stalls, for as long as it stalls
+  (`a_cut_bundle_returns_with_its_last_write_done_and_no_partial_left`,
+  `a_read_dropped_with_a_write_under_way_leaves_no_partial_behind`, each
+  holding a write on the pool;
+  `a_write_still_waiting_when_its_read_is_dropped_writes_nothing`). A
+  flush to the disk is not behind the gate: one still on the pool when
+  `cancel` came or the read was dropped ends there, and holds its file
+  open until it has.
+- **Every byte is written at its own offset**, by a positioned write.
+  The writer shared its position with the handle given to
+  `BundleHooks::admitted`: a hook that read or sought the file, or kept
+  a clone of it and moved that while the file was written, moved where
+  the bytes landed, under a hash that still matched. Nothing done to the
+  handle's position does now
+  (`a_hook_that_moves_a_partial_files_position_moves_no_byte`). Where
+  that position stands when a hook is called is promised by nothing: it
+  stood after the last byte written, and now differs by system.
+
 Uses `safecopy-folder`, `safecopy-chunks` and `safecopy-resume`; quinn
 only with `quic`.
 

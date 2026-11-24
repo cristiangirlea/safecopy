@@ -9,8 +9,9 @@ use std::sync::LazyLock;
 
 use safecopy_chunks::{DIGEST_LEN, Digest, Hasher, Pace, Progress, SLICE, Saved, read_version};
 use safecopy_folder::{Directory, Finish, Meta, MetaRules, PublishError, PublishRules};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
+use crate::placed::Placed;
 use crate::writer::chunk_error;
 use crate::{BundleError, BundleLimits, GIVEN_UP, Outcome, TableEntry, WHOLE, wire};
 
@@ -245,6 +246,22 @@ impl<R: AsyncRead + Unpin> Table<R> {
     /// holds a write, and while a file is flushed and published. Dropping
     /// this future instead also removes every partial file not published,
     /// but [`BundleHooks::ended`] is not called.
+    ///
+    /// No write is left behind. Each slice is written on the blocking
+    /// pool, at its own offset in the file, behind a gate its entry's
+    /// writer shares with it. A bundle that ends early waits for the
+    /// write under way before it removes the partial file, and a dropped
+    /// read shuts the gate, which waits for that write too: one slice
+    /// ([`safecopy_chunks::SLICE`]) at most, and on a disk that stalls,
+    /// as long as it stalls. A write that had not started writes nothing.
+    /// So when this returns or is dropped, nothing of it is still being
+    /// written and no handle of a partial file is still open: on Windows,
+    /// where a file's name goes only with its last handle, a removed
+    /// partial file is gone from its folder by then. A flush
+    /// ([`ReadOptions::sync`], and the flush of a copy a publish made) is
+    /// not behind the gate: one still on the pool when `cancel` came or
+    /// the read was dropped ends there, and holds its file open until it
+    /// has.
     pub async fn read(
         mut self,
         decisions: Vec<Take<'_>>,
@@ -402,11 +419,11 @@ impl<R: AsyncRead + Unpin> Table<R> {
         cancel: &mut Pin<&mut impl Future<Output = ()>>,
     ) -> Result<(u8, Option<(Digest, Digest)>, Option<io::ErrorKind>), BundleError> {
         let index = u32::try_from(entry).expect("at most `files`");
-        let cut = BundleError::CutShort { entry: index };
+        let cut = || BundleError::CutShort { entry: index };
         let mut failed = None;
         let mut writer = match slot {
-            Slot::Open(open) => match open.file.try_clone() {
-                Ok(file) => Some(tokio::fs::File::from_std(file)),
+            Slot::Open(open) => match Placed::new(&open.file) {
+                Ok(writer) => Some(writer),
                 Err(e) => {
                     failed = Some(e.kind());
                     None
@@ -415,42 +432,48 @@ impl<R: AsyncRead + Unpin> Table<R> {
             _ => None,
         };
         let mut hasher = Hasher::new(0);
-        let mut at = 0;
-        while at < size {
-            let want = usize::try_from(size - at).map_or(SLICE, |left| left.min(SLICE));
-            let n = read_some(&mut self.reader, &mut buffer[..want], cancel).await?;
-            if n == 0 {
-                return Err(cut);
-            }
-            if let Some(file) = &mut writer {
-                tokio::select! {
-                    biased;
-                    () = cancel.as_mut() => return Err(BundleError::Cancelled),
-                    () = options.pace.before_write(n) => {}
+        let received = async {
+            let mut at = 0;
+            while at < size {
+                let want = usize::try_from(size - at).map_or(SLICE, |left| left.min(SLICE));
+                let n = read_some(&mut self.reader, &mut buffer[..want], cancel).await?;
+                if n == 0 {
+                    return Err(cut());
                 }
-                match file.write_all(&buffer[..n]).await {
-                    Ok(()) => options.progress.advanced(n as u64),
-                    Err(e) => {
-                        failed = Some(e.kind());
-                        writer = None;
+                if let Some(file) = &mut writer {
+                    tokio::select! {
+                        biased;
+                        () = cancel.as_mut() => return Err(BundleError::Cancelled),
+                        () = options.pace.before_write(n) => {}
                     }
+                    match file.write(&buffer[..n]).await {
+                        Ok(()) => options.progress.advanced(n as u64),
+                        Err(e) => {
+                            failed = Some(e.kind());
+                            writer = None;
+                        }
+                    }
+                    hasher.update(&buffer[..n]);
                 }
-                hasher.update(&buffer[..n]);
+                at += n as u64;
             }
-            at += n as u64;
+            Ok(())
         }
-        if let Some(mut file) = writer {
-            if let Err(e) = file.flush().await {
-                failed = Some(e.kind());
-            }
-            // Every write is done before the handle is used again.
-            drop(file.into_std().await);
+        .await;
+        // Every write is done and the writer's handle closed before the
+        // partial file is used again or removed, however the bytes ended:
+        // nothing of this read is written after it returns.
+        if let Some(mut file) = writer
+            && let Err(e) = file.settle().await
+        {
+            failed = Some(e.kind());
         }
+        received?;
         let mut end = [0; 1 + DIGEST_LEN];
         let mut got = 0;
         while got < end.len() {
             match read_some(&mut self.reader, &mut end[got..], cancel).await? {
-                0 => return Err(cut),
+                0 => return Err(cut()),
                 n => got += n,
             }
         }

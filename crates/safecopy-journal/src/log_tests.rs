@@ -1,34 +1,11 @@
 //! The journal's log: segments, groups and recovery after a crash.
 
 use super::*;
-use crate::tests::partial;
+use crate::tests::{Scratch, partial};
 use safecopy_manifest::{Entry as ListEntry, Kind, groups};
 
-fn temp(name: &str) -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let target = exe.ancestors().nth(3).unwrap();
-    let dir = target
-        .join("test-tmp")
-        .join(format!("jlog-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-struct Scratch(PathBuf);
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 fn scratch(name: &str) -> (Scratch, PathBuf, PathBuf) {
-    let base = temp(name);
-    let (place, journals) = (base.join("Work"), base.join("journals"));
-    std::fs::create_dir_all(&place).unwrap();
-    std::fs::create_dir_all(&journals).unwrap();
-    (Scratch(base), place, journals)
+    Scratch::folders("jlog", name)
 }
 
 fn journals(dir: &Path) -> usize {
@@ -1023,12 +1000,23 @@ fn a_folder_numbered_after_its_child_is_refused() {
 }
 
 /// Starts and ends the partial of `place` as `NN.txt.part` in `dir`, its
-/// file removed after: a stream cut and come again.
-fn churn(dir: &Path, root: &Directory, journal: &Journal, place: u32) {
+/// file removed after: a stream cut and come again. Gives the ID the
+/// journal recorded for the file.
+fn churn(dir: &Path, root: &Directory, journal: &Journal, place: u32) -> u128 {
     let name = format!("{place:02}.txt.part");
     drop(partial(root, journal, place, &name, b"data"));
+    let live = journal.partials();
+    let id = live.iter().find(|s| s.place == place).unwrap().file;
     journal.ended(place).unwrap();
     std::fs::remove_file(dir.join(&name)).unwrap();
+    id
+}
+
+/// How many bytes the log writes `n` in.
+fn written_in(n: u128) -> u64 {
+    let mut bytes = Vec::new();
+    crate::record::varint(&mut bytes, n);
+    bytes.len() as u64
 }
 
 #[test]
@@ -1051,20 +1039,28 @@ fn a_journal_without_groups_starts_its_next_segment_after_roll_every_ends() {
             .unwrap()
             .seq()
     };
-    let mut first_cycle = 0;
-    let mut longest = 0;
+    let len = |journal: &Journal| std::fs::metadata(journal.segment_path()).unwrap().len();
+    // A segment with nothing live, as every new one here is.
+    let fresh = len(&journal);
+    let mut before = fresh;
+    let mut each = None;
     for p in 0..40 {
-        churn(&place, &root, &journal, p);
-        let len = std::fs::metadata(journal.segment_path()).unwrap().len();
-        if p < 4 {
-            first_cycle = first_cycle.max(len);
-        }
-        longest = longest.max(len);
+        let id = churn(&place, &root, &journal, p);
         // A new segment after every fourth end, and only then.
         assert_eq!(seq(&journal), 1 + u64::from(p + 1) / 4, "after {p}");
         assert_eq!(segments(&journal_dir).len(), 1, "the old one deleted");
+        let now = len(&journal);
+        if (p + 1) % 4 == 0 {
+            // Nothing of the partials that came and went is carried over.
+            assert_eq!(now, fresh, "after {p}");
+        } else {
+            // A start and an end take the same bytes every time, but for
+            // the file's ID: the disk hands out longer and shorter ones.
+            let rest = now - before - written_in(id);
+            assert_eq!(*each.get_or_insert(rest), rest, "after {p}");
+        }
+        before = now;
     }
-    assert!(longest <= first_cycle, "{longest} past {first_cycle}");
     // Each new segment's name was synced before the old one went.
     assert_eq!(seams::DIR_SYNCS.get(), 1 + 10);
     drop(journal);
