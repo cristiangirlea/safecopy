@@ -255,8 +255,9 @@ pub enum ResumeError {
     NotHeld,
     /// The partial file is shorter than its `have`.
     WrongSize,
-    /// The partial file or its folder is not there any more, or another
-    /// file has its name.
+    /// The partial file or its folder is not there any more, another
+    /// file has its name, or the record names a file that is no partial
+    /// (never opened).
     Gone,
     /// The partial file's disk or folder cannot be read now: a disk away,
     /// a place the system would not show. Nothing is removed for it.
@@ -284,6 +285,9 @@ pub enum ResumeError {
     },
     /// The system's random source failed.
     Random,
+    /// A receiving record's file is not named as a partial under the
+    /// store's journal settings: the record is not written.
+    NotPartial,
     /// The journal crate refused.
     Journal(safecopy_journal::JournalError),
     /// The system's error.

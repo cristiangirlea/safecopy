@@ -375,7 +375,11 @@ fn a_partial_is_found_present_without_being_opened_for_its_bytes() {
     let file = root.create(OsStr::new("a.bin.part")).unwrap();
     file.set_len(4096).unwrap();
     let at = PartialAt::of(&root, &root, &file, OsStr::new("a.bin.part")).unwrap();
-    assert_eq!(at.present(), Some(4096), "while a save has it open");
+    assert_eq!(
+        at.present(&settings()),
+        Some(4096),
+        "while a save has it open"
+    );
     // The handle shuts nothing out: the save's next opens still work.
     #[cfg(windows)]
     {
@@ -388,39 +392,43 @@ fn a_partial_is_found_present_without_being_opened_for_its_bytes() {
             .share_mode(0)
             .open(place.join("a.bin.part"))
             .unwrap();
-        assert_eq!(at.present(), Some(4096), "attributes need no sharing");
-        assert_eq!(at.try_reopen().err(), Some(Left::Busy));
-        assert!(at.reopen().is_none());
+        assert_eq!(
+            at.present(&settings()),
+            Some(4096),
+            "attributes need no sharing"
+        );
+        assert_eq!(at.try_reopen(&settings()).err(), Some(Left::Busy));
+        assert!(at.reopen(&settings()).is_none());
         drop(alone);
     }
     #[cfg(not(windows))]
     drop(file);
-    let (_, again) = at.try_reopen().unwrap();
+    let (_, again) = at.try_reopen(&settings()).unwrap();
     again.set_len(10).unwrap();
     drop(again);
-    assert_eq!(at.present(), Some(10));
+    assert_eq!(at.present(&settings()), Some(10));
     // Another file under the name is not it, whatever its length.
     std::fs::rename(place.join("a.bin.part"), place.join("moved")).unwrap();
     std::fs::write(place.join("a.bin.part"), [0; 4096]).unwrap();
-    assert_eq!(at.present(), None, "replaced");
-    assert_eq!(at.try_reopen().err(), Some(Left::Replaced));
+    assert_eq!(at.present(&settings()), None, "replaced");
+    assert_eq!(at.try_reopen(&settings()).err(), Some(Left::Replaced));
     // Nor is a folder, a link or nothing at all.
     std::fs::remove_file(place.join("a.bin.part")).unwrap();
-    assert_eq!(at.present(), None, "gone");
-    assert_eq!(at.try_reopen().err(), Some(Left::Gone));
+    assert_eq!(at.present(&settings()), None, "gone");
+    assert_eq!(at.try_reopen(&settings()).err(), Some(Left::Gone));
     std::fs::create_dir(place.join("a.bin.part")).unwrap();
-    assert_eq!(at.present(), None, "a folder");
+    assert_eq!(at.present(&settings()), None, "a folder");
     std::fs::remove_dir(place.join("a.bin.part")).unwrap();
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(place.join("moved"), place.join("a.bin.part")).unwrap();
-        assert_eq!(at.present(), None, "a link to the very file");
+        assert_eq!(at.present(&settings()), None, "a link to the very file");
     }
     #[cfg(windows)]
     {
         // A junction to the folder the very file is in.
         junction(&place, &place.join("a.bin.part"));
-        assert_eq!(at.present(), None, "a junction");
+        assert_eq!(at.present(&settings()), None, "a junction");
         assert_eq!(
             std::fs::read(place.join("a.bin.part").join("moved"))
                 .unwrap()
@@ -431,7 +439,7 @@ fn a_partial_is_found_present_without_being_opened_for_its_bytes() {
         // A file symbolic link needs Developer Mode or an administrator.
         let (moved, link) = (place.join("moved"), place.join("a.bin.part"));
         if std::os::windows::fs::symlink_file(moved, link).is_ok() {
-            assert_eq!(at.present(), None, "a link to the very file");
+            assert_eq!(at.present(&settings()), None, "a link to the very file");
         } else {
             assert!(
                 !symlinks_required(),
@@ -2003,4 +2011,71 @@ mod windows {
         assert!(journal.partials().is_empty());
         root.discard(&file, OsStr::new("a.part")).unwrap();
     }
+}
+
+/// A record read from a disk may name any file of the person's: only a
+/// name that is a partial's is opened, measured or removed.
+#[test]
+fn a_recorded_name_that_is_not_a_partials_is_never_opened() {
+    let (_scratch, place, _) = scratch("not-partial");
+    let root = Directory::destination(&place).unwrap();
+    let bytes = [7u8; 64];
+    // The place of the file at `path`, recorded under `name`.
+    let recorded = |name: &str, path: &Path| {
+        let file = std::fs::File::open(path).unwrap();
+        PartialAt::of(&root, &root, &file, OsStr::new(name)).unwrap()
+    };
+    let plain = place.join("report.docx");
+    std::fs::write(&plain, bytes).unwrap();
+    let alone = place.join(".part");
+    std::fs::write(&alone, bytes).unwrap();
+    std::fs::create_dir(place.join("sub")).unwrap();
+    let below = place.join("sub").join("a.part");
+    std::fs::write(&below, bytes).unwrap();
+    // Windows reads it as a stream of the file; elsewhere it is a name.
+    let stream = if cfg!(windows) {
+        plain.clone()
+    } else {
+        let stream = place.join("report.docx:x.part");
+        std::fs::write(&stream, bytes).unwrap();
+        stream
+    };
+    let refused = [
+        recorded("report.docx", &plain),
+        recorded(".part", &alone),
+        recorded("report.docx:x.part", &stream),
+        recorded("sub/a.part", &below),
+        recorded(r"sub\a.part", &below),
+    ];
+    let s = settings();
+    for at in &refused {
+        assert!(!at.is_partial(&s), "{}", at.partial);
+        assert_eq!(at.try_reopen(&s).err(), Some(Left::Name), "{}", at.partial);
+        assert!(at.reopen(&s).is_none(), "{}", at.partial);
+        assert_eq!(at.present(&s), None, "{}", at.partial);
+        assert!(!at.remove(&s), "{}", at.partial);
+    }
+    for path in [&plain, &alone, &below, &stream] {
+        assert_eq!(std::fs::read(path).unwrap(), bytes, "as it was");
+    }
+
+    // The ending is a setting: each one's partials are the other's files.
+    let other = Settings {
+        partial_ending: ".tmp".to_string(),
+        ..settings()
+    };
+    let (part, tmp) = (place.join("a.bin.part"), place.join("a.bin.tmp"));
+    std::fs::write(&part, bytes).unwrap();
+    std::fs::write(&tmp, bytes).unwrap();
+    let (part, tmp) = (recorded("a.bin.part", &part), recorded("a.bin.tmp", &tmp));
+    assert!(part.is_partial(&s) && !part.is_partial(&other));
+    assert!(tmp.is_partial(&other) && !tmp.is_partial(&s));
+    assert_eq!(part.try_reopen(&other).err(), Some(Left::Name));
+    assert_eq!(part.present(&other), None);
+    assert_eq!(tmp.try_reopen(&s).err(), Some(Left::Name));
+    assert_eq!(tmp.present(&s), None);
+    assert_eq!(part.present(&s), Some(64));
+    assert_eq!(tmp.present(&other), Some(64));
+    assert!(part.try_reopen(&s).is_ok());
+    assert!(tmp.try_reopen(&other).is_ok());
 }

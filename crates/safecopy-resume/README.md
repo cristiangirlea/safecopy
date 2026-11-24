@@ -102,7 +102,7 @@ store's index. Only what both sides must agree on is fixed: the chunk
 
 Errors are `ResumeError` kinds (`PastSize`, `OffChunk`, `NotHeld`,
 `WrongSize`, `Gone`, `Unreachable`, `PrefixChanged`, `Busy`, `Damaged`,
-`TooMany`, ...);
+`TooMany`, `NotPartial`, ...);
 each program words them, and maps each `Verdict` to its own codes.
 
 ## How to resume a file
@@ -148,6 +148,14 @@ The hooks of the two saves differ:
 A continued save has its record already: `Store::receiving` in its
 `whole` would write the record anew, with the first save's `created`
 time lost. A save that starts new after a restart is a first save.
+
+The record's `at` is `PartialAt::of(&root, &dir, file, partial)` with
+the `file` and the `partial` name the `created` hook was given. The
+store keeps a record only for a file named as a partial: a name that
+ends in its journal settings' `partial_ending` (`.part`, which is what
+`save_resumable` names its partials; a program with another ending
+passes it with `Store::with_journal_settings`). For any other name
+`Store::receiving` is `ResumeError::NotPartial` and writes nothing.
 
 The sender keeps `Store::sending` for the file from its first stream.
 
@@ -272,6 +280,21 @@ for a record whose **first** write was torn by a crash: its file reads
 as nothing, and blocks its key until the next `expire`. Run `expire` at
 every start.
 
+**A record that names a file that is no partial.** A record says where
+its partial is by folder, name and file ID, and a file that reads as a
+record can be put into the store's folder by another program of the same
+person, naming any file of theirs. The store acts on a record's file
+only under a partial's name, by its journal settings
+(`PartialAt::is_partial`: the ending, more than the ending alone, no
+separator, no `name:stream`): any other is never opened, so never cut
+or handed out to be written. `kept_by` does not list it; `reopen`,
+`reopen_hashed`, `held_from` and `held_hashed` take it for
+`ResumeError::Gone` and remove the record alone; `receiving` and `keep`
+are `ResumeError::NotPartial` and write nothing. `expire`, `forget` and
+`remove_all` remove such a record's own file and leave the file it
+names, as a journal's cleanup does. Two stores on one folder must so be
+given the same ending: each takes the other's records for these.
+
 **A partial open elsewhere.** On Windows a partial file being written is
 open without delete sharing, which shuts out the reopening a check or a
 continuation needs; Unix has no such thing. `kept_by` asks for the
@@ -310,6 +333,22 @@ The handshake and the checks are fuzzed: `fuzz/fuzz_targets/resume_handshake.rs`
 
 ## Changes
 
+- **The store acts only on a record whose file is named as a partial.**
+  `reopen` and `reopen_hashed` opened the file a record named, whatever
+  its name, and cut it to the record's `have`: a record file put into
+  the store's folder, reading as the right peer and key and naming some
+  other file of the person's, had that file cut and handed out to be
+  written. The store now opens a record's file only under a partial's
+  name, by its journal settings: such a record is `ResumeError::Gone`
+  at a reopening or a check and goes, alone; `kept_by` does not list
+  it; `expire`, `forget` and `remove_all` remove the record and leave
+  the file (`a_forged_record_naming_another_file_cuts_and_opens_nothing`,
+  `a_forged_record_naming_a_stream_a_path_or_the_ending_alone_opens_nothing`).
+  `receiving` and `keep` write no such record: new kind
+  **`ResumeError::NotPartial`**
+  (`a_record_of_a_file_not_named_as_a_partial_is_not_written`). The
+  ending is `Store::with_journal_settings`' `partial_ending`
+  (`a_store_keeps_partials_of_its_own_ending_only`).
 - **The store writes only records it can tell are its own.** A record
   file's name can be worked out from its peer and key; a file found under
   it was held and written at its first slot, then cut to a record's

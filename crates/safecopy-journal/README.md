@@ -206,13 +206,26 @@ After a crash, cleanup:
 
 ## Changes
 
-- **`PartialAt::present()`** gives a kept partial's length when it is
+- **Only a name that is a partial's is opened.** `PartialAt::reopen`,
+  `try_reopen` and `present` opened whatever name was recorded, where
+  `remove` checked it first: a record read from a disk can name any file
+  of the person's, and a caller that cut or wrote what `reopen` gave it
+  did so to that file. All three now take the `Settings`, as `remove`
+  does, and open nothing for a name that does not end in
+  `Settings::partial_ending`, is the ending alone, has a separator or
+  would open a stream of a file (`name:stream`): `try_reopen` is
+  `Left::Name`, the other two `None`. They take the settings, and are
+  not left to a check the caller makes first, so that no caller can
+  leave it out. New: **`PartialAt::is_partial(&settings)`**, the same
+  rule for a caller that opens nothing
+  (`a_recorded_name_that_is_not_a_partials_is_never_opened`).
+- **`PartialAt::present(&settings)`** gives a kept partial's length when it is
   still the recorded file under its name: no byte read, and no conflict
   with a transfer writing the file. Windows opens it for its attributes
   alone, Linux and Android as a path only; macOS, which has neither,
   opens it for reading without waiting and reads nothing
   (`a_partial_is_found_present_without_being_opened_for_its_bytes`).
-  **`PartialAt::try_reopen()`** is `reopen` with why it failed, and
+  **`PartialAt::try_reopen(&settings)`** is `reopen` with why it failed, and
   `Left` has one more kind, `Busy`: the file is there and open elsewhere
   (Windows), which `reopen` gave as `None`, the same as gone.
 - **Cleanup keeps a journal while a partial it lists is kept.**
@@ -237,7 +250,7 @@ After a crash, cleanup:
   removed in the moment it was opened, with no name left, is `NotFound`
   as before.
 - **Tested:** a junction and a file symbolic link under a partial's name
-  are not `present()` on Windows
+  are not `present` on Windows
   (`a_partial_is_found_present_without_being_opened_for_its_bytes`).
 - **`files::hold(path)`** holds a record file that is already there as
   `files::create` holds a new one, and **`files::busy(&error)`** says
@@ -339,7 +352,8 @@ it was ported from):
   and a longer segment is read only that far
   (`a_segment_longer_than_the_limit_is_read_only_that_far`).
 - `clean_up_keeping` leaves the partials the caller keeps; `PartialAt`
-  names where one is, removes it by identity and reopens it, and
+  names where one is, removes it by identity and reopens it (only under
+  a partial's name, by the settings each call takes), and
   `Location::open` finds a recorded folder again or says why not (`Left`).
 - Streams that start partials at once in new folders each get their own
   folder entry (`partials_started_at_once_in_new_folders_are_all_recorded`).

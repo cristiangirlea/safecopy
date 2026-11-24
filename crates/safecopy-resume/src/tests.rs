@@ -2889,3 +2889,262 @@ async fn a_link_under_a_records_name_is_not_written_through() {
     assert!(std::fs::symlink_metadata(&name).is_ok(), "left as it is");
     assert_eq!(std::fs::read(&other).unwrap(), b"theirs");
 }
+
+/// An ordinary file of the person's in the root, opened as a save would
+/// hold a partial.
+fn ordinary(side: &Side, name: &str, bytes: &[u8]) -> File {
+    let path = side.place.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap()
+}
+
+/// A record file someone else put into the store's folder: it reads as
+/// `PEER`'s record of `key`, as a store writes one first, and says the
+/// file `file`, recorded under `name`, is a partial holding one whole
+/// chunk of `bytes`. Its path.
+fn forged(side: &Side, key: TransferKey, file: &File, name: &str, bytes: &[u8]) -> PathBuf {
+    let record = Receiving {
+        peer: PEER,
+        key,
+        same: Vec::new(),
+        size: bytes.len() as u64,
+        at: PartialAt::of(&side.root, &side.root, file, OsStr::new(name)).unwrap(),
+        have: C,
+        prefix: hash(&bytes[..C as usize]),
+        created: 5,
+        last: 5,
+    };
+    let payload = crate::record::Record::Receiving(record).encode();
+    let mut written = crate::record::slot(1, &payload).unwrap();
+    written.resize(2 * crate::record::SLOT + 1, 0);
+    let path = side
+        .base
+        .join("records")
+        .join(crate::store::file_name(true, PEER, key));
+    std::fs::write(&path, written).unwrap();
+    path
+}
+
+/// A record names its partial by folder, name and file ID, and a record
+/// file can be put into the store's folder by anyone: one naming another
+/// file of the person's makes the store open, cut and remove nothing.
+#[tokio::test]
+async fn a_forged_record_naming_another_file_cuts_and_opens_nothing() {
+    let side = side("forged", Limits::default());
+    let store = &side.store;
+    let bytes = data(2 * C);
+    let thesis = side.place.join("thesis.docx");
+    let file = ordinary(&side, "thesis.docx", &bytes);
+    let forge = || forged(&side, key(211), &file, "thesis.docx", &bytes);
+    let untouched = || {
+        assert!(
+            std::fs::read(&thesis).unwrap() == bytes,
+            "not a byte of it, nor its length"
+        );
+    };
+    let gone = Some(ResumeError::Gone);
+
+    let record = forge();
+    assert_eq!(
+        store.received(PEER, key(211)).unwrap().have,
+        C,
+        "it reads as the peer's record"
+    );
+    assert!(store.kept_by(PEER).unwrap().is_empty(), "not listed");
+    assert!(record.exists());
+    assert_eq!(store.reopen(PEER, key(211)).err(), gone);
+    untouched();
+    assert!(!record.exists(), "the record goes, and nothing else");
+
+    // The prefix it claims is the file's own: the hash would match.
+    forge();
+    assert_eq!(store.reopen_hashed(PEER, key(211)).await.err(), gone);
+    untouched();
+    assert!(!record.exists());
+
+    forge();
+    assert!(store.held_hashed(PEER).await.unwrap().is_empty());
+    untouched();
+    forge();
+    assert!(store.held_from(PEER).await.unwrap().is_empty());
+    untouched();
+
+    // Listed by nothing, it waits for an expiry: its name goes then, and
+    // the file it names stays.
+    forge();
+    assert!(store.kept_by(PEER).unwrap().is_empty());
+    assert!(record.exists());
+    let hour = Duration::from_secs(3600);
+    assert_eq!(store.expire(6, hour, &[]).unwrap().removed, 0);
+    assert_eq!(store.expire(5 + 7200, hour, &[]).unwrap().removed, 1);
+    assert!(!record.exists());
+    untouched();
+
+    // So do a forget and a removal of everything.
+    forge();
+    store.forget(PEER, key(211)).unwrap();
+    assert!(!record.exists());
+    untouched();
+    forge();
+    assert_eq!(store.remove_all(Some(PEER)).unwrap(), 1);
+    assert!(!record.exists());
+    untouched();
+}
+
+/// A name that would open a stream of a file, one with a separator, and
+/// the ending alone are no partial's either: refused before any open.
+#[tokio::test]
+async fn a_forged_record_naming_a_stream_a_path_or_the_ending_alone_opens_nothing() {
+    let side = side("forged-names", Limits::default());
+    let store = &side.store;
+    let bytes = data(2 * C);
+    std::fs::create_dir(side.place.join("sub")).unwrap();
+    let below = std::path::Path::new("sub").join("f.part");
+    let files = [
+        ("thesis.docx", "thesis.docx:x.part"),
+        (below.to_str().unwrap(), "sub/f.part"),
+        (below.to_str().unwrap(), r"sub\f.part"),
+        (".part", ".part"),
+    ];
+    for (at, name) in files {
+        let file = ordinary(&side, at, &bytes);
+        let record = forged(&side, key(212), &file, name, &bytes);
+        assert!(store.received(PEER, key(212)).is_some(), "{name}");
+        assert!(store.kept_by(PEER).unwrap().is_empty(), "{name}");
+        // `Gone`, and not what the folder's own refusal of the name gives.
+        assert_eq!(
+            store.reopen(PEER, key(212)).err(),
+            Some(ResumeError::Gone),
+            "{name}"
+        );
+        assert!(!record.exists(), "{name}");
+        forged(&side, key(212), &file, name, &bytes);
+        assert_eq!(
+            store.reopen_hashed(PEER, key(212)).await.err(),
+            Some(ResumeError::Gone),
+            "{name}"
+        );
+        assert!(
+            std::fs::read(side.place.join(at)).unwrap() == bytes,
+            "{name}"
+        );
+    }
+}
+
+/// A record is written only for a file named as a partial: no caller's
+/// place, and no record found in the folder, makes the store keep one
+/// that names another file.
+#[tokio::test]
+async fn a_record_of_a_file_not_named_as_a_partial_is_not_written() {
+    let side = side("not-partial", Limits::default());
+    let store = &side.store;
+    let records = side.base.join("records");
+    let bytes = data(2 * C);
+    let file = ordinary(&side, "thesis.docx", &bytes);
+    let refused = Err(ResumeError::NotPartial);
+    let mut record = Receiving {
+        peer: PEER,
+        key: key(213),
+        same: Vec::new(),
+        size: 2 * C,
+        at: PartialAt::of(&side.root, &side.root, &file, OsStr::new("thesis.docx")).unwrap(),
+        have: C,
+        prefix: hash(&bytes[..C as usize]),
+        created: 5,
+        last: 5,
+    };
+    let names = [
+        "thesis.docx",
+        "thesis.docx:x.part",
+        "sub/f.part",
+        r"sub\f.part",
+        ".part",
+    ];
+    for name in names {
+        record.at.partial = name.to_string();
+        assert_eq!(store.receiving(&record, &file), refused, "{name}");
+        assert!(files_in(&records).is_empty(), "{name}: no record");
+    }
+    assert!(store.received(PEER, key(213)).is_none());
+
+    // One found there is not rewritten for the save that asks.
+    let path = forged(&side, key(213), &file, "thesis.docx", &bytes);
+    let was = std::fs::read(&path).unwrap();
+    let held = Held {
+        key: key(213),
+        have: 2 * C,
+        prefix: hash(&bytes),
+    };
+    assert_eq!(
+        store.keep(PEER, &held, 9, &file, true),
+        Err(ResumeError::NotPartial)
+    );
+    let guard = store.saving(PEER, key(213)).unwrap();
+    assert_eq!(guard.kept(&held, 9, &file), Err(ResumeError::NotPartial));
+    assert!(std::fs::read(&path).unwrap() == was, "not a byte of it");
+    assert_eq!(store.received(PEER, key(213)).unwrap().have, C);
+}
+
+/// The ending of a partial's name is the journal settings': a store
+/// given another one keeps files of that ending, and no `.part`.
+#[tokio::test]
+async fn a_store_keeps_partials_of_its_own_ending_only() {
+    let side = side("other-ending", Limits::default());
+    let settings = safecopy_journal::Settings {
+        partial_ending: ".tmp".to_string(),
+        ..Default::default()
+    };
+    let store = Store::open(&side.base.join("other"), Limits::default())
+        .unwrap()
+        .with_journal_settings(settings);
+    let bytes = data(2 * C);
+    let record = |key: TransferKey, name: &str| {
+        let file = ordinary(&side, name, &bytes);
+        let record = Receiving {
+            peer: PEER,
+            key,
+            same: Vec::new(),
+            size: 2 * C,
+            at: PartialAt::of(&side.root, &side.root, &file, OsStr::new(name)).unwrap(),
+            have: C,
+            prefix: hash(&bytes[..C as usize]),
+            created: 5,
+            last: 5,
+        };
+        (record, file)
+    };
+    let (theirs, file) = record(key(214), "f.bin.part");
+    assert_eq!(
+        store.receiving(&theirs, &file),
+        Err(ResumeError::NotPartial)
+    );
+    drop(file);
+    assert!(files_in(&side.base.join("other")).is_empty());
+    let (own, file) = record(key(215), "f.bin.tmp");
+    store.receiving(&own, &file).unwrap();
+    drop(file);
+    assert_eq!(keys(&store.kept_by(PEER).unwrap()), [key(215)]);
+    assert!(store.release(PEER, key(215)));
+    let (_, kept) = store.reopen_hashed(PEER, key(215)).await.unwrap();
+    assert_eq!(kept.have(), C);
+    drop(kept);
+    assert_eq!(
+        std::fs::metadata(side.place.join("f.bin.tmp"))
+            .unwrap()
+            .len(),
+        C,
+        "its own partial, cut to what it has"
+    );
+    // The default store takes `.part`, and not the other's ending.
+    side.store
+        .receiving(&theirs, &ordinary(&side, "g.bin", b""))
+        .unwrap();
+    assert_eq!(
+        side.store.receiving(&own, &ordinary(&side, "h.bin", b"")),
+        Err(ResumeError::NotPartial)
+    );
+}

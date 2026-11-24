@@ -174,8 +174,10 @@ impl Store {
         Ok(store)
     }
 
-    /// The journal's settings the store removes partial files by: which
-    /// ending a partial's name has.
+    /// The journal's settings the store knows a partial file by: which
+    /// ending its name has. A record naming a file without it is never
+    /// written, and one found is never listed, reopened, cut or removed
+    /// through ([`PartialAt::is_partial`]).
     pub fn with_journal_settings(mut self, settings: safecopy_journal::Settings) -> Self {
         self.journal = settings;
         self
@@ -270,9 +272,18 @@ impl Store {
     /// Writes `record`: into a new file, or over the older slot of the
     /// file holding its key, then flushed to the disk. A file another
     /// store holds is not written, nor one that does not show it is this
-    /// record's: [`ResumeError::Busy`].
+    /// record's: [`ResumeError::Busy`]. A receiving record whose file is
+    /// not named as a partial is not written:
+    /// [`ResumeError::NotPartial`].
     fn write(&self, record: &Record) -> Result<(), ResumeError> {
         let receiving = matches!(record, Record::Receiving(_));
+        // Here, where every record passes: none is kept that would name
+        // a file the store never opens, cuts or removes.
+        if let Record::Receiving(r) = record
+            && !r.at.is_partial(&self.journal)
+        {
+            return Err(ResumeError::NotPartial);
+        }
         let existing = self.find(record.peer(), record.key(), receiving);
         let payload = record.encode();
         // Before a file is made for it.
@@ -591,12 +602,21 @@ impl Store {
     /// `record.have` at least one chunk and a whole number of them, within
     /// the size. `partial` is flushed to the disk first, so `have` never
     /// claims a byte that is not there.
+    ///
+    /// `record.at` must name a partial as the store's journal settings
+    /// have it ([`PartialAt::is_partial`],
+    /// [`Self::with_journal_settings`]): any other name is
+    /// [`ResumeError::NotPartial`], before anything is flushed or
+    /// written.
     pub fn receiving(&self, record: &Receiving, partial: &File) -> Result<(), ResumeError> {
         if record.have > record.size {
             return Err(ResumeError::PastSize);
         }
         if record.have < CHUNK || !on_chunk(record.have) {
             return Err(ResumeError::OffChunk);
+        }
+        if !record.at.is_partial(&self.journal) {
+            return Err(ResumeError::NotPartial);
         }
         if record.same.len() > self.limits.same_bytes {
             return Err(ResumeError::TooLarge {
@@ -612,7 +632,10 @@ impl Store {
     /// record is rewritten, after `partial` is flushed, once at least
     /// [`Limits::rewrite_bytes`] more are whole and
     /// [`Limits::rewrite_every`] has passed, or at once with `at_drop`.
-    /// Whether it was written.
+    /// Whether it was written. A record found there whose file is not
+    /// named as a partial ([`PartialAt::is_partial`]) is not this store's
+    /// to rewrite: [`ResumeError::NotPartial`], with nothing flushed or
+    /// written.
     ///
     /// When it writes, it flushes `partial` and the record to the disk,
     /// and holds its thread for that long: in a save's `whole` hook on a
@@ -627,6 +650,9 @@ impl Store {
     ) -> Result<bool, ResumeError> {
         let (key, have, prefix) = (held.key, held.have, held.prefix);
         let mut record = self.received(peer, key).ok_or(ResumeError::NotHeld)?;
+        if !record.at.is_partial(&self.journal) {
+            return Err(ResumeError::NotPartial);
+        }
         if have > record.size {
             return Err(ResumeError::PastSize);
         }
@@ -655,7 +681,9 @@ impl Store {
     /// listings alone: each receiving record of `peer` whose partial file
     /// is still the recorded one under its name
     /// ([`PartialAt::present`]) and at least `have` bytes long. Oldest
-    /// first, at most [`Limits::per_peer`].
+    /// first, at most [`Limits::per_peer`]. A record whose file is not
+    /// named as a partial ([`PartialAt::is_partial`]) is not listed, and
+    /// nothing is opened for it.
     ///
     /// No byte of a partial is read and no record file whose listing is
     /// unchanged is opened, so the other side cannot make this side read
@@ -674,7 +702,12 @@ impl Store {
             let Record::Receiving(record) = found.record else {
                 continue;
             };
-            if record.peer != peer || record.at.present().is_none_or(|len| len < record.have) {
+            if record.peer != peer
+                || record
+                    .at
+                    .present(&self.journal)
+                    .is_none_or(|len| len < record.have)
+            {
                 continue;
             }
             let held = Held {
@@ -733,7 +766,7 @@ impl Store {
             if record.peer != peer || lock(&self.state).held.contains_key(&found.name) {
                 continue;
             }
-            match hash_partial(record, &self.chunks).await {
+            match hash_partial(record, &self.journal, &self.chunks).await {
                 Ok((_, _, hasher)) => {
                     let held = Held {
                         key: record.key,
@@ -772,13 +805,20 @@ impl Store {
     /// that is gone, replaced or shorter than `have`
     /// ([`ResumeError::Gone`], [`ResumeError::WrongSize`]), and let go as
     /// it is otherwise.
+    ///
+    /// Only a file named as a partial is opened and cut, as the store's
+    /// journal settings have it ([`PartialAt::is_partial`]): a record
+    /// naming any other file is [`ResumeError::Gone`] with nothing
+    /// opened, and goes; the file it names is not touched.
     pub fn reopen(&self, peer: PeerId, key: TransferKey) -> Result<(Directory, File), ResumeError> {
         let found = self.take_received(peer, key)?;
         let opened = match &found.record {
-            Record::Receiving(record) => open_partial(record).and_then(|(dir, file)| {
-                file.set_len(record.have)?;
-                Ok((dir, file))
-            }),
+            Record::Receiving(record) => {
+                open_partial(record, &self.journal).and_then(|(dir, file)| {
+                    file.set_len(record.have)?;
+                    Ok((dir, file))
+                })
+            }
             Record::Sending(_) => Err(ResumeError::NotHeld),
         };
         self.settle(&found, opened)
@@ -811,7 +851,7 @@ impl Store {
             name: &found.name,
             under_way: true,
         };
-        let hashed = match hash_partial(record, &self.chunks).await {
+        let hashed = match hash_partial(record, &self.journal, &self.chunks).await {
             Ok((dir, file, hasher)) => match file.set_len(record.have) {
                 Ok(()) => Ok((dir, file, hasher)),
                 Err(e) => Err(e.into()),
@@ -1259,13 +1299,18 @@ fn lost(error: &ResumeError) -> bool {
 }
 
 /// A kept partial opened by identity, with its folder:
-/// [`ResumeError::Gone`] when it is not there or another file has its
-/// name, [`ResumeError::Busy`] when it is open elsewhere,
+/// [`ResumeError::Gone`] when it is not there, another file has its
+/// name, or the record names a file that is no partial under `journal`
+/// (nothing is opened for that one: the caller cuts what this opens),
+/// [`ResumeError::Busy`] when it is open elsewhere,
 /// [`ResumeError::Unreachable`] when its disk or folder cannot be read
 /// now, [`ResumeError::WrongSize`] when it is shorter than `have`.
-fn open_partial(record: &Receiving) -> Result<(Directory, File), ResumeError> {
-    let (dir, file) = record.at.try_reopen().map_err(|left| match left {
-        Left::Gone | Left::Replaced => ResumeError::Gone,
+fn open_partial(
+    record: &Receiving,
+    journal: &safecopy_journal::Settings,
+) -> Result<(Directory, File), ResumeError> {
+    let (dir, file) = record.at.try_reopen(journal).map_err(|left| match left {
+        Left::Gone | Left::Replaced | Left::Name => ResumeError::Gone,
         Left::Busy => ResumeError::Busy,
         _ => ResumeError::Unreachable,
     })?;
@@ -1279,9 +1324,10 @@ fn open_partial(record: &Receiving) -> Result<(Directory, File), ResumeError> {
 /// once: [`ResumeError::PrefixChanged`] when they do not hash to `prefix`.
 async fn hash_partial(
     record: &Receiving,
+    journal: &safecopy_journal::Settings,
     settings: &safecopy_chunks::Settings,
 ) -> Result<(Directory, File, Hasher), ResumeError> {
-    let (dir, file) = open_partial(record)?;
+    let (dir, file) = open_partial(record, journal)?;
     #[cfg(test)]
     crate::tests::seams::stall().await;
     #[cfg(test)]
