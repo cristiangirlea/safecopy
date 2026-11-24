@@ -330,8 +330,10 @@ pub async fn save_verified<R: AsyncRead + Unpin + ?Sized>(
 /// one land over its own. The drop waits for a write already under way,
 /// for as long as that one write takes: one slice ([`crate::SLICE`]) at
 /// most, and on a disk that stalls, as long as it stalls. A copy into
-/// the name that a publish had begun is not the partial: a slice of it
-/// still on the pool ends there, into a copy the drop removes. Every
+/// the name that a publish had begun ends the same way: the drop waits
+/// for the slice of it under way, and removes the copy; only a flush of
+/// the copy still on the pool ends there
+/// ([`Directory::publish_with`]). Every
 /// other end goes through the
 /// same gate first: it is shut before the partial is cut back, handed
 /// back in [`Stopped::kept`], flushed, published or removed, and

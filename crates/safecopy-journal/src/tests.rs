@@ -1,34 +1,106 @@
 use super::*;
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-/// A new, empty folder for one test, under the build's target folder.
-fn temp(name: &str) -> PathBuf {
-    // The test binary is in target/<profile>/deps.
-    let exe = std::env::current_exe().unwrap();
-    let target = exe.ancestors().nth(3).unwrap();
-    let dir = target
-        .join("test-tmp")
-        .join(format!("journal-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// Held for writing while a child process starts, and for reading by
+/// every test that has folders: on Unix a child holds every open file of
+/// this process until it becomes its own program, locks included, so a
+/// file a test let go of would read as held.
+static CHILD_START: RwLock<()> = RwLock::new(());
+
+thread_local! {
+    /// This thread's hold on `CHILD_START` for reading and how many
+    /// scratch folders share it: a second hold would wait for ever behind
+    /// a child's start that waits for the first.
+    static NO_CHILD: RefCell<(usize, Option<RwLockReadGuard<'static, ()>>)> =
+        const { RefCell::new((0, None)) };
 }
 
-struct Scratch(PathBuf);
+fn no_child() -> RwLockReadGuard<'static, ()> {
+    CHILD_START.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A new, empty folder for one test, under the build's target folder and
+/// removed with it. While a test has one, no child process starts: every
+/// lock the test lets go of is then let go of in fact.
+pub(crate) struct Scratch(PathBuf);
+
+impl Scratch {
+    /// `kind` tells one test module's folders from another's.
+    pub(crate) fn new(kind: &str, name: &str) -> Self {
+        NO_CHILD.with_borrow_mut(|(count, held)| {
+            if *count == 0 {
+                *held = Some(no_child());
+            }
+            *count += 1;
+        });
+        // The test binary is in target/<profile>/deps.
+        let exe = std::env::current_exe().unwrap();
+        let target = exe.ancestors().nth(3).unwrap();
+        let dir = target
+            .join("test-tmp")
+            .join(format!("{kind}-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Made before the folder is: a panic here still gives the hold back.
+        let scratch = Self(dir);
+        std::fs::create_dir_all(&scratch.0).unwrap();
+        scratch
+    }
+
+    /// With a folder to write into and one for journals.
+    pub(crate) fn folders(kind: &str, name: &str) -> (Self, PathBuf, PathBuf) {
+        let scratch = Self::new(kind, name);
+        let (place, journals) = (scratch.0.join("Work"), scratch.0.join("journals"));
+        std::fs::create_dir_all(&place).unwrap();
+        std::fs::create_dir_all(&journals).unwrap();
+        (scratch, place, journals)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
 
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+        NO_CHILD.with_borrow_mut(|(count, held)| {
+            *count -= 1;
+            if *count == 0 {
+                *held = None;
+            }
+        });
+    }
+}
+
+/// The only test running, for as long as this is held: this thread's own
+/// hold is given up for it, and taken again after.
+struct Alone(Option<RwLockWriteGuard<'static, ()>>);
+
+impl Alone {
+    fn take() -> Self {
+        NO_CHILD.with_borrow_mut(|(_, held)| *held = None);
+        Self(Some(
+            CHILD_START.write().unwrap_or_else(PoisonError::into_inner),
+        ))
+    }
+}
+
+impl Drop for Alone {
+    fn drop(&mut self) {
+        self.0 = None;
+        NO_CHILD.with_borrow_mut(|(count, held)| {
+            if *count > 0 {
+                *held = Some(no_child());
+            }
+        });
     }
 }
 
 /// A scratch folder with a folder to write into and one for journals.
 fn scratch(name: &str) -> (Scratch, PathBuf, PathBuf) {
-    let base = temp(name);
-    let (place, journals) = (base.join("Work"), base.join("journals"));
-    std::fs::create_dir_all(&place).unwrap();
-    std::fs::create_dir_all(&journals).unwrap();
-    (Scratch(base), place, journals)
+    Scratch::folders("journal", name)
 }
 
 fn journals(dir: &Path) -> usize {
@@ -212,10 +284,9 @@ fn only_a_partial_name_of_one_part_naming_no_stream_is_removable() {
 
 #[test]
 fn a_missing_journal_folder_has_nothing_to_clean() {
-    let base = temp("missing");
-    let _scratch = Scratch(base.clone());
+    let scratch = Scratch::new("journal", "missing");
     assert_eq!(
-        clean_up(&base.join("none"), &settings()).unwrap(),
+        clean_up(&scratch.path().join("none"), &settings()).unwrap(),
         Cleaned::default()
     );
 }
@@ -612,12 +683,6 @@ fn a_file_given_a_second_name_while_it_is_being_held_is_not_held() {
 use std::fs::File;
 use std::process::Command;
 
-/// Held for writing while a child process starts, and for reading by a
-/// test that cannot have its open files copied into one: on Unix a child
-/// holds every open file of this process until it becomes its own program,
-/// locks included, so a file a test let go of can read as held.
-pub(crate) static CHILD_START: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
 /// The test binary run again as another process, in `role`.
 fn child(role: &str, place: &Path, journal_dir: &Path) -> String {
     use std::process::Stdio;
@@ -632,7 +697,9 @@ fn child(role: &str, place: &Path, journal_dir: &Path) -> String {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let started = {
-        let _alone = CHILD_START.write().unwrap_or_else(PoisonError::into_inner);
+        // Back from the start, the child is its own program and holds
+        // none of this process's files.
+        let _alone = Alone::take();
         command.spawn().unwrap()
     };
     let output = started.wait_with_output().unwrap();
@@ -671,6 +738,63 @@ fn as_child() {
         }
         other => panic!("no role {other}"),
     }
+}
+
+/// A program that starts a child process just as it lets a journal go:
+/// until the child is its own program it holds a copy of every open file
+/// of this one, the journal's lock with them.
+#[cfg(unix)]
+#[test]
+fn a_journal_let_go_while_a_child_starts_is_left_for_the_next_cleanup() {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let (_scratch, place, journal_dir) = scratch("child-start");
+    let root = Directory::destination(&place).unwrap();
+    let journal = Journal::start(&journal_dir, &root, &settings()).unwrap();
+    drop(partial(&root, &journal, 0, "a.part", b"half"));
+    let (mut forked, tell) = io::pipe().unwrap();
+    let (wait, go) = io::pipe().unwrap();
+    let go_in_child = go.as_raw_fd();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["tests::as_child", "--exact", "--ignored"])
+        .env_remove("SAFECOPY_JOURNAL_CHILD")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: between the fork and the exec only descriptors are closed,
+    // written and read, which is allowed there.
+    unsafe {
+        command.pre_exec(move || {
+            // The child's own copy of the end it waits on, or the pipe
+            // would never end for it.
+            drop(OwnedFd::from_raw_fd(go_in_child));
+            (&tell).write_all(&[1])?;
+            (&wait).read(&mut [0]).map(drop)
+        });
+    }
+    // No other test's files are copied into the child held here.
+    let alone = Alone::take();
+    let starting = std::thread::spawn(move || command.status());
+    // The child exists and is not yet its own program.
+    forked.read_exact(&mut [0]).unwrap();
+    journal.crash();
+    drop(root);
+    // The journal is let go of here, and still reads as held: left whole.
+    assert_eq!(clean_up(&journal_dir, &settings()).unwrap(), cleaned(0, 0));
+    assert!(recover(&journal_dir, &settings()).unwrap().is_empty());
+    assert_eq!(journals(&journal_dir), 1);
+    assert!(place.join("a.part").exists());
+    // The child becomes its own program: the copies are closed.
+    drop(go);
+    assert!(starting.join().unwrap().unwrap().success());
+    drop(alone);
+    assert_eq!(recover(&journal_dir, &settings()).unwrap().len(), 1);
+    assert_eq!(clean_up(&journal_dir, &settings()).unwrap(), cleaned(1, 0));
+    assert!(!place.join("a.part").exists());
+    assert_eq!(journals(&journal_dir), 0);
 }
 
 #[test]

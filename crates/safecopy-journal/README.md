@@ -191,6 +191,23 @@ segment to fit fails with the system's error for the removal.
 `files::create`, which `safecopy-resume` makes its records with, still
 names a file and then locks it on Unix, and fails with the error `busy`
 tells when another had it in between; its caller handles that.
+**A child process started just as a journal is let go** (Unix) holds
+that journal for a moment. The lock is the open file's, and a child a
+program starts has a copy of every open file of that program from the
+moment it is made until it becomes its own program, the files marked to
+be closed then among them. A journal dropped in that moment is closed in
+the program and still locked in the child, so `clean_up` and `recover`
+read it as a running journal's: they remove nothing and report nothing
+for it, and leave it whole. That is safe, as it is for any running
+journal: no partial is removed and no record is lost, and the next call
+after the child has started finds the journal let go
+(`a_journal_let_go_while_a_child_starts_is_left_for_the_next_cleanup`,
+which holds a child between the two steps). A caller that needs the
+journal at once, to continue its transfer, calls again. A child that
+never becomes another program (a fork that goes on as the same one) keeps
+its copies, and the journals with them, until it closes them or ends.
+Windows gives a child no handle of a journal.
+
 **A journals folder on a network file system** has weaker locks on Unix:
 Linux turns this lock into a lock a process holds. A cleanup in the
 process that runs the journal is given it too, and the process loses it
@@ -266,6 +283,15 @@ After a crash, cleanup:
 
 ## Changes
 
+- **What a child process started beside a journal does is said and
+  tested**, see "A cleanup beside a running journal": nothing in the
+  crate changed for it. The crate's own tests start child processes, and
+  a test whose journal was let go while another test's child started
+  found it still held now and then; every test with folders now keeps
+  children from starting while it runs. The test of `Settings::roll_every`
+  counted a segment's bytes, which follow the size of the IDs the disk
+  hands out (on NTFS an ID grows a byte when its file record has been
+  used 256 times); it now checks what the journal does with them.
 - **A cleanup and a running journal no longer meet at a segment (Unix).**
   Two things could happen with a cleanup in one process and a journal in
   another. A cleanup that opened a segment just before its journal started

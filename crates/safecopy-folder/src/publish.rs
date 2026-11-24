@@ -5,10 +5,11 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use safecopy_names::candidates;
+use tokio::task::JoinHandle;
 
 use crate::{Applied, Directory, Meta, MetaRules, Refusal, refusal};
 
@@ -129,14 +130,84 @@ fn write_at(file: &File, bytes: &[u8], at: u64) -> io::Result<usize> {
 }
 
 /// A copy created under its final name, removed on drop unless kept.
+///
+/// A slice handed to the blocking pool outlives the publish that asked
+/// for it, and would hold both files open while it waits there. So the
+/// claim and its slices share a gate: dropped, the claim waits for the
+/// slice that holds it, shuts every later one out and closes the handles
+/// the copy went through, before the copy is removed.
 struct Claim<'a> {
     dir: &'a Directory,
     file: File,
     leaf: &'a OsStr,
     kept: bool,
+    gate: Arc<Gate>,
+    #[cfg(test)]
+    seam: Option<crate::seams::Copies>,
 }
 
-impl Claim<'_> {
+/// The handles a copy's slices go through, the file's and the copy's:
+/// held for the length of each slice, and empty once the claim is gone.
+struct Gate(Mutex<Option<(File, File)>>);
+
+impl Gate {
+    fn lock(&self) -> MutexGuard<'_, Option<(File, File)>> {
+        // A slice that panicked left the copy as whole as it will be.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl<'a> Claim<'a> {
+    /// `output`, just created as `leaf` in `dir`, to be copied into from
+    /// `source`.
+    fn new(dir: &'a Directory, source: &File, output: File, leaf: &'a OsStr) -> io::Result<Self> {
+        // The claim first: a handle that cannot be cloned still removes the copy.
+        let claim = Self {
+            dir,
+            file: output,
+            leaf,
+            kept: false,
+            gate: Arc::new(Gate(Mutex::new(None))),
+            #[cfg(test)]
+            seam: crate::seams::COPIES.take(),
+        };
+        let handles = (source.try_clone()?, claim.file.try_clone()?);
+        *claim.gate.lock() = Some(handles);
+        Ok(claim)
+    }
+
+    /// Copies one slice at the offset `at` on the blocking pool: the
+    /// buffer back, and how many bytes, 0 at the end of the file.
+    fn slice(&self, mut buffer: Vec<u8>, at: u64) -> JoinHandle<(Vec<u8>, io::Result<usize>)> {
+        let gate = self.gate.clone();
+        #[cfg(test)]
+        let seam = self.seam.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let step = |step| {
+                if let Some(seam) = &seam {
+                    seam(step);
+                }
+            };
+            #[cfg(test)]
+            step(crate::seams::Step::Queued);
+            let files = gate.lock();
+            let copied = match &*files {
+                Some((source, output)) => {
+                    #[cfg(test)]
+                    step(crate::seams::Step::Copying);
+                    copy_slice(source, output, &mut buffer, at)
+                }
+                // The claim is gone, and its publish with it.
+                None => Ok(0),
+            };
+            #[cfg(test)]
+            step(crate::seams::Step::Ended);
+            drop(files);
+            (buffer, copied)
+        })
+    }
+
     fn keep(mut self) {
         self.kept = true;
     }
@@ -144,6 +215,13 @@ impl Claim<'_> {
 
 impl Drop for Claim<'_> {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(seam) = &self.seam {
+            seam(crate::seams::Step::Closing);
+        }
+        // Waits for the slice that holds the gate, one slice, as long as
+        // the disk takes. A slice that has not started finds no file.
+        self.gate.lock().take();
         if !self.kept {
             let _ = self.dir.discard(&self.file, self.leaf);
         }
@@ -377,6 +455,18 @@ impl Directory {
     /// makes the file be copied into its name, the copy gets them too, and
     /// with [`Finish::sync`] its bytes are flushed to the disk before the
     /// publish succeeds; a copy that fails any of that is removed.
+    ///
+    /// Dropped while it copies, this removes the copy and leaves no slice
+    /// of it behind: each slice is copied on the blocking pool behind a
+    /// gate the copy shares with it, and the drop shuts that gate. It
+    /// waits for the slice under way, 64 KiB, and on a disk that stalls,
+    /// as long as it stalls; a slice that had not started copies nothing.
+    /// When the drop returns no handle of the copy or of `file` is open
+    /// but the caller's, so on Windows too the copy is gone from the
+    /// folder by then and `partial` can be removed from it at once. A
+    /// flush of the copy ([`Finish::sync`]) is not behind the gate: one
+    /// still on the pool at a drop or a cancel ends there, and on Windows
+    /// the removed copy stays in the folder until it has.
     pub async fn publish_with(
         &self,
         file: &File,
@@ -457,21 +547,15 @@ impl Directory {
                         || refusal(&e) == Some(Refusal::Replaced) => {}
                 Err(e) => return Err(at_name(e)),
             }
-            let source = Arc::new(file.try_clone().map_err(at_name)?);
             let output = match self.create(leaf) {
                 Ok(output) => output,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(at_name(e)),
             };
-            // Until the publish succeeds the copy goes, even with a future dropped midway.
-            let claim = Claim {
-                dir: self,
-                file: output,
-                leaf,
-                kept: false,
-            };
-            let output = Arc::new(claim.file.try_clone().map_err(at_name)?);
-            // Copied from the open file, not from what `partial` names now.
+            // Until the publish succeeds the copy goes, even with a future
+            // dropped midway. Copied from the open file, not from what
+            // `partial` names now.
+            let claim = Claim::new(self, file, output, leaf).map_err(at_name)?;
             if rules.mark {
                 marked = self.mark(leaf);
             }
@@ -485,11 +569,7 @@ impl Directory {
                 loop {
                     #[cfg(test)]
                     crate::seams::at("copy slice");
-                    let (from, to) = (source.clone(), output.clone());
-                    let copy = slice.insert(tokio::task::spawn_blocking(move || {
-                        let copied = copy_slice(&from, &to, &mut buffer, at);
-                        (buffer, copied)
-                    }));
+                    let copy = slice.insert(claim.slice(buffer, at));
                     let joined = copy.await;
                     slice = None;
                     let (back, copied) =
@@ -513,12 +593,12 @@ impl Directory {
             }
             // A new file: the time and the bit are set on it again, after its last byte.
             let copied = copied.and_then(|()| {
-                applied = self.apply(&output, meta, meta_rules)?;
+                applied = self.apply(&claim.file, meta, meta_rules)?;
                 Ok(())
             });
             // The copy is a file of its own: the caller's flush of `file` did not reach it.
             let copied = match copied {
-                Ok(()) if finish.sync => sync_data(&output, &mut cancel).await,
+                Ok(()) if finish.sync => sync_data(&claim.file, &mut cancel).await,
                 copied => copied,
             };
             copied.map_err(|e| match e {

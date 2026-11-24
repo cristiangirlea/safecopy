@@ -536,6 +536,26 @@ mod seams {
         /// How many times a copy was flushed to the disk.
         pub static SYNCS: Cell<u32> = const { Cell::new(0) };
         static HOOKS: RefCell<Vec<(&'static str, Hook)>> = const { RefCell::new(Vec::new()) };
+        /// Told of each step of the slices of the next copy into a name
+        /// this thread starts, on the thread that takes the step.
+        pub static COPIES: RefCell<Option<Copies>> = const { RefCell::new(None) };
+    }
+
+    /// What hears of a copy's slices: it may hold a step for as long as a
+    /// test needs.
+    pub type Copies = std::sync::Arc<dyn Fn(Step) + Send + Sync>;
+
+    /// A step of a copy into a name.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Step {
+        /// A slice is on the blocking pool and has not taken the gate.
+        Queued,
+        /// It holds the gate and is about to copy.
+        Copying,
+        /// It has copied, or found the gate shut, and still holds it.
+        Ended,
+        /// The copy's claim is being dropped and is about to take the gate.
+        Closing,
     }
 
     /// Runs `hook` once, when the code reaches `point`: a swap acted out

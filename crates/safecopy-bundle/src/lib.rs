@@ -46,6 +46,7 @@ use std::sync::Arc;
 pub use safecopy_chunks::Saved;
 pub use safecopy_resume::TransferKey;
 
+mod placed;
 mod reader;
 mod wire;
 mod writer;
@@ -325,6 +326,42 @@ impl Gate {
             .try_acquire_owned()
             .ok()
             .map(|place| Pass { _place: place })
+    }
+}
+
+/// What the tests reach into.
+#[cfg(test)]
+pub(crate) mod seams {
+    use std::cell::{Cell, RefCell};
+    use std::sync::Arc;
+
+    thread_local! {
+        /// Told of each step of the writes of every read this thread
+        /// starts, on the thread that takes the step.
+        pub static WRITES: RefCell<Option<Writes>> = const { RefCell::new(None) };
+        /// The write that would pass this byte of the next partial file
+        /// this thread writes fails, with nothing of it written.
+        pub static WRITE_ERROR_AT: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    /// What hears of a read's writes: it may hold a step for as long as a
+    /// test needs.
+    pub type Writes = Arc<dyn Fn(Step) + Send + Sync>;
+
+    /// A step of a partial file's writer.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Step {
+        /// A write is on the blocking pool and has not taken the gate.
+        Queued,
+        /// It holds the gate and is about to write.
+        Writing,
+        /// It has written, or found the gate shut, and still holds it.
+        Ended,
+        /// The file's bytes have ended, and the read is about to wait for
+        /// the write under way.
+        Settling,
+        /// The writer is being dropped and is about to take the gate.
+        Closing,
     }
 }
 
