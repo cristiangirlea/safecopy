@@ -539,7 +539,9 @@ impl PartialAt {
     }
 }
 
-/// Whether `found` is `name` or a numbered form of it ("name (2).ext").
+/// Whether `found` is `name` or a numbered form of it ("name (2).ext"):
+/// the one the rules cut to fit, or the whole name with the number, as a
+/// publish that cuts nothing writes it.
 fn named_as(found: &str, name: &str, settings: &Settings) -> bool {
     if found == name {
         return true;
@@ -555,9 +557,11 @@ fn named_as(found: &str, name: &str, settings: &Settings) -> bool {
     let Ok(n) = digits.parse::<usize>() else {
         return false;
     };
+    let (stem, ext) = safecopy_names::stem_and_ext(name);
     n >= 2
         && !digits.starts_with('0')
-        && safecopy_names::numbered(name, n, &settings.names).as_deref() == Some(found)
+        && (safecopy_names::numbered(name, n, &settings.names).as_deref() == Some(found)
+            || found == format!("{stem} ({n}){ext}"))
 }
 
 /// A published file in `dir` that is the partial `file` named as it
@@ -593,7 +597,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_numbered_form_is_only_the_one_the_names_crate_makes() {
+    fn a_numbered_form_is_the_name_with_its_number_cut_or_whole() {
         let settings = Settings::default();
         assert!(named_as("report.pdf", "report.pdf", &settings));
         assert!(named_as("report (2).pdf", "report.pdf", &settings));
@@ -603,5 +607,21 @@ mod tests {
         assert!(!named_as("report (2).pdf.part", "report.pdf", &settings));
         assert!(!named_as("other (2).pdf", "report.pdf", &settings));
         assert!(!named_as("report (x).pdf", "report.pdf", &settings));
+        // A name at the limit is published with its number after it, uncut;
+        // the name the rules would cut to make room is one too.
+        for name in [
+            "я".repeat(100),
+            "文".repeat(66),
+            "x".repeat(200),
+            format!("{}.txt", "я".repeat(98)),
+        ] {
+            let (stem, ext) = safecopy_names::stem_and_ext(&name);
+            let whole = format!("{stem} (2){ext}");
+            assert!(named_as(&whole, &name, &settings), "{whole}");
+            let cut = safecopy_names::numbered(&name, 2, &settings.names).unwrap();
+            assert!(cut != whole && named_as(&cut, &name, &settings), "{cut}");
+            assert!(!named_as(&format!("{stem} (02){ext}"), &name, &settings));
+            assert!(!named_as(&format!("{stem}x (2){ext}"), &name, &settings));
+        }
     }
 }

@@ -36,6 +36,15 @@ fn folder(path: &str) -> Entry {
     }
 }
 
+/// The limits of a caller that only writes where a name is counted in
+/// UTF-16 units: the tests of wide paths need names over 200 bytes.
+fn wide_limits() -> Limits {
+    Limits {
+        names: safecopy_names::NameRules::default().with_max_bytes(usize::MAX),
+        ..limits()
+    }
+}
+
 fn new(entries: Vec<Entry>) -> Result<Manifest, ManifestError> {
     Manifest::new(1, entries, &limits())
 }
@@ -196,10 +205,7 @@ fn each_limit_takes_the_limit_itself_and_refuses_one_past_it() {
     );
 
     let names = Limits {
-        names: safecopy_names::NameRules {
-            max_units: 3,
-            ..Default::default()
-        },
+        names: safecopy_names::NameRules::default().with_max_units(3),
         ..limits()
     };
     assert!(at(&names, vec![folder("r"), file("r/abc", 1)]).is_ok());
@@ -235,7 +241,7 @@ fn each_limit_takes_the_limit_itself_and_refuses_one_past_it() {
 fn a_path_the_callers_check_refuses_is_refused_never_cut() {
     let fits = Limits {
         fits: Some(fits_4050),
-        ..limits()
+        ..wide_limits()
     };
     // 10 × 400 bytes and 10 separators, then 40: 4,050 bytes in 1,020 characters.
     let at = wide_parts(&"😀".repeat(10));
@@ -263,10 +269,12 @@ fn a_path_the_callers_check_refuses_is_refused_never_cut() {
 fn without_a_check_of_the_callers_a_path_within_the_characters_is_taken() {
     let wide = wide_parts(&"😀".repeat(14));
     assert_eq!(wide.join("/").chars().count(), MAX_PATH_CHARS);
-    assert!(new(along(&wide)).is_ok());
+    assert!(Manifest::new(1, along(&wide), &wide_limits()).is_ok());
+    // Under the default rules a part of 400 bytes is no safe name.
+    assert_eq!(why(new(along(&wide))), ManifestError::Name);
     let fits = Limits {
         fits: Some(fits_4050),
-        ..limits()
+        ..wide_limits()
     };
     assert_eq!(
         why(Manifest::new(1, along(&wide), &fits)),
@@ -382,6 +390,37 @@ fn names_cleaning_would_change_are_refused_in_a_list() {
     }
     let at = "x".repeat(MAX_NAME_UNITS);
     assert!(new(vec![folder("r"), file(&format!("r/{at}"), 1)]).is_ok());
+}
+
+/// A name within the units that a system counting bytes would refuse is
+/// no safe name: 67 three-byte characters are 201 bytes.
+#[test]
+fn names_over_the_byte_limit_are_refused_in_a_list() {
+    let list = |name: &str| vec![folder("r"), file(&format!("r/{name}"), 1)];
+    for name in ["文".repeat(67), "😀".repeat(51), "я".repeat(101)] {
+        assert_eq!(why(new(list(&name))), ManifestError::Name, "{name}");
+        assert_eq!(
+            why(new(vec![folder(&name), file(&format!("{name}/a"), 1)])),
+            ManifestError::Name,
+            "{name}"
+        );
+        assert!(Manifest::new(1, list(&name), &wide_limits()).is_ok());
+    }
+    for name in ["文".repeat(66), "😀".repeat(50), "я".repeat(100)] {
+        assert!(new(list(&name)).is_ok(), "{name}");
+    }
+    // What a listing gives for such names is taken, numbered ones too.
+    let long = format!("{}.pdf", "文".repeat(90));
+    let mut siblings = Siblings::default();
+    let one = siblings.take(OsStr::new(&long)).unwrap();
+    let two = siblings.take(OsStr::new(&long)).unwrap();
+    assert!(one.len() <= 200 && two.len() <= 200 && one != two);
+    let entries = vec![
+        folder("r"),
+        file(&format!("r/{one}"), 1),
+        file(&format!("r/{two}"), 1),
+    ];
+    assert!(new(entries).is_ok());
 }
 
 #[test]
@@ -566,10 +605,10 @@ fn an_oversized_list_is_refused_when_encoded() {
     for i in 0..(MAX_ENTRIES - entries.len()) {
         entries.push(file(&format!("{deepest}/{i:05}{}", "中".repeat(195)), 1));
     }
-    let manifest = new(entries).unwrap();
+    let manifest = Manifest::new(1, entries, &wide_limits()).unwrap();
     assert_eq!(manifest.entries().len(), MAX_ENTRIES);
     assert_eq!(
-        why(manifest.encode(&limits())),
+        why(manifest.encode(&wide_limits())),
         ManifestError::TooLong {
             most: 16 * 1024 * 1024
         }
@@ -948,7 +987,7 @@ fn a_listed_path_the_callers_check_refuses_is_refused_whole() {
     let (_scratch, dir) = scratch("wide");
     let fits = Limits {
         fits: Some(fits_4050),
-        ..limits()
+        ..wide_limits()
     };
     let parts = wide_parts("");
     let root = dir.join(&parts[0]);

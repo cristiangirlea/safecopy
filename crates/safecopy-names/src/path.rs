@@ -5,7 +5,11 @@ use std::fmt;
 use crate::{NameRules, cleaned_name, fitted, reserved};
 
 /// Limits on a path inside a folder.
+///
+/// Built from the default, since more limits may come:
+/// `PathRules::default().with_max_depth(8)`, or by setting a field of one.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PathRules {
     /// The most parts a path may have, the folder's own name first.
     pub max_depth: usize,
@@ -23,6 +27,26 @@ impl Default for PathRules {
             max_chars: 1024,
             names: NameRules::default(),
         }
+    }
+}
+
+impl PathRules {
+    /// These rules with [`max_depth`](Self::max_depth) set.
+    pub const fn with_max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = max_depth;
+        self
+    }
+
+    /// These rules with [`max_chars`](Self::max_chars) set.
+    pub const fn with_max_chars(mut self, max_chars: usize) -> Self {
+        self.max_chars = max_chars;
+        self
+    }
+
+    /// These rules with [`names`](Self::names) set.
+    pub const fn with_names(mut self, names: NameRules) -> Self {
+        self.names = names;
+        self
     }
 }
 
@@ -79,7 +103,8 @@ impl std::error::Error for PathError {}
 /// (`..`), start at a drive or its top (`C:`, `\`), name a stream (`:`) or
 /// a device (`CON`); the path is neither deeper nor longer than `rules`
 /// allow. Each part is made safe as [`safe_name`](crate::safe_name) makes a
-/// name, except that a device name is refused rather than renamed.
+/// name, cut to both of its limits, except that a device name is refused
+/// rather than renamed.
 pub fn check_path(name: &str, rules: &PathRules) -> Result<EntryPath, PathError> {
     if name.chars().count() > rules.max_chars {
         return Err(PathError::TooLong {
@@ -114,7 +139,7 @@ pub fn check_path(name: &str, rules: &PathRules) -> Result<EntryPath, PathError>
             return Err(PathError::LeavesFolder);
         }
         let fitted = cleaned_name(part)
-            .and_then(|cleaned| fitted(&cleaned, rules.names.max_units))
+            .and_then(|cleaned| fitted(&cleaned, "", &rules.names))
             .ok_or(PathError::Unusable)?;
         // After the cut: a cut can leave a device name ("NUL", then spaces).
         if reserved(&fitted) {
@@ -219,12 +244,71 @@ mod tests {
         assert_eq!(check(&long), Err(TooLong { most: 1024 }));
         let longest = format!("a/{}", "x".repeat(1022));
         assert!(check(&longest).is_ok());
-        // A part is cut by UTF-16 units, as Windows counts them.
+        // A part is cut by UTF-16 units, as Windows counts them, and by
+        // bytes: 50 of these are 200 bytes.
         let wide = check(&format!("a/{}", "😀".repeat(150))).unwrap();
-        assert_eq!(wide.parts[1].encode_utf16().count(), 200);
+        assert_eq!(wide.parts[1], "😀".repeat(50));
         // A part the cut and the trim leave as "NUL" is refused too.
         let cut_to_device = format!("a/NUL{}x/b.txt", " ".repeat(197));
         assert_eq!(check(&cut_to_device), Err(Reserved));
+    }
+
+    /// Each part is cut to the byte limit as [`safe_name`](crate::safe_name)
+    /// cuts a name, and a part the cut leaves a device name is refused.
+    #[test]
+    fn a_part_over_the_byte_limit_is_cut_as_one_over_the_unit_limit_is() {
+        let names = NameRules::default();
+        for name in [
+            format!("{}.png", "😀".repeat(100)),
+            format!("{}.pdf", "文".repeat(90)),
+            format!("{}.txt", "я".repeat(130)),
+        ] {
+            let safe = crate::safe_name(&name, &names).unwrap();
+            assert!(safe.len() <= 200 && safe != name, "{name}");
+            // As a folder on the way, as the last folder and as a file.
+            for path in [
+                format!("{name}/b.txt"),
+                format!("a/{name}/"),
+                format!("a/{name}"),
+            ] {
+                let checked = check(&path).unwrap();
+                assert!(checked.parts.contains(&safe), "{path}");
+                for part in &checked.parts {
+                    assert!(part.len() <= 200, "{path}");
+                    assert!(part.encode_utf16().count() <= 200, "{path}");
+                }
+            }
+        }
+        // 200 units and 202 bytes: the cut drops "文", the trim the spaces.
+        let cut_to_device = format!("a/NUL{}文/b.txt", " ".repeat(196));
+        assert_eq!(check(&cut_to_device), Err(PathError::Reserved));
+        // The limits are the path's own names' limits.
+        let rules = PathRules::default().with_names(names.with_max_bytes(6));
+        assert_eq!(
+            check_path("文文文/文.txt", &rules).unwrap().parts,
+            ["文文", "文.tx"]
+        );
+        let lifted =
+            PathRules::default().with_names(NameRules::default().with_max_bytes(usize::MAX));
+        let part = "文".repeat(90);
+        assert_eq!(
+            check_path(&format!("a/{part}"), &lifted).unwrap().parts[1],
+            part
+        );
+    }
+
+    #[test]
+    fn the_path_rules_are_built_from_the_default() {
+        let rules = PathRules::default()
+            .with_max_depth(2)
+            .with_max_chars(8)
+            .with_names(NameRules::default().with_max_units(3));
+        assert_eq!((rules.max_depth, rules.max_chars), (2, 8));
+        assert_eq!(rules.names.max_units, 3);
+        // A field of rules a caller holds can be set as well.
+        let mut set = rules.clone();
+        set.max_depth = 5;
+        assert_eq!(set, rules.with_max_depth(5));
     }
 
     #[test]

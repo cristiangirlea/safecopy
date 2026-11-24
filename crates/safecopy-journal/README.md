@@ -283,6 +283,12 @@ After a crash, cleanup:
 
 ## Changes
 
+- **A numbered file at the name limit is found again.** A publish puts
+  the number after the whole name, and recovery looked for the name the
+  rules cut to make room for it, so a published `name (2)` whose name
+  was within four of the limit was fetched again. With names limited in
+  bytes too (`safecopy-names`) every cut name of wide characters is that
+  long. Recovery now takes both forms.
 - **What a child process started beside a journal does is said and
   tested**, see "A cleanup beside a running journal": nothing in the
   crate changed for it. The crate's own tests start child processes, and

@@ -77,6 +77,14 @@ original code behaved as below, this crate does not:
 
 ## Changes
 
+- **A name over 200 bytes is refused in a list.** `Limits::names` follows
+  `safecopy-names`, whose default rules now limit a name to 200 bytes of
+  UTF-8 as well as 200 UTF-16 units. A listing cuts such a name (90
+  Chinese characters to 66) and numbers it within the limit; a list from
+  a sender that kept it whole, as an earlier version did, is refused with
+  `ManifestError::Name`. A caller that only writes where names are
+  counted in units takes such lists with
+  `names: NameRules::default().with_max_bytes(usize::MAX)`.
 - **A file's time and execute bit at listing time.** `Sources::meta(n)`
   and the new field `Listed::meta` give `safecopy_folder::Meta
   { modified, executable }` from the metadata the listing already read,
