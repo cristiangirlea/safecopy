@@ -8,7 +8,8 @@ use std::pin::Pin;
 use std::sync::LazyLock;
 
 use safecopy_folder::{
-    Applied, Directory, Finish, Marked, Meta, MetaRules, PublishError, PublishRules,
+    Applied, Directory, Finish, Marked, Meta, MetaRules, PublishError, PublishRules, Refusal,
+    refusal,
 };
 use tokio::io::AsyncRead;
 
@@ -36,12 +37,44 @@ pub trait Hooks: Send + Sync {
         Ok(())
     }
 
-    /// The save ended: published, or failed with the partial file removed
-    /// (left only when the system refused to remove it, for the caller's
-    /// crash cleanup to find). Called once, whatever happened.
-    fn ended(&self, outcome: Result<&Saved, &ChunkError>) {
-        let _ = outcome;
+    /// The save ended, with what became of the partial file: published,
+    /// or after a failure removed, or left where the system refused to
+    /// remove it, for the caller's crash cleanup to find. Called once for
+    /// a save that runs to its end, whatever that end is; not called when
+    /// the save's future is dropped, and the partial file then stays for
+    /// the crash cleanup.
+    fn ended(&self, outcome: Result<&Saved, &ChunkError>, partial: PartialFate) {
+        let _ = (outcome, partial);
     }
+}
+
+/// What became of the partial file when a save ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PartialFate {
+    /// The save ended before one was created.
+    NotCreated,
+    /// The save succeeded: it has its name. Where the file was linked or
+    /// copied into that name, a partial name the system then refused to
+    /// remove stays behind; [`Directory::publish_with`] does not report
+    /// that, so a cleanup still looks for it.
+    Published,
+    /// The save failed, and it was removed.
+    Removed,
+    /// The save failed, and another file was under its name by then
+    /// (Linux and macOS, which remove by name): that file is not the
+    /// partial and was left untouched.
+    Replaced,
+    /// The save failed, and the system refused to remove it: what
+    /// [`Hooks::created`] was given is still there, unless the kind says
+    /// otherwise (one already gone is `NotFound`).
+    Left {
+        /// What the system said.
+        kind: io::ErrorKind,
+        /// The system's own code for it (`errno`, a Windows error code),
+        /// when it has one.
+        raw: Option<i32>,
+    },
 }
 
 /// No hooks.
@@ -119,7 +152,8 @@ fn partial_name(name: &str, n: u64) -> OsString {
 /// downloaded-file mark when `options.publish` asks, the time and the
 /// execute bit as `options.meta_rules` allow, and the name, never
 /// replacing a file. A file that fails anywhere, its hash included, is
-/// removed before it gets a name. [`Hooks::ended`] hears the outcome.
+/// removed before it gets a name. [`Hooks::ended`] hears the outcome, and
+/// whether that removal failed ([`PartialFate::Left`]).
 ///
 /// `cancel` is watched while the bytes come and while publishing.
 pub async fn save_verified<R: AsyncRead + Unpin + ?Sized>(
@@ -131,8 +165,8 @@ pub async fn save_verified<R: AsyncRead + Unpin + ?Sized>(
     hooks: &dyn Hooks,
     cancel: impl Future<Output = ()>,
 ) -> Result<Saved, ChunkError> {
-    let outcome = save(reader, dir, name, size, options, hooks, cancel).await;
-    hooks.ended(outcome.as_ref());
+    let (outcome, partial) = save(reader, dir, name, size, options, hooks, cancel).await;
+    hooks.ended(outcome.as_ref(), partial);
     outcome
 }
 
@@ -144,12 +178,15 @@ async fn save<R: AsyncRead + Unpin + ?Sized>(
     options: &SaveOptions<'_>,
     hooks: &dyn Hooks,
     cancel: impl Future<Output = ()>,
-) -> Result<Saved, ChunkError> {
+) -> (Result<Saved, ChunkError>, PartialFate) {
     tokio::pin!(cancel);
-    hooks
-        .before_create()
-        .map_err(|e| ChunkError::Hook(e.kind()))?;
-    let (file, partial) = create(dir, name)?;
+    if let Err(e) = hooks.before_create() {
+        return (Err(ChunkError::Hook(e.kind())), PartialFate::NotCreated);
+    }
+    let (file, partial) = match create(dir, name) {
+        Ok(created) => created,
+        Err(e) => return (Err(e), PartialFate::NotCreated),
+    };
     let target = Target {
         dir,
         file: &file,
@@ -158,13 +195,30 @@ async fn save<R: AsyncRead + Unpin + ?Sized>(
         size,
     };
     let saved = fill(reader, &target, options, hooks, &mut cancel).await;
-    if saved.is_err() {
+    let fate = if saved.is_ok() {
+        PartialFate::Published
+    } else {
         // A file that is not whole and checked never gets a name. One that
         // cannot be removed now is left to the caller's crash cleanup; the
-        // error that stopped the save is the one to report.
-        let _ = dir.discard(&file, &partial);
+        // error that stopped the save is still the one returned.
+        match discard(dir, &file, &partial) {
+            Ok(()) => PartialFate::Removed,
+            Err(e) if refusal(&e) == Some(Refusal::Replaced) => PartialFate::Replaced,
+            Err(e) => PartialFate::Left {
+                kind: e.kind(),
+                raw: e.raw_os_error(),
+            },
+        }
+    };
+    (saved, fate)
+}
+
+fn discard(dir: &Directory, file: &File, partial: &OsStr) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(error) = crate::seams::DISCARD_ERROR.take() {
+        return Err(io::Error::from_raw_os_error(error));
     }
-    saved
+    dir.discard(file, partial)
 }
 
 fn create(dir: &Directory, name: &str) -> Result<(File, OsString), ChunkError> {

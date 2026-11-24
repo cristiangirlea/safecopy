@@ -4,7 +4,7 @@ use crate::seams::{
     ATTRIBUTES, FINAL_PATH_FAILS, GONE_BEFORE_INSPECT, GONE_BEFORE_OPEN, INSPECT_FAILS, NO_VOLUME,
 };
 use crate::sources::{Kept, OFFLINE, RECALL_ON_DATA_ACCESS, RECALL_ON_OPEN, online_only};
-use safecopy_folder::{Directory, is_link};
+use safecopy_folder::{Directory, Meta, Time, is_link};
 use safecopy_names::{PathRules, Siblings, check_path, safe_name};
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
@@ -1542,6 +1542,175 @@ fn an_online_only_file_is_listed_from_its_metadata_and_fetched_when_opened() {
     assert_eq!(read(&sources, 2), b"in the cloud");
 }
 
+/// A known modified time for `path`, set through a handle of its own.
+fn set_time(path: &Path, secs: u64) -> Time {
+    let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(time).unwrap();
+    Time::from_system(time).unwrap()
+}
+
+/// The modified time the disk gives for `path`, read by path.
+fn time_of(path: &Path) -> Option<Time> {
+    Time::from_system(std::fs::metadata(path).unwrap().modified().unwrap())
+}
+
+/// Holds `path` open so that nothing else can open it for its data
+/// (Windows: shared with no one).
+#[cfg(windows)]
+fn held_alone(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    let held = std::fs::File::options()
+        .read(true)
+        .share_mode(0)
+        .open(path)
+        .unwrap();
+    assert!(std::fs::File::open(path).is_err(), "not held alone");
+    held
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Each entry's time and execute bit come with the list, a folder's time
+/// too, and no file is opened for them: on Windows the file is held so
+/// that no one else can open it for its data while it is listed.
+#[test]
+fn a_list_gives_each_entry_s_time_and_execute_bit_without_opening_it() {
+    let (_scratch, dir) = scratch("meta");
+    write(&dir.join("r/sub/doc.txt"), b"text");
+    write(&dir.join("r/tool"), b"#!");
+    let doc = set_time(&dir.join("r/sub/doc.txt"), 1_000_000_000);
+    let tool = set_time(&dir.join("r/tool"), 1_500_000_000);
+    #[cfg(unix)]
+    set_mode(&dir.join("r/tool"), 0o744);
+    #[cfg(windows)]
+    let held = held_alone(&dir.join("r/sub/doc.txt"));
+    let (manifest, sources) = list(&[dir.join("r")]).unwrap();
+    assert_eq!(
+        paths(&manifest),
+        [
+            ("r", Kind::Folder, 0),
+            ("r/sub", Kind::Folder, 0),
+            ("r/sub/doc.txt", Kind::File, 4),
+            ("r/tool", Kind::File, 2),
+        ]
+    );
+    let file = |modified, executable| {
+        Some(Meta {
+            modified: Some(modified),
+            executable,
+        })
+    };
+    assert_eq!(sources.meta(2), file(doc, false));
+    // The owner's bit, where the system has one.
+    assert_eq!(sources.meta(3), file(tool, cfg!(unix)));
+    // A folder: its time, and never a program though it can be searched.
+    let sub = sources.meta(1).unwrap();
+    assert_eq!(sub.modified, time_of(&dir.join("r/sub")));
+    assert!(sub.modified.is_some() && !sub.executable);
+    assert!(!sources.meta(0).unwrap().executable);
+    assert_eq!(sources.meta(4), None);
+    #[cfg(windows)]
+    {
+        // Listed while no one could read it; opening it for its data still cannot.
+        assert_eq!(why(sources.open(2)), ManifestError::Changed);
+        drop(held);
+    }
+    assert_eq!(read(&sources, 2), b"text");
+    assert_eq!(read(&sources, 3), b"#!");
+}
+
+/// An online-only file's time comes from the metadata it is listed from.
+#[test]
+fn an_online_only_file_s_time_is_given_without_fetching_it() {
+    let (_scratch, dir) = scratch("cloud-meta");
+    write(&dir.join("r/online.docx"), b"in the cloud");
+    let time = set_time(&dir.join("r/online.docx"), 1_200_000_000);
+    ATTRIBUTES.with_borrow_mut(|given| {
+        given.insert("online.docx".into(), RECALL_ON_DATA_ACCESS);
+    });
+    // Fetching it means opening it for its data, which no one can here.
+    #[cfg(windows)]
+    let held = held_alone(&dir.join("r/online.docx"));
+    let listed = list(&[dir.join("r")]);
+    ATTRIBUTES.with_borrow_mut(HashMap::clear);
+    let (_, sources) = listed.unwrap();
+    assert!(sources.online_only(1));
+    assert_eq!(
+        sources.meta(1),
+        Some(Meta {
+            modified: Some(time),
+            executable: false,
+        })
+    );
+    #[cfg(windows)]
+    drop(held);
+    assert_eq!(read(&sources, 1), b"in the cloud");
+}
+
+/// Linux lists by a path handle: a file this user may not read still gives
+/// its time, with nothing opened for its data.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn a_file_that_cannot_be_read_still_gives_its_time_with_the_list() {
+    let (_scratch, dir) = scratch("no-read");
+    let locked = dir.join("r/locked");
+    write(&locked, b"listed");
+    let modified = time_of(&locked);
+    set_mode(&locked, 0o000);
+    // An administrator reads any file: nothing to show then.
+    if std::fs::File::open(&locked).is_err() {
+        let (_, sources) = list(&[dir.join("r")]).unwrap();
+        let meta = sources.meta(1).unwrap();
+        assert_eq!((meta.modified, meta.executable), (modified, false));
+    }
+    set_mode(&locked, 0o644);
+}
+
+/// The execute bit alone, changed since the list, is a changed source: the
+/// other side was told what the list gave. Put back, it opens.
+#[cfg(unix)]
+#[test]
+fn a_source_whose_execute_bit_changed_is_changed() {
+    let (_scratch, dir) = scratch("bit-changed");
+    write(&dir.join("r/gained"), b"listed");
+    write(&dir.join("r/lost"), b"listed");
+    set_mode(&dir.join("r/lost"), 0o755);
+    let (_, sources) = list(&[dir.join("r")]).unwrap();
+    assert!(!sources.meta(1).unwrap().executable);
+    assert!(sources.meta(2).unwrap().executable);
+    let listing = Listing::list(&dir.join("r"), &limits()).unwrap();
+    let opened = sources.open(1).unwrap().unwrap();
+    opened.unchanged().unwrap();
+    let times: Vec<_> = (1..3).map(|n| sources.meta(n).unwrap().modified).collect();
+    set_mode(&dir.join("r/gained"), 0o744);
+    set_mode(&dir.join("r/lost"), 0o644);
+    // Size, time and identity are as listed: only the bit differs.
+    assert_eq!(time_of(&dir.join("r/gained")), times[0]);
+    assert_eq!(time_of(&dir.join("r/lost")), times[1]);
+    assert_eq!(why(opened.unchanged()), ManifestError::Changed);
+    for n in [1, 2] {
+        assert_eq!(why(sources.open(n)), ManifestError::Changed, "{n}");
+    }
+    for entry in &listing.entries {
+        assert_eq!(why(listing.open_entry(entry)), ManifestError::Changed);
+    }
+    // The group's and others' bits are not the owner's.
+    set_mode(&dir.join("r/gained"), 0o655);
+    set_mode(&dir.join("r/lost"), 0o700);
+    opened.unchanged().unwrap();
+    for n in [1, 2] {
+        assert_eq!(read(&sources, n), b"listed");
+    }
+    for entry in &listing.entries {
+        assert!(listing.open_entry(entry).unwrap().is_some());
+    }
+}
+
 #[test]
 fn a_file_a_storage_service_took_offline_refuses_the_list() {
     let (_scratch, dir) = scratch("offline");
@@ -1728,6 +1897,55 @@ fn a_folder_is_listed_depth_first_with_its_empty_folders() {
         listing.entries[2].parts(),
         [OsString::from("2024"), OsString::from("a.jpg")]
     );
+}
+
+/// A folder's listing carries each file's time and execute bit, and an
+/// empty folder's time, from what the walk read; an entry whose bit is no
+/// longer the listed one does not open.
+#[test]
+fn a_folder_s_listing_gives_each_entry_s_time_and_execute_bit() {
+    let (_scratch, dir) = scratch("listing-meta");
+    let root = dir.join("Photos");
+    write(&root.join("a.txt"), b"a");
+    write(&root.join("tool"), b"#!");
+    std::fs::create_dir_all(root.join("empty")).unwrap();
+    let a = set_time(&root.join("a.txt"), 1_000_000_000);
+    let tool = set_time(&root.join("tool"), 1_500_000_000);
+    #[cfg(unix)]
+    set_mode(&root.join("tool"), 0o700);
+    let listing = Listing::list(&root, &limits()).unwrap();
+    assert_eq!(
+        names_of(&listing),
+        ["Photos/a.txt", "Photos/tool", "Photos/empty/"]
+    );
+    let metas: Vec<Meta> = listing.entries.iter().map(|e| e.meta).collect();
+    assert_eq!(
+        metas,
+        [
+            Meta {
+                modified: Some(a),
+                executable: false,
+            },
+            Meta {
+                modified: Some(tool),
+                executable: cfg!(unix),
+            },
+            Meta {
+                modified: time_of(&root.join("empty")),
+                executable: false,
+            },
+        ]
+    );
+    assert!(metas[2].modified.is_some());
+    for entry in &listing.entries {
+        listing.open_entry(entry).unwrap();
+    }
+    // Told to the other side as the opposite of what the file is now.
+    for entry in &listing.entries[..2] {
+        let mut other = entry.clone();
+        other.meta.executable = !other.meta.executable;
+        assert_eq!(why(listing.open_entry(&other)), ManifestError::Changed);
+    }
 }
 
 #[test]

@@ -8,12 +8,15 @@
 //!   before it is used.
 //! - [`Sources`] lists files and folders a person picked, by handle, and
 //!   keeps what it needs to open each again: the folders they are in,
-//!   held open, and the identity, size and modified time of every entry.
-//!   A source put in another's place, grown, shrunk or touched since it
-//!   was listed is [`ManifestError::Changed`], never read; one that is no
+//!   held open, and the identity, size, modified time and execute bit of
+//!   every entry. [`Sources::meta`] gives the last two as they were read
+//!   while listing, with no file opened. A source put in another's place,
+//!   grown, shrunk, touched or with another execute bit since it was
+//!   listed is [`ManifestError::Changed`], never read; one that is no
 //!   longer a regular file is [`ManifestError::NotAFile`].
 //! - [`Listing`] walks one folder by handle for sending it whole, skipping
-//!   (and saying so) what it cannot send. An entry that does not open
+//!   (and saying so) what it cannot send; each entry carries its time and
+//!   execute bit ([`Listed::meta`]). An entry that does not open
 //!   again names the part of its path that failed: the folder on the way
 //!   that became a link ([`ManifestError::Link`]), or the entry itself.
 //! - [`groups`] cuts a list into groups, which a transfer goes through in
@@ -27,11 +30,15 @@
 //!
 //! # Systems
 //!
-//! - **Windows** lists an online-only file (one a cloud service keeps) from
-//!   its metadata alone, and refuses one a storage service took offline
-//!   ([`ManifestError::Offline`]). A source folder on no volume of this
-//!   computer (a network share) is refused ([`ManifestError::Network`]).
-//!   Other systems have neither attribute nor check.
+//! - **Windows**: [`Sources`] lists an online-only file (one a cloud
+//!   service keeps) from its metadata alone, its time included, while
+//!   [`Listing::list`] opens each file as it walks and so fetches one
+//!   marked to be fetched when opened. `Sources` refuses one a storage
+//!   service took offline ([`ManifestError::Offline`]). A source folder on
+//!   no volume of this computer (a network share) is refused
+//!   ([`ManifestError::Network`]). Other systems have neither attribute
+//!   nor check. No file is executable there: the execute bit is the
+//!   owner's on Linux and macOS, as [`safecopy_folder::Meta::read`] has it.
 //! - **macOS** cannot read where a folder held open is now, so a source
 //!   inside a kept-out folder is found by the identity of everything in the
 //!   kept-out folders, and by the path the folder was opened at.
@@ -239,8 +246,8 @@ pub enum ManifestError {
     /// The list has no entry of that number.
     NotListed,
     /// The source is no longer what was listed: another file in its place,
-    /// another folder in a folder's, gone, a link, or another size or
-    /// modified time.
+    /// another folder in a folder's, gone, a link, or another size,
+    /// modified time or execute bit.
     Changed,
     /// A listed file is no longer a regular file: a folder is under its
     /// name now, or a device, a pipe or a socket.

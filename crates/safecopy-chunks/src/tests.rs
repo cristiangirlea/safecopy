@@ -334,7 +334,11 @@ async fn a_wrong_hash_removes_the_file_before_it_gets_a_name() {
     // It never came near a name: no publish step ran.
     assert_eq!(
         hooks.steps(),
-        ["before_create", "created a.exe.part", "ended Err(Damaged)"]
+        [
+            "before_create",
+            "created a.exe.part",
+            "ended Err(Damaged) Removed"
+        ]
     );
     drop(dir);
     std::fs::remove_dir_all(&to).unwrap();
@@ -503,7 +507,7 @@ async fn a_cancel_while_the_bytes_come_removes_the_partial() {
         [
             "before_create",
             "created a.bin.part",
-            "ended Err(Cancelled)"
+            "ended Err(Cancelled) Removed"
         ]
     );
     drop((dir, sending));
@@ -557,7 +561,7 @@ async fn a_cancel_while_the_pace_holds_a_slice_removes_the_partial() {
         [
             "before_create",
             "created a.bin.part",
-            "ended Err(Cancelled)"
+            "ended Err(Cancelled) Removed"
         ]
     );
     drop(dir);
@@ -613,13 +617,13 @@ impl Hooks for Recorder {
         )
     }
 
-    fn ended(&self, outcome: Result<&Saved, &ChunkError>) {
+    fn ended(&self, outcome: Result<&Saved, &ChunkError>, partial: PartialFate) {
         let note = match outcome {
             Ok(saved) => format!(
-                "ended Ok({})",
+                "ended Ok({}) {partial:?}",
                 saved.path.file_name().unwrap().to_string_lossy()
             ),
-            Err(e) => format!("ended Err({e:?})"),
+            Err(e) => format!("ended Err({e:?}) {partial:?}"),
         };
         self.steps.lock().unwrap().push(note);
     }
@@ -675,7 +679,7 @@ async fn hooks_run_in_order_and_an_error_in_any_removes_the_partial() {
             "before_create",
             "created a.exe.part",
             "before_publish a.exe.part",
-            "ended Ok(a.exe)"
+            "ended Ok(a.exe) Published"
         ]
     );
     assert_eq!(files, ["a.exe"]);
@@ -687,14 +691,17 @@ async fn hooks_run_in_order_and_an_error_in_any_removes_the_partial() {
     for (step, steps) in [
         (
             "before_create",
-            vec!["before_create", "ended Err(Hook(PermissionDenied))"],
+            vec![
+                "before_create",
+                "ended Err(Hook(PermissionDenied)) NotCreated",
+            ],
         ),
         (
             "created",
             vec![
                 "before_create",
                 "created a.exe.part",
-                "ended Err(Hook(PermissionDenied))",
+                "ended Err(Hook(PermissionDenied)) Removed",
             ],
         ),
         (
@@ -703,7 +710,7 @@ async fn hooks_run_in_order_and_an_error_in_any_removes_the_partial() {
                 "before_create",
                 "created a.exe.part",
                 "before_publish a.exe.part",
-                "ended Err(Hook(PermissionDenied))",
+                "ended Err(Hook(PermissionDenied)) Removed",
             ],
         ),
     ] {
@@ -712,6 +719,137 @@ async fn hooks_run_in_order_and_an_error_in_any_removes_the_partial() {
         assert_eq!(hooks.steps(), steps, "{step}");
         assert!(files.is_empty(), "{step}: {files:?}");
     }
+}
+
+/// Hooks that note what became of the partial file.
+#[derive(Default)]
+struct Fates(Mutex<Vec<PartialFate>>);
+
+impl Hooks for Fates {
+    fn ended(&self, _: Result<&Saved, &ChunkError>, partial: PartialFate) {
+        self.0.lock().unwrap().push(partial);
+    }
+}
+
+/// A partial file that could not be created was never there to remove.
+#[tokio::test]
+async fn a_save_that_cannot_create_its_partial_says_none_was_created() {
+    let to = temp("not-created");
+    let dir = Directory::open(&to).unwrap();
+    let stream = framed(b"x").await;
+    let hooks = Fates::default();
+    // Not one name in the folder.
+    let saved = save_verified(
+        &mut &stream[..],
+        &dir,
+        "a/b",
+        1,
+        &SaveOptions::default(),
+        &hooks,
+        std::future::pending(),
+    )
+    .await;
+    assert!(matches!(saved, Err(ChunkError::Io(_))), "{saved:?}");
+    assert_eq!(*hooks.0.lock().unwrap(), [PartialFate::NotCreated]);
+    assert!(files_in(&to).is_empty());
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// Where a partial is removed by its name, another file put under that
+/// name before the save failed is not removed, and `ended` says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_partial_whose_name_another_file_took_is_reported_replaced() {
+    struct Swap(PathBuf, Fates);
+    impl Hooks for Swap {
+        fn created(&self, _: &File, partial: &OsStr) -> io::Result<()> {
+            std::fs::remove_file(self.0.join(partial))?;
+            std::fs::write(self.0.join(partial), b"another program's")?;
+            Err(io::ErrorKind::PermissionDenied.into())
+        }
+        fn ended(&self, outcome: Result<&Saved, &ChunkError>, partial: PartialFate) {
+            self.1.ended(outcome, partial);
+        }
+    }
+    let to = temp("replaced");
+    let dir = Directory::open(&to).unwrap();
+    let stream = framed(b"x").await;
+    let hooks = Swap(to.clone(), Fates::default());
+    let saved = save_verified(
+        &mut &stream[..],
+        &dir,
+        "a.bin",
+        1,
+        &SaveOptions::default(),
+        &hooks,
+        std::future::pending(),
+    )
+    .await;
+    assert_eq!(
+        saved,
+        Err(ChunkError::Hook(io::ErrorKind::PermissionDenied))
+    );
+    assert_eq!(*hooks.1.0.lock().unwrap(), [PartialFate::Replaced]);
+    assert_eq!(
+        std::fs::read(to.join("a.bin.part")).unwrap(),
+        b"another program's"
+    );
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// A partial file the system refuses to remove is left where it is, and
+/// `ended` is told so with the system's code; the save's own error stands.
+#[tokio::test]
+async fn a_partial_that_cannot_be_removed_is_reported_left_and_is_still_there() {
+    // Access denied, as each system numbers it.
+    let denied = if cfg!(windows) { 5 } else { 13 };
+    let to = temp("left");
+    let dir = Directory::open(&to).unwrap();
+    let bytes = data(1000);
+    let mut stream = framed(&bytes).await;
+    stream[500] ^= 1;
+    let hooks = Fates::default();
+    crate::seams::DISCARD_ERROR.set(Some(denied));
+    let saved = save_verified(
+        &mut &stream[..],
+        &dir,
+        "a.bin",
+        1000,
+        &SaveOptions::default(),
+        &hooks,
+        std::future::pending(),
+    )
+    .await;
+    assert_eq!(crate::seams::DISCARD_ERROR.get(), None, "the removal ran");
+    assert_eq!(saved, Err(ChunkError::Damaged));
+    assert_eq!(
+        *hooks.0.lock().unwrap(),
+        [PartialFate::Left {
+            kind: io::ErrorKind::PermissionDenied,
+            raw: Some(denied),
+        }]
+    );
+    assert_eq!(files_in(&to), ["a.bin.part"]);
+
+    // The same save with nothing in the way: removed, and said so.
+    let hooks = Fates::default();
+    let saved = save_verified(
+        &mut &stream[..],
+        &dir,
+        "b.bin",
+        1000,
+        &SaveOptions::default(),
+        &hooks,
+        std::future::pending(),
+    )
+    .await;
+    assert_eq!(saved, Err(ChunkError::Damaged));
+    assert_eq!(*hooks.0.lock().unwrap(), [PartialFate::Removed]);
+    assert_eq!(files_in(&to), ["a.bin.part"]);
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
 }
 
 /// The mark comes after the hash matched, then the time, then the name.

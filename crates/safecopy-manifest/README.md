@@ -9,20 +9,23 @@ A bounded list of files to send.
   the count is checked before any room is set aside for it.
 - `Sources::list` lists the files and folders a person picked, walking
   folders by handle, and keeps the folders they are in open.
+  `Sources::meta` gives an entry's modified time and execute bit
+  (`safecopy_folder::Meta`) as the listing read them, with no file opened.
   `Sources::open` opens an entry again from those folders without
   following a link, and refuses anything not as it was listed (another
-  file in its place, gone, another size or modified time) with
-  `ManifestError::Changed`, and a file that is no longer a regular file
+  file in its place, gone, another size, modified time or execute bit)
+  with `ManifestError::Changed`, and a file that is no longer a regular file
   with `ManifestError::NotAFile`; `Opened::unchanged` checks again while
   and after it is read.
 - `Sources::list_keeping_out` also refuses anything inside, holding or
   linked into folders the caller keeps out, judged by the identity of all
   they hold and by where the folders really are.
 - `Listing` walks one folder by handle for sending it whole, and says what
-  it skips (links, what cannot be read, what is too deep). `open_entry`
-  opens a listed file again from the held folder and refuses one that grew
-  (`Changed`) or is no longer a regular file (`NotAFile`); an error's `at`
-  is the part of the path that failed.
+  it skips (links, what cannot be read, what is too deep); each entry
+  carries its time and execute bit (`Listed::meta`). `open_entry` opens a
+  listed file again from the held folder and refuses one that grew or
+  whose execute bit changed (`Changed`), or is no longer a regular file
+  (`NotAFile`); an error's `at` is the part of the path that failed.
 
 - `groups` cuts a list into groups, in order, as a pure function of the
   list, so both sides compute the same: a group ends where the parent
@@ -45,9 +48,9 @@ own check on each path, such as its framing's header limit.
 Errors are `ManifestError` kinds; nothing is worded or logged here.
 
 On Windows an online-only file (kept by a cloud service) is listed from
-its metadata and fetched only when opened; one a storage service took
-offline is refused, and so is a source on a network share. Other systems
-have neither.
+its metadata by `Sources`, its time included, and fetched only when
+opened; one a storage service took offline is refused, and so is a source
+on a network share. Other systems have neither.
 
 The encoding is the id, the count, then each entry's path, kind and size,
 as unsigned LEB128 varints and length-prefixed UTF-8: the same bytes as
@@ -74,6 +77,25 @@ original code behaved as below, this crate does not:
 
 ## Changes
 
+- **A file's time and execute bit at listing time.** `Sources::meta(n)`
+  and the new field `Listed::meta` give `safecopy_folder::Meta
+  { modified, executable }` from the metadata the listing already read,
+  with nothing more opened for them. `Sources` lists from metadata alone,
+  so no file is opened for its data and an online-only file is not
+  fetched; a `Listing` opens each entry for reading as it walks, as it
+  did before, and reads the `Meta` from that handle. The
+  execute bit is the owner's on Linux and macOS and never set on Windows,
+  as `Meta::read` has it. A folder has its time and is never executable;
+  `Sources::meta` is `None` for a number the list does not have
+  (`a_list_gives_each_entry_s_time_and_execute_bit_without_opening_it`,
+  `an_online_only_file_s_time_is_given_without_fetching_it`,
+  `a_folder_s_listing_gives_each_entry_s_time_and_execute_bit`).
+- **A changed execute bit alone is `Changed`.** `Sources::open`,
+  `Opened::unchanged` and `Listing::open_entry` refuse a file whose
+  owner's execute bit is no longer the listed one, though its size, time
+  and identity are the same: the other side was told what the listing
+  gave. `open_entry` still does not compare the modified time
+  (`a_source_whose_execute_bit_changed_is_changed`).
 - New: `groups`, `Groups`, `GroupLimits`, `Progress` and `ProgressError`
   (`a_flat_folder_of_10000_entries_is_cut_into_groups_of_at_most_256_entries_or_256_mib`,
   `a_nested_tree_is_cut_where_the_parent_changes_and_small_folders_share_a_group`,
