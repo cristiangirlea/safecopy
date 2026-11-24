@@ -3554,14 +3554,16 @@ fn the_store_leaves_a_file_with_the_inode_and_another_second_identity() {
     use safecopy_journal::Second;
     let side = side("second-other", Limits::default());
     let real = kept_in(&side.store, &side, PEER, key(231), "real", 1, 5);
-    // One generation, or one second, on: the record of a file that is gone.
+    // One generation on, or born a second before: the record of a file
+    // that is gone. Before, since a file born later than its record is
+    // another on every system, and one born earlier is not on all.
     let other = match real.at.second {
         Second::None => {
             eprintln!("skipped: this file system gives a file no second identity");
             return;
         }
         Second::Born { secs, nanos } => Second::Born {
-            secs: secs + 1,
+            secs: secs - 1,
             nanos,
         },
         Second::Generation(n) => Second::Generation(n ^ 1),
