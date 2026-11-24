@@ -852,6 +852,7 @@ fn a_segment_reads_back_what_was_written() {
             inode: 9,
         },
         &settings,
+        crate::log::FORMAT,
     );
     let entries = vec![
         Entry::Group {
@@ -875,6 +876,7 @@ fn a_segment_reads_back_what_was_written() {
                     partial: format!("{p}.jpg.part"),
                     size: 5,
                     file: 100 + u128::from(p),
+                    second: crate::Second::None,
                 })
                 .collect(),
         ),
@@ -884,8 +886,16 @@ fn a_segment_reads_back_what_was_written() {
     ];
     let mut bytes = frame(&state.header());
     for entry in &entries {
-        bytes.extend_from_slice(&frame(&entry.encode()));
-        assert_eq!(Entry::decode(&entry.encode(), &settings).unwrap(), *entry);
+        bytes.extend_from_slice(&frame(&entry.encode(crate::log::FORMAT)));
+        assert_eq!(
+            Entry::decode(
+                &entry.encode(crate::log::FORMAT),
+                &settings,
+                crate::log::FORMAT
+            )
+            .unwrap(),
+            *entry
+        );
     }
     for entry in entries.clone() {
         state.apply(entry).unwrap();
@@ -897,8 +907,12 @@ fn a_segment_reads_back_what_was_written() {
     // An entry that cannot follow stops the reading there: a Done of a
     // place in no open group.
     let mut more = bytes.clone();
-    more.extend_from_slice(&frame(&Entry::Done { place: 40 }.encode()));
-    more.extend_from_slice(&frame(&Entry::Ended { place: 1 }.encode()));
+    more.extend_from_slice(&frame(
+        &Entry::Done { place: 40 }.encode(crate::log::FORMAT),
+    ));
+    more.extend_from_slice(&frame(
+        &Entry::Ended { place: 1 }.encode(crate::log::FORMAT),
+    ));
     assert_eq!(
         read_segment(&more, &settings).unwrap().entries,
         entries.len()
@@ -973,7 +987,7 @@ fn a_folder_numbered_after_its_child_is_refused() {
         device: 1,
         inode: 1,
     };
-    let state = State::new(root, &settings);
+    let state = State::new(root, &settings, crate::log::FORMAT);
     let folder = |n, parent| {
         Entry::Folder(Folder {
             n,
@@ -985,7 +999,7 @@ fn a_folder_numbered_after_its_child_is_refused() {
     };
     let mut bytes = frame(&state.header());
     for entry in [folder(5, 0), folder(1, 5), folder(6, 5)] {
-        bytes.extend_from_slice(&frame(&entry.encode()));
+        bytes.extend_from_slice(&frame(&entry.encode(crate::log::FORMAT)));
     }
     // The child numbered below its parent stops the reading there.
     let read = read_segment(&bytes, &settings).unwrap();
@@ -1000,22 +1014,47 @@ fn a_folder_numbered_after_its_child_is_refused() {
 }
 
 /// Starts and ends the partial of `place` as `NN.txt.part` in `dir`, its
-/// file removed after: a stream cut and come again. Gives the ID the
-/// journal recorded for the file.
-fn churn(dir: &Path, root: &Directory, journal: &Journal, place: u32) -> u128 {
+/// file removed after: a stream cut and come again. Gives the ID and the
+/// second identity the journal recorded for the file.
+fn churn(dir: &Path, root: &Directory, journal: &Journal, place: u32) -> (u128, Second) {
     let name = format!("{place:02}.txt.part");
     drop(partial(root, journal, place, &name, b"data"));
     let live = journal.partials();
-    let id = live.iter().find(|s| s.place == place).unwrap().file;
+    let started = live.iter().find(|s| s.place == place).unwrap();
+    let id = (started.file, started.second);
     journal.ended(place).unwrap();
     std::fs::remove_file(dir.join(&name)).unwrap();
     id
 }
 
-/// How many bytes the log writes `n` in.
-fn written_in(n: u128) -> u64 {
+/// How many bytes the log writes a file's ID and the numbers of its second
+/// identity in: the ones that differ from file to file.
+fn written_in((file, second): (u128, Second)) -> u64 {
+    let numbers = match second {
+        Second::None => vec![file],
+        Second::Born { secs, nanos } => {
+            vec![
+                file,
+                (((secs << 1) ^ (secs >> 63)) as u64).into(),
+                nanos.into(),
+            ]
+        }
+        Second::Generation(n) => vec![file, n.into()],
+        Second::Both {
+            secs,
+            nanos,
+            generation,
+        } => vec![
+            file,
+            (((secs << 1) ^ (secs >> 63)) as u64).into(),
+            nanos.into(),
+            generation.into(),
+        ],
+    };
     let mut bytes = Vec::new();
-    crate::record::varint(&mut bytes, n);
+    for n in numbers {
+        crate::record::varint(&mut bytes, n);
+    }
     bytes.len() as u64
 }
 
@@ -1055,7 +1094,8 @@ fn a_journal_without_groups_starts_its_next_segment_after_roll_every_ends() {
             assert_eq!(now, fresh, "after {p}");
         } else {
             // A start and an end take the same bytes every time, but for
-            // the file's ID: the disk hands out longer and shorter ones.
+            // the file's ID and its second identity: the disk hands out
+            // longer and shorter ones.
             let rest = now - before - written_in(id);
             assert_eq!(*each.get_or_insert(rest), rest, "after {p}");
         }

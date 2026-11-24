@@ -3396,3 +3396,212 @@ async fn an_empty_file_with_a_second_name_under_a_records_name_is_not_written() 
     }
     assert!(side.store.received(PEER, key(227)).is_none());
 }
+
+/// A receiving record's bytes laid out field by field: `kind` is its kind
+/// byte and `second` what follows its partial's place, nothing in a
+/// record of before.
+fn receiving_by_hand(kind: u8, second: &[u8]) -> Vec<u8> {
+    // The record format, and the record's kind.
+    let mut bytes = vec![1, kind];
+    bytes.extend_from_slice(&PEER.0);
+    bytes.extend_from_slice(&key(230).0);
+    // Nothing that must stay the same; 9 bytes declared.
+    bytes.extend_from_slice(&[0, 9]);
+    // A Unix root: its path, its device and its inode.
+    bytes.extend_from_slice(&[1, 3]);
+    bytes.extend_from_slice(b"/in");
+    bytes.push(7);
+    bytes.extend_from_slice(&9u128.to_le_bytes());
+    // No level below it; the partial's name and its inode.
+    bytes.extend_from_slice(&[0, 6]);
+    bytes.extend_from_slice(b"f.part");
+    bytes.extend_from_slice(&11u128.to_le_bytes());
+    bytes.extend_from_slice(second);
+    // 4 bytes kept, their hash, made at 5 and last changed at 6.
+    bytes.push(4);
+    bytes.extend_from_slice(&hash(b"half").0);
+    bytes.extend_from_slice(&[5, 6]);
+    bytes
+}
+
+fn receiving_with(second: safecopy_journal::Second) -> Receiving {
+    use safecopy_journal::{Location, Root};
+    Receiving {
+        peer: PEER,
+        key: key(230),
+        same: Vec::new(),
+        size: 9,
+        at: PartialAt {
+            location: Location {
+                root: Root::Unix {
+                    path: b"/in".to_vec(),
+                    device: 7,
+                    inode: 9,
+                },
+                levels: Vec::new(),
+            },
+            partial: "f.part".into(),
+            file: 11,
+            second,
+        },
+        have: 4,
+        prefix: hash(b"half"),
+        created: 5,
+        last: 6,
+    }
+}
+
+/// Both directions of the record's change, with bytes built by hand: a
+/// record of before reads as before and is still written so, and one with
+/// a second identity is a kind of its own, which a version that knows two
+/// kinds reads as damaged, as this one reads a kind it does not know.
+#[test]
+fn a_receiving_record_holds_a_second_identity_as_a_kind_of_its_own() {
+    use crate::record::Record;
+    use safecopy_journal::Second;
+    let before = receiving_by_hand(0, &[]);
+    let none = receiving_with(Second::None);
+    assert_eq!(Record::decode(&before), Ok(Record::Receiving(none.clone())));
+    assert_eq!(
+        Record::Receiving(none).encode(),
+        before,
+        "not a byte changed"
+    );
+
+    // 3 seconds and 5 nanoseconds before the epoch, zigzagged (-4 is 7);
+    // a generation of 300; both of them.
+    let cases: [(Second, &[u8]); 3] = [
+        (
+            Second::Both {
+                secs: -4,
+                nanos: 999_999_995,
+                generation: 300,
+            },
+            &[3, 7, 0xFB, 0x93, 0xEB, 0xDC, 0x03, 0xAC, 0x02],
+        ),
+        (
+            Second::Born {
+                secs: -4,
+                nanos: 999_999_995,
+            },
+            &[1, 7, 0xFB, 0x93, 0xEB, 0xDC, 0x03],
+        ),
+        (Second::Generation(300), &[2, 0xAC, 0x02]),
+    ];
+    for (second, tail) in cases {
+        let bytes = receiving_by_hand(2, tail);
+        let record = Record::Receiving(receiving_with(second));
+        assert_eq!(Record::decode(&bytes).as_ref(), Ok(&record), "{second:?}");
+        assert_eq!(record.encode(), bytes, "{second:?}");
+        // The kind byte is all a version of before reads of it.
+        assert_eq!(bytes[1], 2);
+        // Read by the rules of the kind of before, it does not end where
+        // a record ends.
+        let mut as_before = bytes.clone();
+        as_before[1] = 0;
+        assert_eq!(Record::decode(&as_before), Err(ResumeError::Damaged));
+    }
+    // A kind no version has; in the new kind, no second identity, one of
+    // no kind, a second of a billion nanoseconds, a generation past 32 bits.
+    assert_eq!(
+        Record::decode(&receiving_by_hand(3, &[])),
+        Err(ResumeError::Damaged)
+    );
+    let bad: [&[u8]; 5] = [
+        &[],
+        &[0],
+        &[4, 1],
+        &[1, 2, 0x80, 0x94, 0xEB, 0xDC, 0x03],
+        &[2, 0x80, 0x80, 0x80, 0x80, 0x10],
+    ];
+    for tail in bad {
+        assert_eq!(
+            Record::decode(&receiving_by_hand(2, tail)),
+            Err(ResumeError::Damaged),
+            "{tail:?}"
+        );
+    }
+}
+
+/// A journal's entry for a partial that is gone and a record of a new
+/// partial with its name and inode are not one partial: the record does
+/// not keep what the entry lists.
+#[test]
+fn two_places_with_second_identities_that_differ_are_not_one_partial() {
+    use safecopy_journal::Second;
+    let born = |secs| Second::Born { secs, nanos: 0 };
+    let at = |second| receiving_with(second).at;
+    let same = crate::store::same_partial;
+    assert!(same(&at(born(1)), &at(born(1))));
+    assert!(!same(&at(born(1)), &at(born(2))));
+    assert!(!same(
+        &at(Second::Generation(1)),
+        &at(Second::Generation(2))
+    ));
+    // One of before, or of another kind, says nothing against it.
+    assert!(same(&at(born(1)), &at(Second::None)));
+    assert!(same(&at(Second::None), &at(Second::Generation(2))));
+    assert!(same(&at(born(1)), &at(Second::Generation(2))));
+}
+
+/// The store finds a kept partial through its record's place: a file under
+/// the name with the recorded inode and another second identity, as a new
+/// file given a removed partial's inode has, is not listed, not reopened
+/// to be cut, and not removed with its record.
+#[cfg(unix)]
+#[test]
+fn the_store_leaves_a_file_with_the_inode_and_another_second_identity() {
+    use safecopy_journal::Second;
+    let side = side("second-other", Limits::default());
+    let real = kept_in(&side.store, &side, PEER, key(231), "real", 1, 5);
+    // One generation on, or born a second before: the record of a file
+    // that is gone. Before, since a file born later than its record is
+    // another on every system, and one born earlier is not on all.
+    let other = match real.at.second {
+        Second::None => {
+            eprintln!("skipped: this file system gives a file no second identity");
+            return;
+        }
+        Second::Born { secs, nanos } => Second::Born {
+            secs: secs - 1,
+            nanos,
+        },
+        Second::Generation(n) => Second::Generation(n ^ 1),
+        Second::Both {
+            secs,
+            nanos,
+            generation,
+        } => Second::Both {
+            secs,
+            nanos,
+            generation: generation ^ 1,
+        },
+    };
+    assert_eq!(keys(&side.store.kept_by(PEER).unwrap()), [key(231)]);
+    // Let go of, so the record below is read from the disk again.
+    side.store.release(PEER, key(231));
+    let stale = Receiving {
+        at: PartialAt {
+            second: other,
+            ..real.at.clone()
+        },
+        ..real.clone()
+    };
+    let path = planted(&side, stale.clone());
+    assert_eq!(side.store.received(PEER, key(231)), Some(stale.clone()));
+    assert!(side.store.kept_by(PEER).unwrap().is_empty());
+    assert!(!side.store.keeps(&real.at), "another partial than the file");
+    assert_eq!(
+        side.store.reopen(PEER, key(231)).map(|_| ()),
+        Err(ResumeError::Gone)
+    );
+    let hour = Duration::from_secs(3600);
+    side.store.expire(5 + 2 * 3600, hour, &[]).unwrap();
+    assert!(!path.exists(), "the record went");
+    let file = side.place.join("real.part");
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().len(),
+        C,
+        "not cut, not removed"
+    );
+}

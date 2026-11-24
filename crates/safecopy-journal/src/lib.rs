@@ -5,8 +5,8 @@
 //! folder, a paste, a session's single files): an append-only log of what
 //! the transfer has done, in short segment files. From the moment each
 //! partial file is created, and before it gets a byte, the journal records
-//! the file's folder, its name, its own ID and the entry it is for, synced
-//! to the disk. A partial kept from an earlier transfer and opened again
+//! the file's folder, its name, its own ID, its second identity where the
+//! system gives one, and the entry it is for, synced to the disk. A partial kept from an earlier transfer and opened again
 //! to continue is recorded the same way, with the bytes it has. For a transfer that goes by groups (`safecopy-manifest`'s
 //! [`groups`](safecopy_manifest::groups)) it also records the groups it
 //! opens and the entries it settles, so its [`Progress`] stays bounded and
@@ -133,6 +133,52 @@
 //!   only: one recorded with another volume's serial number is
 //!   [`Left::Volume`].
 //!
+//! # A second identity
+//!
+//! Unix may give a removed file's inode to the next file made (ext4 does
+//! at once; APFS and btrfs hardly ever). A journal's
+//! entry can outlive its partial (its ending could not be written, an old
+//! segment was left under its name, the person removed the file by hand),
+//! and a new partial of the same name in the same folder can be given the
+//! same inode. By the inode alone, a cleanup in another process would
+//! take that new file, still being written, for the one recorded.
+//!
+//! So a partial is recorded with a second identity where the system and
+//! the file system give one ([`Second`], which says what each gives): its
+//! birth time and its inode's generation, each where it is given. Wherever a recorded partial is
+//! found again, the second identity is compared after the ID:
+//! [`clean_up`], [`PartialAt::remove`], [`PartialAt::reopen`],
+//! [`PartialAt::try_reopen`], [`PartialAt::present`], and the published
+//! file [`recover`] looks for.
+//!
+//! - **Another second identity** under the recorded name and ID is
+//!   another file: [`Left::Replaced`]. It is not opened for writing, cut
+//!   or removed, and its journal ends. On macOS and the BSDs a birth time
+//!   earlier than the one recorded is not another: a file's birth time
+//!   moves back there when its modified time is set to an earlier one,
+//!   as a publish sets it, and a file made since is born later.
+//! - **One that cannot be read now**, where one was recorded (a system or
+//!   a sandbox that no longer answers), shows nothing either way: the
+//!   file is left, [`Left::Io`], and its journal kept for a later cleanup.
+//! - **None recorded** compares nothing more, and the partial is known by
+//!   its ID alone, as before: a journal of before, a file system that
+//!   gives none, Windows.
+//!
+//! What stays of the limit: a file system that gives no second identity,
+//! and, where only a birth time is given, two files made within one step
+//! of the clock a file system stamps its files with (see [`Second`]).
+//!
+//! **Windows on FAT and exFAT.** NTFS and ReFS keep a file ID for the
+//! life of its file. A FAT or exFAT volume makes one from where the
+//! file's entry sits in its folder, and gives it to another file later.
+//! [`Journal::start`] takes such a volume, which has a volume path, and
+//! its partials are recorded. A cleanup finds a recorded folder only by
+//! opening it by its ID, and the FAT driver refuses every open by ID: no
+//! folder is found, and no file there is removed by a cleanup, the one
+//! recorded or another. Where a volume does open a folder by such an ID,
+//! a file under the recorded name with the recorded ID is taken for the
+//! one recorded: Windows reads no second identity.
+//!
 //! # The log
 //!
 //! Each segment starts with a header (the format, its sequence number, the
@@ -148,6 +194,16 @@
 //! already under the next segment's name, the journal leaves it and takes
 //! the number after: the numbers of a journal's segments grow, and need
 //! not follow one another.
+//!
+//! There are two formats, and this version reads both. In format 2 each
+//! started partial, in the snapshot or in an entry, ends with its second
+//! identity; format 1 has none and is otherwise the same. A journal is
+//! written in format 2 on Unix, whether its file system gives a second
+//! identity or not, and in format 1 on Windows, byte for byte as before.
+//! A version that knows only format 1 reads a format 2 segment as one with
+//! no whole header: its cleanup removes the journal and touches no file,
+//! so the partials listed stay on the disk, and its [`recover`] gives
+//! nothing for that journal.
 //!
 //! A journal syncs once per partial started (once for a bundle's, with
 //! [`Journal::started_many`]) and once per mark move; settling and ending
@@ -230,11 +286,12 @@
 //!   compares it, then each level by name relative to the one above with
 //!   no link followed, comparing each; a level renamed, replaced or turned
 //!   into a link stops the walk, and so does one recorded on another device
-//!   than the root's. A partial is removed by its name after its
-//!   inode is compared, so a file swapped in at that moment is not caught.
-//!   Its inode can be reused as soon as a file is deleted, so a file found
-//!   under a published name is only a candidate there, never settled
-//!   ([`Recovered::candidates`]).
+//!   than the root's. A partial is removed by its name after its inode
+//!   and its second identity are compared, so a file swapped in at that
+//!   moment is not caught. Its inode can be reused as soon as a file is
+//!   deleted, and not every file system gives a second identity, so a
+//!   file found under a published name is only a candidate there, never
+//!   settled ([`Recovered::candidates`]).
 //! - Journals in the whole-record format of before ([`Record`], extension
 //!   [`EXTENSION`]) are still read and cleaned up; only Windows wrote them.
 
@@ -255,11 +312,13 @@ pub mod files;
 mod location;
 mod log;
 mod record;
+mod second;
 #[cfg(windows)]
 mod win;
 
 pub use location::{Left, Level, Location, PartialAt};
 pub use log::{Folder, Root, Segment, Started, read_segment};
+pub use second::Second;
 
 use files::Held;
 use log::{Entry, State, frame};
@@ -519,7 +578,7 @@ impl Journal {
     /// `root`. Fails with [`Refusal::NoVolume`] on Windows for a folder on
     /// a network share.
     pub fn start(dir: &Path, root: &Directory, settings: &Settings) -> Result<Self, JournalError> {
-        let state = State::new(location::root_of(root)?, settings);
+        let state = State::new(location::root_of(root)?, settings, written(root));
         let header = frame(&state.header());
         // A process ID is reused: the salt keeps a later journal from taking
         // the name of one kept from before, whose later segments it would read as its own.
@@ -683,6 +742,19 @@ impl Journal {
     }
 }
 
+/// The format a new journal is written in: the second wherever a partial
+/// may have a second identity to record, which is every Unix system. On
+/// Windows none is read, and the format of before says all there is to
+/// say, to a version of before too.
+fn written(root: &Directory) -> u8 {
+    // Nothing is read here but on Windows, where a test acts one out.
+    if cfg!(unix) || Second::of(root.handle()) != Second::None {
+        log::FORMAT_SECOND
+    } else {
+        log::FORMAT
+    }
+}
+
 /// A number unlike any earlier process's: the standard library's hasher
 /// keys come from the system's random source.
 fn salt() -> u64 {
@@ -742,6 +814,7 @@ impl Open {
                     .to_string(),
                 size: start.size,
                 file: id.file,
+                second: Second::of(start.file),
             });
         }
         // Folders are numbered under the same lock as the write, so two
@@ -843,8 +916,9 @@ impl Open {
             let mut settled = 0;
             let mut bytes = Vec::new();
             // The groups opened since, already in the state.
+            let format = log.state.format;
             for entry in &log.pending {
-                bytes.extend_from_slice(&frame(&entry.encode()));
+                bytes.extend_from_slice(&frame(&entry.encode(format)));
             }
             for entry in entries {
                 settled += match &entry {
@@ -852,7 +926,7 @@ impl Open {
                     Entry::DoneMany(places) => places.len(),
                     _ => 0,
                 };
-                bytes.extend_from_slice(&frame(&entry.encode()));
+                bytes.extend_from_slice(&frame(&entry.encode(format)));
                 moved += next.apply(entry)?;
             }
             if log.len + bytes.len() as u64 <= most as u64 {
@@ -1088,7 +1162,9 @@ struct Taken {
 /// removed and its partials left. A journal so lives as long as a partial
 /// it lists is kept: on Unix, where an inode is reused once its file is
 /// deleted, that is as long as it can meet a new partial of the same name
-/// and inode in the same folder, and take it for the one it lists.
+/// and inode in the same folder. It takes that one for the one it lists
+/// only where neither has a second identity to tell them apart
+/// ([`Second`]).
 ///
 /// A journal still open in a running transfer, in this process or another,
 /// is left alone; so is one that cannot be opened, and a link or other
@@ -1269,6 +1345,7 @@ impl Segment {
                     },
                     partial: started.partial.clone(),
                     file: started.file,
+                    second: started.second,
                 })
             })
             .collect()
@@ -1357,9 +1434,7 @@ pub fn recover(dir: &Path, settings: &Settings) -> Result<Vec<Recovered>, Journa
             let Some(dir) = at.and_then(|at| at.location.find().ok()) else {
                 continue;
             };
-            let Some(found) =
-                location::find_published(&dir, &started.name, started.file, started.size, settings)
-            else {
+            let Some(found) = location::find_published(&dir, &started, settings) else {
                 continue;
             };
             if cfg!(windows) {
@@ -1478,6 +1553,13 @@ pub(crate) mod seams {
         pub static CRASH: Cell<Option<Crash>> = unset();
         /// How this thread reads a held folder's present place.
         pub static PLACE: Cell<Place> = unset();
+        /// What every file and folder reports as its second identity on
+        /// this thread, in place of what the system gives: `Some(None)`
+        /// is a system that gives none.
+        pub static SECOND: Cell<Option<crate::Second>> = unset();
+        /// This thread's system moves a file's birth time back with its
+        /// modified time, as macOS does.
+        pub static BIRTH_MOVES_BACK: Cell<bool> = unset();
     }
 
     thread_local! {
@@ -1553,5 +1635,7 @@ pub(crate) mod seams {
 mod log_tests;
 #[cfg(test)]
 mod meet_tests;
+#[cfg(test)]
+mod second_tests;
 #[cfg(test)]
 mod tests;

@@ -14,7 +14,7 @@ use libfuzzer_sys::arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use safecopy::chunks::{CHUNK, Digest};
 use safecopy::folder::FileId;
-use safecopy::journal::{Location, PartialAt, Root};
+use safecopy::journal::{Location, PartialAt, Root, Second};
 use safecopy::resume::handshake::{self, Reply};
 use safecopy::resume::{
     Held, Limits, Next, PeerId, Receiving, Resumable, Sending, Source, Take, TransferKey,
@@ -111,6 +111,7 @@ fn receiving(input: &Checks) -> Receiving {
             },
             partial: "f.part".into(),
             file: 0,
+            second: Second::None,
         },
         have: input.record_have,
         prefix: Digest(input.prefix),

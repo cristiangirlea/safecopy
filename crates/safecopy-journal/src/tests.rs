@@ -1599,7 +1599,11 @@ fn crafted_segment(
 ) -> Vec<u8> {
     use crate::log::{Entry, State, frame};
     let id = folder.identity().unwrap();
-    let state = State::new(location::root_of(root).unwrap(), &settings());
+    let state = State::new(
+        location::root_of(root).unwrap(),
+        &settings(),
+        crate::log::FORMAT,
+    );
     let mut bytes = frame(&state.header());
     for (n, name) in (1u32..).zip(levels) {
         let entry = Entry::Folder(Folder {
@@ -1609,7 +1613,7 @@ fn crafted_segment(
             device: id.volume,
             id: id.file,
         });
-        bytes.extend(frame(&entry.encode()));
+        bytes.extend(frame(&entry.encode(crate::log::FORMAT)));
     }
     let started = Entry::Started(Started {
         place: 0,
@@ -1618,8 +1622,9 @@ fn crafted_segment(
         partial: "a.jpg.part".to_string(),
         size: 4,
         file: identity(file).unwrap().file,
+        second: crate::Second::None,
     });
-    bytes.extend(frame(&started.encode()));
+    bytes.extend(frame(&started.encode(crate::log::FORMAT)));
     bytes
 }
 
@@ -1653,6 +1658,7 @@ fn an_empty_folder_name_that_is_not_the_only_level_is_damaged() {
             partial: "a.jpg.part".to_string(),
             size: 4,
             file: 1,
+            second: crate::Second::None,
         });
         let header = crate::log::frame(&state.header());
         assert_eq!(
@@ -1662,7 +1668,11 @@ fn an_empty_folder_name_that_is_not_the_only_level_is_damaged() {
         );
     }
     // Alone and directly below the root, it reads.
-    let mut alone = crate::log::State::new(location::root_of(&root).unwrap(), &settings());
+    let mut alone = crate::log::State::new(
+        location::root_of(&root).unwrap(),
+        &settings(),
+        crate::log::FORMAT,
+    );
     let level = Folder {
         n: 1,
         parent: 0,
@@ -1678,6 +1688,7 @@ fn an_empty_folder_name_that_is_not_the_only_level_is_damaged() {
         partial: "a.jpg.part".to_string(),
         size: 4,
         file: 1,
+        second: crate::Second::None,
     });
     let read = read_segment(&crate::log::frame(&alone.header()), &settings()).unwrap();
     assert_eq!(read.partials().len(), 1);
@@ -2335,7 +2346,11 @@ type Recorded<'a> = (&'a str, u64, u128);
 /// had, and the partial `file` as `partial` in the last.
 fn older_segment(root: &Directory, levels: &[Recorded<'_>], partial: &str, file: &File) -> Vec<u8> {
     use crate::log::{Entry, State, frame};
-    let state = State::new(location::root_of(root).unwrap(), &settings());
+    let state = State::new(
+        location::root_of(root).unwrap(),
+        &settings(),
+        crate::log::FORMAT,
+    );
     let mut bytes = frame(&state.header());
     for (n, (name, device, id)) in (1u32..).zip(levels) {
         let entry = Entry::Folder(Folder {
@@ -2345,7 +2360,7 @@ fn older_segment(root: &Directory, levels: &[Recorded<'_>], partial: &str, file:
             device: *device,
             id: *id,
         });
-        bytes.extend(frame(&entry.encode()));
+        bytes.extend(frame(&entry.encode(crate::log::FORMAT)));
     }
     let started = Entry::Started(Started {
         place: 0,
@@ -2354,8 +2369,9 @@ fn older_segment(root: &Directory, levels: &[Recorded<'_>], partial: &str, file:
         partial: partial.to_string(),
         size: 4,
         file: identity(file).unwrap().file,
+        second: crate::Second::None,
     });
-    bytes.extend(frame(&started.encode()));
+    bytes.extend(frame(&started.encode(crate::log::FORMAT)));
     bytes
 }
 

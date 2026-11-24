@@ -49,8 +49,10 @@ when they are set lower. A journal past either bound is removed and its
 partials left: cleanup removes only what a journal proves it wrote. On
 Linux and macOS, where an inode is reused once its file is deleted, a
 journal kept longer can meet a new partial of the same name and inode in
-the same folder; run a cleanup after forgetting kept files so such a
-journal does not outlast them. A journal that lists a kept partial now
+the same folder. Where the file system gives a second identity the two
+are told apart (see "A second identity"); where it gives none, run a
+cleanup after forgetting kept files so such a journal does not outlast
+them. A journal that lists a kept partial now
 lives as long as that partial is kept (up to the caller's keep time, and
 512 journals by default) where it went at the next cleanup, so the time
 in which an old journal can meet such a new partial is that much longer.
@@ -85,6 +87,14 @@ root is used (one level each), `Group` when a group opens, `Started` (or
 without being settled. Each entry is framed with its length and a CRC-32C;
 a reader stops at the first one cut short, damaged, or that could not
 follow the ones before it, so a torn append loses only that entry.
+
+There are two formats, named by a byte of the header, and both are read.
+In format 2 each started partial, in the snapshot or in an entry, ends
+with its second identity: a kind byte (0 none, 1 a birth time, 2 a
+generation, 3 both) and that kind's numbers. Format 1 has none and is
+otherwise the same. A journal is written in format 2 on Unix, whether
+its file system gives a second identity or not, and in format 1 on
+Windows, byte for byte as before.
 
 A journal syncs once per `started` or `started_many`, and once per mark
 move: then it writes the next segment's snapshot and syncs it (on Unix
@@ -128,8 +138,9 @@ how long and how many journals cleanup keeps for a later try (30 days,
   above, no link followed, comparing each: a level renamed, replaced or
   turned into a link stops the walk, and so does one recorded on another
   device than the root's. The partial is opened without
-  following a link, its inode compared, and its name removed while it is
-  still that file; a swap in that moment is not caught. A journal is held
+  following a link, its inode and its second identity compared, and its
+  name removed while it is still that file; a swap in that moment is not
+  caught. A journal is held
   by an exclusive `flock`, which other programs see only if they lock.
 
 `files` holds the helpers that create, hold, take and delete such files;
@@ -141,6 +152,71 @@ counted through the open handle: `st_nlink`, or the number of links
 `GetFileInformationByHandle` gives): what it wrote would land in a file
 another name shows. `take`, which only reads and removes the name, takes
 such a file. `refused` tells those refusals from the system's errors.
+
+## A second identity
+
+Unix may give a removed file's inode to the next file made (ext4 does
+at once; APFS and btrfs hardly ever). A journal's
+entry can outlive its partial (its ending could not be written, an old
+segment was left under its name, the person removed the file by hand),
+and a new partial of the same name in the same folder can be given the
+same inode. By the inode alone, a cleanup in another process would take
+that new file, still being written, for the one recorded.
+
+So a partial is recorded with a second identity (`Second`) where the
+system and the file system give one, and it is compared after the ID
+wherever a recorded partial is found again: `clean_up`,
+`PartialAt::remove`, `reopen`, `try_reopen` and `present`, and the
+published file `recover` looks for. What is given, with no privilege,
+and both where both are given:
+
+| System | Second identity |
+| --- | --- |
+| Linux | The birth time from `statx` (kernel 4.11 on): ext4 with inodes of 256 bytes or more, btrfs, f2fs made with inode creation times, and on newer kernels xfs (version 5 inodes) and tmpfs; an overlay reports its upper file system's. And the inode's generation (`FS_IOC_GETVERSION`): ext2, ext3, ext4, xfs, btrfs, f2fs. None: tmpfs on an older kernel, many network and FUSE file systems. |
+| Android | The same; the birth time only through the C library's `statx` (Android 11 on), since the system refuses the call itself to an app before that. A generation only where the system's rules let the app ask. Shared storage behind FUSE gives neither. |
+| macOS, the BSDs | The birth time of `stat` (APFS, HFS+, UFS2, ZFS); one that reads as zero or -1 is none. No generation without the superuser. |
+| Windows | None: NTFS and ReFS keep a file ID for the life of its file. |
+
+The change time is never used: a partial is recorded before its first
+byte, and every write moves its change time. Writing, syncing, cutting
+and renaming move neither a birth time nor a generation.
+
+- **Another second identity** under the recorded name and ID is another
+  file (`Left::Replaced`): it is not opened for writing, cut or removed,
+  and its journal ends. Where both were recorded, either one differing
+  says so.
+- **On macOS and the BSDs a birth time earlier than the one recorded is
+  not another file.** A file's birth time moves back there when its
+  modified time is set to an earlier one, as a publish that carries the
+  sender's time sets it before the file has its name. A file made since
+  is born later, so only a later birth time is another file; a clock set
+  back between the two is not seen.
+- **One that cannot be read now**, where one was recorded, shows nothing
+  either way: the file is left (`Left::Io`) and its journal kept for a
+  later cleanup.
+- **None recorded** compares nothing more: the partial is known by its ID
+  alone, as before.
+
+What stays of the limit:
+
+- A file system that gives neither: there a journal that outlives its
+  partial can still take a new partial of the same name and inode for it.
+- Where only a birth time is given (tmpfs, macOS), it is as fine as the
+  clock the file system stamps files with, a few milliseconds on many
+  Linux kernels: a file removed and another made with its inode within
+  one step of that clock are not told apart. Where a generation is given
+  too it tells them apart, as far as the file system makes one for each
+  file: btrfs numbers generations by transaction, so two files of one
+  transaction share one.
+- **Windows on FAT and exFAT.** Such a volume makes a file ID from where
+  the file's entry sits in its folder, and gives it to another file
+  later. `Journal::start` takes the volume (it has a volume path) and
+  its partials are recorded. A cleanup finds a recorded folder only by
+  opening it by its ID, and the FAT driver refuses every open by ID: no
+  folder is found, and no file there is removed by a cleanup, the one
+  recorded or another. Where a volume does open a folder by such an ID,
+  a file under the recorded name with the recorded ID is taken for the
+  one recorded: Windows reads no second identity.
 
 ## A cleanup beside a running journal
 
@@ -326,6 +402,51 @@ Finding a partial again goes by the same rule (`Location::open`,
 
 ## Changes
 
+- **A partial is known by a second identity too (Unix).** An inode is
+  given to the next file made once its file is removed, so a journal's
+  entry that outlived its partial could meet a new partial of the same
+  name and inode, and a cleanup in another process removed the new file
+  while it was written. A partial is now recorded with its birth time
+  and its inode's generation, each where the system gives it, and they
+  are compared wherever the partial is found again (see "A second
+  identity").
+  - **The API:** `Started` and `PartialAt` have a new field, `second:
+    Second`; code that builds either by its fields names it
+    (`Second::None` compares nothing more). `Second::of(&file)` reads
+    one, `Second::agrees` compares two records, `Segment::format()` says
+    which format a segment has. `try_reopen` gives `Left::Replaced` for
+    a file with the ID and another second identity, and `Left::Io` when
+    the one recorded cannot be read now.
+  - **On disk, a newer version reading older journals:** a segment of
+    format 1 is read as before, its partials with no second identity,
+    known by their IDs alone
+    (`a_segment_of_the_format_of_before_is_read_and_its_partials_known_as_before`).
+  - **On disk, an older version reading newer journals:** a journal
+    on Unix is now written in format 2, where each started partial ends
+    with its second identity. A version of before takes a header
+    for whole only when its format byte is 1: it reads a format 2
+    segment as a journal with no whole header, so its cleanup removes
+    the journal and touches no file, and its `recover` gives nothing
+    for it. The partials listed stay on the disk until the caller
+    removes them. Nothing is misread: no entry of format 2 is ever
+    decoded by format 1's rules (checked with the version before this
+    one, built and run against a journal this one wrote). On Windows
+    the journal is format 1, byte for byte as before, and an older
+    version reads it as it always did.
+  - **Tested** with a seam that makes one file report two second
+    identities, on every system
+    (`a_file_with_the_recorded_inode_and_another_second_identity_is_left`,
+    `a_recorded_second_identity_that_cannot_be_read_now_leaves_the_file_for_later`,
+    `a_file_that_gives_no_second_identity_is_known_as_before`), with
+    segments of both formats built byte by byte, and on Linux with the
+    state itself: a partial removed and files made until one is given
+    its inode
+    (`a_new_partial_given_the_inode_of_one_removed_is_not_taken_for_it`,
+    which says when a file system never gave the inode again and
+    nothing was tested). With `SAFECOPY_REQUIRE_SECOND` set, as CI sets
+    it on Linux, a file that does not give both a birth time and a
+    generation fails
+    `a_file_keeps_its_second_identity_through_what_a_transfer_does_to_it`.
 - **A folder on another file system below the root is refused on Unix,
   as on Windows.** `started`, `started_many` and `PartialAt::of` now
   return `JournalError::OtherVolume` for a folder on a file system

@@ -7,7 +7,8 @@ use std::path::{Component, Path, PathBuf};
 use safecopy_folder::{Directory, FileId, Refusal, identity};
 
 use crate::log::Root;
-use crate::{JournalError, Settings, removable};
+use crate::log::Started;
+use crate::{JournalError, Second, Settings, removable};
 
 /// One folder below the root, on the way to a partial file: its name in
 /// the folder above and its identity. An empty name, in a level directly
@@ -43,7 +44,8 @@ pub struct Location {
     pub levels: Vec<Level>,
 }
 
-/// A partial file's place: its folder, its name there and its own ID.
+/// A partial file's place: its folder, its name there, its own ID and its
+/// second identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PartialAt {
     /// Its folder.
@@ -52,6 +54,11 @@ pub struct PartialAt {
     pub partial: String,
     /// Its own file ID or inode.
     pub file: u128,
+    /// What else it is known by, where the system gives it: a file found
+    /// under the name with the ID and another of these is another file,
+    /// given the inode of the one recorded. [`Second::None`] compares
+    /// nothing more.
+    pub second: Second,
 }
 
 /// Why a recorded folder or partial is not found again, and is left alone.
@@ -478,6 +485,7 @@ impl PartialAt {
                 .ok_or(JournalError::NameNotText)?
                 .to_string(),
             file: id.file,
+            second: Second::of(file),
         })
     }
 
@@ -494,7 +502,8 @@ impl PartialAt {
 
     /// Removes the partial file, only through a handle checked to be it:
     /// its folder found by identity, the name ending in
-    /// [`Settings::partial_ending`], its file ID the recorded one. Windows
+    /// [`Settings::partial_ending`], its file ID the recorded one, and its
+    /// second identity the recorded one where one was. Windows
     /// deletes through that handle; Unix removes the name after checking
     /// it still is that file. Anything else is left.
     pub fn remove(&self, settings: &Settings) -> bool {
@@ -514,6 +523,7 @@ impl PartialAt {
             if id.file != self.file || dir.identity().ok().map(|d| d.volume) != Some(id.volume) {
                 return Err(Left::Replaced);
             }
+            self.second.check(&file)?;
             safecopy_folder::delete_by_handle(&file).map_err(|_| Left::Io)
         }
         #[cfg(unix)]
@@ -526,6 +536,8 @@ impl PartialAt {
             if !meta.is_file() || id.file != self.file || volume != id.volume {
                 return Err(Left::Replaced);
             }
+            // The inode may be a new file's: the one recorded was removed.
+            self.second.check(&file)?;
             dir.discard(&file, name).map_err(|e| left(&e))
         }
     }
@@ -540,7 +552,10 @@ impl PartialAt {
 
     /// [`Self::reopen`], with why it failed: [`Left::Gone`] and
     /// [`Left::Replaced`] say the recorded file is not under its name any
-    /// more; [`Left::Busy`] that it is there and open elsewhere (Windows,
+    /// more (another file there with its ID and another second identity
+    /// is [`Left::Replaced`]; a second identity that cannot be read from
+    /// the file now is [`Left::Io`]);
+    /// [`Left::Busy`] that it is there and open elsewhere (Windows,
     /// where a file being written is not shared for this open); the rest
     /// that nothing is known of it now. [`Left::Name`] is a recorded name
     /// that is not a partial's under `settings`: nothing is opened for it,
@@ -559,17 +574,23 @@ impl PartialAt {
         if id.file != self.file || volume != id.volume {
             return Err(Left::Replaced);
         }
+        // The caller cuts what this opens: never a new file with the inode.
+        self.second.check(&file)?;
         Ok((dir, file))
     }
 
     /// The partial file's length, when it is still under its name: its
     /// folder found as [`Self::reopen`] finds it, the name inspected with
-    /// no link followed, and its identity and volume compared as there.
+    /// no link followed, and its identity, its second identity and its
+    /// volume compared as there.
     /// No byte of it is read, and the handle conflicts with no other, a
     /// transfer writing the file included: Windows opens it for its
     /// attributes alone, sharing everything, and Linux and Android as a
     /// path only; macOS and the BSDs, which have neither, open it for
-    /// reading without waiting, and read nothing. `None` when its name is
+    /// reading without waiting, and read nothing. A partial recorded with
+    /// a generation is opened so on Linux and Android too, once the path
+    /// has shown a regular file with the recorded ID and birth time: a
+    /// path does not answer for a generation. `None` when its name is
     /// not a partial's under `settings` ([`Self::is_partial`], nothing
     /// opened), it is gone, another file has its name, or nothing is
     /// known of it now.
@@ -578,11 +599,26 @@ impl PartialAt {
             return None;
         }
         let dir = self.location.find().ok()?;
-        let file = dir.inspect(OsStr::new(&self.partial)).ok()?;
+        let name = OsStr::new(&self.partial);
+        let file = dir.inspect(name).ok()?;
         let meta = file.metadata().ok()?;
         let id = identity(&file).ok()?;
-        let same = id.file == self.file && dir.identity().ok()?.volume == id.volume;
-        (same && meta.is_file()).then_some(meta.len())
+        let same = id.file == self.file
+            && dir.identity().ok()?.volume == id.volume
+            && meta.is_file()
+            && self.second.check_born(&file).is_ok();
+        if !same {
+            return None;
+        }
+        if self.second.has_generation() {
+            // Looked at first, and a regular file with the ID: only now
+            // opened, since a path answers for no generation.
+            let opened = dir.entry(name).ok()?;
+            if identity(&opened).ok()? != id || self.second.check_generation(&opened).is_err() {
+                return None;
+            }
+        }
+        Some(meta.len())
     }
 }
 
@@ -611,16 +647,16 @@ fn named_as(found: &str, name: &str, settings: &Settings) -> bool {
             || found == format!("{stem} ({n}){ext}"))
 }
 
-/// A published file in `dir` that is the partial `file` named as it
-/// would be published: its ID, a name that is `name` or a numbered form of
-/// it and does not end in the partial ending, and `size` bytes. Its name.
+/// A published file in `dir` that is the partial `started` named as it
+/// would be published: its ID and its second identity, a name that is the
+/// entry's or a numbered form of it and does not end in the partial
+/// ending, and its declared size. Its name.
 pub(crate) fn find_published(
     dir: &Directory,
-    name: &str,
-    file: u128,
-    size: u64,
+    started: &Started,
     settings: &Settings,
 ) -> Option<String> {
+    let (name, file, size) = (started.name.as_str(), started.file, started.size);
     let volume = dir.identity().ok()?.volume;
     let names = dir.names(settings.list_most).ok()?;
     for found in names.into_iter().map_while(Result::ok) {
@@ -634,7 +670,9 @@ pub(crate) fn find_published(
             continue;
         };
         // An ID or an inode is the recorded file's on the folder's volume only.
-        if identity(candidate.file()).is_ok_and(|id| id.file == file && id.volume == volume) {
+        if identity(candidate.file()).is_ok_and(|id| id.file == file && id.volume == volume)
+            && started.second.check(candidate.file()).is_ok()
+        {
             return Some(found.to_string());
         }
     }

@@ -1374,9 +1374,11 @@ impl Drop for Reading<'_> {
 }
 
 /// Whether two places name one partial: the same folder by identity (the
-/// last level's, or the root's), the same name in it and the same file ID,
-/// whatever root each was recorded from.
-fn same_partial(a: &PartialAt, b: &PartialAt) -> bool {
+/// last level's, or the root's), the same name in it, the same file ID
+/// and no two second identities of one kind that differ (a file made
+/// since with the inode of one removed), whatever root each was recorded
+/// from.
+pub(crate) fn same_partial(a: &PartialAt, b: &PartialAt) -> bool {
     let folder = |at: &PartialAt| {
         at.location.levels.last().map_or_else(
             || match &at.location.root {
@@ -1386,7 +1388,10 @@ fn same_partial(a: &PartialAt, b: &PartialAt) -> bool {
             |level| (level.device, level.id),
         )
     };
-    folder(a) == folder(b) && a.partial == b.partial && a.file == b.file
+    folder(a) == folder(b)
+        && a.partial == b.partial
+        && a.file == b.file
+        && a.second.agrees(b.second)
 }
 
 fn root_device(root: &safecopy_journal::Root) -> u64 {
