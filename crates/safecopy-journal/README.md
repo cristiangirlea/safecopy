@@ -276,11 +276,15 @@ be closed then among them. A journal dropped in that moment is closed in
 the program and still locked in the child, so `clean_up` and `recover`
 read it as a running journal's: they remove nothing and report nothing
 for it, and leave it whole. That is safe, as it is for any running
-journal: no partial is removed and no record is lost, and the next call
-after the child has started finds the journal let go
+journal: no partial is removed and no record is lost, and a call after
+the child has become its own program finds the journal let go
 (`a_journal_let_go_while_a_child_starts_is_left_for_the_next_cleanup`,
-which holds a child between the two steps). A caller that needs the
-journal at once, to continue its transfer, calls again. A child that
+which holds a child between the two steps). That is a moment after the
+start is back in the program: the system closes the child's copies as
+the last step of the change, and Linux hands the start back before it
+(a file let go of right after a start still read as held in 7 of 5000
+starts). A caller that needs the journal at once, to continue its
+transfer, calls again. A child that
 never becomes another program (a fork that goes on as the same one) keeps
 its copies, and the journals with them, until it closes them or ends.
 Windows gives a child no handle of a journal.
@@ -402,6 +406,19 @@ Finding a partial again goes by the same rule (`Location::open`,
 
 ## Changes
 
+- **The tests' child processes close their copies themselves (Unix).**
+  Nothing in the crate changed. A test kept children from starting
+  while it ran, and a start is back before the system has closed the
+  child's copies of the test's files (see "A cleanup beside a running
+  journal"), so a file let go of right after one could still read as
+  held. A child the tests start now closes every file and folder it was
+  given, above the three standard ones, before it becomes its own
+  program, and says so through a pipe the start waits on
+  (`a_started_child_holds_no_file_of_this_process`). Pipes and sockets
+  stay open: a start that fails is heard through one
+  (`a_program_that_is_not_there_is_not_started`). Linux and Android
+  read the open ones from `/proc/self/fd`; the other Unix systems try
+  every number below the limit on open files, 2^20 at most.
 - **A partial is known by a second identity too (Unix).** An inode is
   given to the next file made once its file is removed, so a journal's
   entry that outlived its partial could meet a new partial of the same

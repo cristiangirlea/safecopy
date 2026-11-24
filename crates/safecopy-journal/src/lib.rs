@@ -258,8 +258,11 @@
 //!   still locked there. [`clean_up`] and [`recover`] then read it as a
 //!   running journal's: they remove nothing and report nothing for it,
 //!   and leave it whole. That is safe, as it is for any running journal:
-//!   no partial is removed and no record is lost, and the next call
-//!   after the child has started finds the journal let go. A caller that
+//!   no partial is removed and no record is lost, and a call after the
+//!   child has become its own program finds the journal let go. That is
+//!   a moment after the start is back in the program: the system closes
+//!   the child's copies as the last step of the change, and Linux hands
+//!   the start back before it (seen in 7 of 5000 starts). A caller that
 //!   needs it at once, to continue its transfer, calls again. A child
 //!   that never becomes another program (a fork that goes on as the same
 //!   one) keeps its copies, and the journals with them, until it closes

@@ -683,25 +683,246 @@ fn a_file_given_a_second_name_while_it_is_being_held_is_not_held() {
 use std::fs::File;
 use std::process::Command;
 
-/// The test binary run again as another process, in `role`.
-fn child(role: &str, place: &Path, journal_dir: &Path) -> String {
-    use std::process::Stdio;
+/// What a child does with its copies of this process's files before it
+/// becomes its own program. A start is back before the system has closed
+/// them: a file let go of here just after would still read as held.
+#[cfg(unix)]
+mod let_go {
+    use std::io;
+    use std::mem::MaybeUninit;
+    use std::os::fd::{AsRawFd, RawFd};
+
+    /// The step for `pre_exec`: closes this process's files and folders
+    /// in the child, then writes one byte to `tell`. System calls and
+    /// memory of its own stack only: nothing else is allowed there.
+    pub(super) fn step(
+        tell: io::PipeWriter,
+    ) -> io::Result<impl FnMut() -> io::Result<()> + Send + Sync + 'static> {
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let end = end()?;
+        Ok(move || {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            close_listed()?;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            for fd in 3..end {
+                close_if_file(fd)?;
+            }
+            told(tell.as_raw_fd())
+        })
+    }
+
+    fn last<T>() -> io::Result<T> {
+        Err(io::Error::last_os_error())
+    }
+
+    /// Closes `fd` if it is a file or a folder. A pipe or a socket stays:
+    /// a start that fails is heard through one.
+    fn close_if_file(fd: RawFd) -> io::Result<bool> {
+        let mut stat = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `fstat` writes one `stat` into the memory it is given.
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                // Not open: nothing to close.
+                Some(libc::EBADF) => return Ok(false),
+                // Only a file or a folder has a number too wide to tell.
+                Some(libc::EOVERFLOW) => {}
+                _ => return Err(error),
+            }
+        } else {
+            // SAFETY: `fstat` returned 0, so the `stat` is filled.
+            let kind = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
+            if kind != libc::S_IFREG && kind != libc::S_IFDIR {
+                return Ok(false);
+            }
+        }
+        // SAFETY: the descriptor is this child's own copy, used by nothing after.
+        if unsafe { libc::close(fd) } != 0 {
+            let error = io::Error::last_os_error();
+            // Interrupted, the descriptor is closed all the same.
+            if error.raw_os_error() != Some(libc::EINTR) {
+                return Err(error);
+            }
+        }
+        Ok(true)
+    }
+
+    /// One byte to the pipe: the next system call after the closes, so
+    /// they are done in full when it is read.
+    fn told(tell: RawFd) -> io::Result<()> {
+        loop {
+            // SAFETY: one byte is read from memory that holds one.
+            match unsafe { libc::write(tell, [1u8].as_ptr().cast(), 1) } {
+                1 => return Ok(()),
+                0 => return Err(io::ErrorKind::WriteZero.into()),
+                _ => {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EINTR) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Closes every file and folder the system lists as open here, above
+    /// the three standard ones.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn close_listed() -> io::Result<()> {
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        // SAFETY: the path is text that ends in a zero byte.
+        let list = unsafe { libc::open(c"/proc/self/fd".as_ptr(), flags) };
+        if list < 0 {
+            return last();
+        }
+        let done = close_in(list);
+        // The list is a folder too, and is closed last.
+        // SAFETY: the descriptor was opened above and is used by nothing after.
+        if unsafe { libc::close(list) } != 0 && done.is_ok() {
+            return last();
+        }
+        done
+    }
+
+    /// Reads the list until one reading of it closes nothing: whatever
+    /// order the system lists in, none is passed over.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn close_in(list: RawFd) -> io::Result<()> {
+        // An entry: eight bytes of number, eight of position, two of its
+        // length, one of kind, then the name and a zero byte.
+        const NAME: usize = 19;
+        let mut entries = [0u8; 2048];
+        loop {
+            let mut closed = false;
+            loop {
+                // SAFETY: at most the array's length is written into it.
+                let read = unsafe {
+                    libc::syscall(
+                        libc::SYS_getdents64,
+                        list,
+                        entries.as_mut_ptr(),
+                        entries.len(),
+                    )
+                };
+                let Ok(read) = usize::try_from(read) else {
+                    return last();
+                };
+                let Some(mut rest) = entries.get(..read).filter(|read| !read.is_empty()) else {
+                    break;
+                };
+                while !rest.is_empty() {
+                    let length = match rest.get(16..18) {
+                        Some(&[low, high]) => usize::from(u16::from_ne_bytes([low, high])),
+                        _ => return Err(io::ErrorKind::InvalidData.into()),
+                    };
+                    let (Some(entry), Some(after)) = (rest.get(NAME..length), rest.get(length..))
+                    else {
+                        return Err(io::ErrorKind::InvalidData.into());
+                    };
+                    rest = after;
+                    if let Some(fd) = number(entry)
+                        && fd > 2
+                        && fd != list
+                        && close_if_file(fd)?
+                    {
+                        closed = true;
+                    }
+                }
+            }
+            if !closed {
+                return Ok(());
+            }
+            // SAFETY: the descriptor is the open list.
+            if unsafe { libc::lseek(list, 0, libc::SEEK_SET) } != 0 {
+                return last();
+            }
+        }
+    }
+
+    /// The descriptor a name of digits stands for; `.` and `..` are none.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn number(name: &[u8]) -> Option<RawFd> {
+        let digits = name.split(|byte| *byte == 0).next()?;
+        if digits.is_empty() {
+            return None;
+        }
+        digits.iter().try_fold(0, |fd: RawFd, digit| {
+            let digit = digit.checked_sub(b'0').filter(|digit| *digit < 10)?;
+            fd.checked_mul(10)?.checked_add(digit.into())
+        })
+    }
+
+    /// Where no list of open descriptors is read without memory of the
+    /// heap, every number below the limit on open files is tried, read
+    /// before the fork, and none from here on.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const END: RawFd = 1 << 20;
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn end() -> io::Result<RawFd> {
+        let mut limit = MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: `getrlimit` writes one `rlimit` into the memory it is given.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+            return last();
+        }
+        // SAFETY: `getrlimit` returned 0, so the `rlimit` is filled.
+        let open = unsafe { limit.assume_init() }.rlim_cur;
+        Ok(RawFd::try_from(open).map_or(END, |open| open.min(END)))
+    }
+}
+
+/// Starts `command` as a child, the only test running meanwhile. Back
+/// from here the child holds no file or folder of this process: on Unix
+/// it closed its copies and said so before becoming its own program.
+#[cfg(unix)]
+fn start(mut command: Command, _alone: &Alone) -> io::Result<std::process::Child> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    let (mut told, tell) = io::pipe()?;
+    let step = let_go::step(tell)?;
+    // SAFETY: the step makes system calls only and takes no memory, which
+    // is what a child may do between the fork and the exec.
+    unsafe { command.pre_exec(step) };
+    let mut child = command.spawn()?;
+    // This process's end of the pipe goes with the command, so the read
+    // ends: with the child's byte, or with the pipe.
+    drop(command);
+    if let Err(untold) = told.read_exact(&mut [0]) {
+        // A child that ended before its byte is not left behind.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(untold);
+    }
+    Ok(child)
+}
+
+/// Windows gives a child no handle of this process's files.
+#[cfg(not(unix))]
+fn start(mut command: Command, _alone: &Alone) -> io::Result<std::process::Child> {
+    command.spawn()
+}
+
+/// The test binary to run again as another process, in `role`.
+fn as_role(role: &str) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .args(["tests::as_child", "--exact", "--ignored", "--nocapture"])
         .args(["--test-threads", "1"])
-        .env("SAFECOPY_JOURNAL_CHILD", role)
+        .env("SAFECOPY_JOURNAL_CHILD", role);
+    command
+}
+
+/// The test binary run again as another process, in `role`.
+fn child(role: &str, place: &Path, journal_dir: &Path) -> String {
+    use std::process::Stdio;
+    let mut command = as_role(role);
+    command
         .env("SAFECOPY_JOURNAL_PLACE", place)
         .env("SAFECOPY_JOURNAL_DIR", journal_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let started = {
-        // Back from the start, the child is its own program and holds
-        // none of this process's files.
-        let _alone = Alone::take();
-        command.spawn().unwrap()
-    };
+    let started = start(command, &Alone::take()).unwrap();
     let output = started.wait_with_output().unwrap();
     let out = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
@@ -712,6 +933,59 @@ fn child(role: &str, place: &Path, journal_dir: &Path) -> String {
     out
 }
 
+/// A file locked here and not marked to be closed in a child stays the
+/// child's for as long as it runs, unless the child closes it before it
+/// becomes its own program: then the file is free once the start is back.
+#[cfg(unix)]
+#[test]
+fn a_started_child_holds_no_file_of_this_process() {
+    use std::os::fd::AsRawFd;
+    use std::process::Stdio;
+    let (_scratch, place, _) = scratch("child-holds-none");
+    let path = place.join("held");
+    let mut command = as_role("wait");
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // No other test starts a child that would be given the file for good.
+    let alone = Alone::take();
+    // More open ones than one reading of the list gives, below the two held.
+    let many: Vec<File> = (0..100).map(|_| File::open(&place).unwrap()).collect();
+    let file = File::create(&path).unwrap();
+    file.lock().unwrap();
+    let folder = File::open(&place).unwrap();
+    folder.lock().unwrap();
+    for kept in [&file, &folder] {
+        // SAFETY: the flags of an open descriptor are read and set.
+        let cleared = unsafe {
+            let flags = libc::fcntl(kept.as_raw_fd(), libc::F_GETFD);
+            assert!(flags >= 0);
+            libc::fcntl(kept.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC)
+        };
+        assert_eq!(cleared, 0);
+    }
+    let mut running = start(command, &alone).unwrap();
+    drop((file, folder, many));
+    let free = [&path, &place].map(|held| File::open(held).unwrap().try_lock().is_ok());
+    // The child runs until its input ends: it was there to hold them.
+    assert!(running.try_wait().unwrap().is_none());
+    drop(running.stdin.take());
+    assert!(running.wait().unwrap().success());
+    drop(alone);
+    assert_eq!(free, [true, true], "the file, the folder");
+}
+
+/// The child keeps the pipe a failed start is told through: a program
+/// that is not there is not taken for started.
+#[test]
+fn a_program_that_is_not_there_is_not_started() {
+    let (scratch, _, _) = scratch("child-none");
+    let command = Command::new(scratch.path().join("no-such-program"));
+    let failed = start(command, &Alone::take()).unwrap_err();
+    assert_eq!(failed.kind(), io::ErrorKind::NotFound);
+}
+
 /// What another process does: started by [`child`], skipped otherwise.
 #[test]
 #[ignore = "run by other tests as a second process"]
@@ -719,6 +993,11 @@ fn as_child() {
     let Some(role) = std::env::var_os("SAFECOPY_JOURNAL_CHILD") else {
         return;
     };
+    if role == "wait" {
+        // Runs until its starter closes its input.
+        std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).unwrap();
+        return;
+    }
     let place = PathBuf::from(std::env::var_os("SAFECOPY_JOURNAL_PLACE").unwrap());
     let journal_dir = PathBuf::from(std::env::var_os("SAFECOPY_JOURNAL_DIR").unwrap());
     match role.to_str().unwrap() {
