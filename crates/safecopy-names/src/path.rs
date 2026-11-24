@@ -103,8 +103,8 @@ impl std::error::Error for PathError {}
 /// (`..`), start at a drive or its top (`C:`, `\`), name a stream (`:`) or
 /// a device (`CON`); the path is neither deeper nor longer than `rules`
 /// allow. Each part is made safe as [`safe_name`](crate::safe_name) makes a
-/// name, cut to both of its limits, except that a device name is refused
-/// rather than renamed.
+/// name, cut to both of its limits with its extension kept, except that a
+/// device name is refused rather than renamed.
 pub fn check_path(name: &str, rules: &PathRules) -> Result<EntryPath, PathError> {
     if name.chars().count() > rules.max_chars {
         return Err(PathError::TooLong {
@@ -265,6 +265,8 @@ mod tests {
         ] {
             let safe = crate::safe_name(&name, &names).unwrap();
             assert!(safe.len() <= 200 && safe != name, "{name}");
+            // The extension is kept in a part as in a name.
+            assert!(safe.ends_with(&name[name.len() - 4..]), "{safe}");
             // As a folder on the way, as the last folder and as a file.
             for path in [
                 format!("{name}/b.txt"),
@@ -282,6 +284,11 @@ mod tests {
         // 200 units and 202 bytes: the cut drops "文", the trim the spaces.
         let cut_to_device = format!("a/NUL{}文/b.txt", " ".repeat(196));
         assert_eq!(check(&cut_to_device), Err(PathError::Reserved));
+        // So is one the cut leaves a device name with its extension.
+        let cut_to_device = format!("a/NUL{}x.txt", " ".repeat(197));
+        assert_eq!(check(&cut_to_device), Err(PathError::Reserved));
+        let long = check(&format!("a/{}.txt", "x".repeat(250))).unwrap();
+        assert_eq!(long.parts[1], format!("{}.txt", "x".repeat(196)));
         // The limits are the path's own names' limits.
         let rules = PathRules::default().with_names(names.with_max_bytes(6));
         assert_eq!(

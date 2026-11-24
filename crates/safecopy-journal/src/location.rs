@@ -623,5 +623,33 @@ mod tests {
             assert!(!named_as(&format!("{stem} (02){ext}"), &name, &settings));
             assert!(!named_as(&format!("{stem}x (2){ext}"), &name, &settings));
         }
+        // The name is the one the journal was given, cut or not: a name an
+        // older version cut at its end, extension and all, and the one cut
+        // now with its extension kept are found alike, each with its number.
+        for name in [
+            "x".repeat(200),
+            format!("{}.txt", "x".repeat(196)),
+            "文".repeat(66),
+            format!("{}.pdf", "文".repeat(65)),
+        ] {
+            let (stem, ext) = safecopy_names::stem_and_ext(&name);
+            assert!(named_as(&name, &name, &settings));
+            assert!(named_as(&format!("{stem} (3){ext}"), &name, &settings));
+            let cut = safecopy_names::numbered(&name, 3, &settings.names).unwrap();
+            assert!(cut.ends_with(&format!(" (3){ext}")), "{cut}");
+            assert!(named_as(&cut, &name, &settings), "{cut}");
+        }
+        // One version's cut of a name is not the other's: another file.
+        let (older, newer) = ("x".repeat(200), format!("{}.txt", "x".repeat(196)));
+        assert!(!named_as(&older, &newer, &settings));
+        assert!(!named_as(&newer, &older, &settings));
+        // A number an older version put before a dot and 19 characters,
+        // cutting the stem: found by rules that keep so long an extension.
+        let name = format!("{}.{}", "x".repeat(180), "y".repeat(19));
+        let before = format!("{} (2).{}", "x".repeat(176), "y".repeat(19));
+        assert!(!named_as(&before, &name, &settings));
+        let mut keeps_any = Settings::default();
+        keeps_any.names = keeps_any.names.with_max_extension(usize::MAX);
+        assert!(named_as(&before, &name, &keeps_any));
     }
 }

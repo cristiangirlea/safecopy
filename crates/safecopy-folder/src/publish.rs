@@ -786,6 +786,9 @@ pub(crate) mod tests {
             let safe = safecopy_names::safe_name(&name, &rules).unwrap();
             let numbered = candidates(&safe).nth(rules.max_number - 1).unwrap();
             assert!(numbered.contains(" (10001)"), "{numbered}");
+            // The cut kept the extension, and the number stands before it.
+            let ext = safecopy_names::stem_and_ext(&name).1;
+            assert!(numbered.ends_with(&format!(" (10001){ext}")), "{numbered}");
             let partial = part(Path::new(&numbered));
             let partial = partial.to_str().unwrap();
             assert!(partial.len() <= 255, "{partial}");

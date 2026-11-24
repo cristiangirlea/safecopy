@@ -77,6 +77,12 @@ original code behaved as below, this crate does not:
 
 ## Changes
 
+- **Nothing changes for a name cut with its extension kept.**
+  `safecopy-names` now cuts a long name in its stem, so the longest safe
+  name may end in an extension. `unique` and `publish` cut nothing and
+  put the number before it, and the numbered name with `.part` is still
+  within the 255 a system holds
+  (`a_numbered_partial_of_the_longest_safe_name_fits_a_system_s_limit`).
 - **The copy into a name reads at its own offsets.** Where a disk has
   neither hard links nor renames, `publish` copies the open file into
   its name; it did so through the file's position, set to the start
