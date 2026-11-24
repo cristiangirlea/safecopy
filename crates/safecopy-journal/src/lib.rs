@@ -93,6 +93,46 @@
 //! name and ID are checked as ever, and a file of the same name where the
 //! folder used to be is another file in another folder: it is left.
 //!
+//! # A folder on another file system
+//!
+//! Every partial of a journal is on the root's own volume or device, on
+//! every system. [`Journal::started`], [`Journal::started_many`] and
+//! [`PartialAt::of`] refuse with [`JournalError::OtherVolume`] a folder
+//! that is on another one, and a folder reached through one that is:
+//! another volume on Windows, a file system mounted below the root on
+//! Unix. A partial is found again by its file ID or its inode, which names
+//! a file on one volume or device only. A caller that writes below such a
+//! folder starts a journal whose root is on that file system.
+//!
+//! The device is the one the system reports for the open folder (`st_dev`
+//! on Unix, the volume's serial number on Windows), compared with the
+//! root's at each level of the walk down from it. Nothing else is asked,
+//! so what counts as another file system is the system's answer: a folder
+//! of the root's own file system bound to a second place below the root
+//! reports the root's device where a bind mount keeps it (Linux does) and
+//! is taken; a btrfs subvolume reports a device number of its own and is
+//! refused like any mount, as is an overlay, a network or a memory file
+//! system mounted below the root; a way that leaves the root's device and
+//! comes back to it is refused at the level that leaves.
+//!
+//! Finding a partial again goes by the same rule ([`Location::open`],
+//! [`PartialAt::reopen`], [`PartialAt::try_reopen`],
+//! [`PartialAt::present`], [`PartialAt::remove`], [`clean_up`] and
+//! [`recover`]):
+//!
+//! - **A recorded level on another device than the root's** stops the
+//!   walk before anything is opened at it: [`Left::Volume`]. Only a
+//!   journal written on Unix before this rule holds one, or a damaged one. Its partial is
+//!   never opened or removed: nothing crosses the boundary. Cleanup counts
+//!   it as left, and since no later cleanup would find it either, the
+//!   entry keeps no journal: the partial file stays where it is.
+//! - **A file system mounted since over a recorded folder** puts another
+//!   device and inode under the folder's name: [`Left::Replaced`], as for
+//!   any folder put in its place. The partial below the mount is left.
+//! - **Windows** opens a recorded folder by its ID on the root's volume
+//!   only: one recorded with another volume's serial number is
+//!   [`Left::Volume`].
+//!
 //! # The log
 //!
 //! Each segment starts with a header (the format, its sequence number, the
@@ -189,7 +229,8 @@
 //!   below it by name with its device and inode. Cleanup opens the root,
 //!   compares it, then each level by name relative to the one above with
 //!   no link followed, comparing each; a level renamed, replaced or turned
-//!   into a link stops the walk. A partial is removed by its name after its
+//!   into a link stops the walk, and so does one recorded on another device
+//!   than the root's. A partial is removed by its name after its
 //!   inode is compared, so a file swapped in at that moment is not caught.
 //!   Its inode can be reused as soon as a file is deleted, so a file found
 //!   under a published name is only a candidate there, never settled
@@ -315,8 +356,10 @@ pub enum JournalError {
     /// The bytes are not a record or a segment: cut short, a number or
     /// text that does not read, or bytes after the end.
     Damaged,
-    /// The partial file, or its folder, is not on the volume the journal
-    /// records: its file ID would mean another file there.
+    /// The partial file, its folder, or a folder on the way to it from
+    /// the root, is not on the root's volume or device as the system
+    /// reports it (a disk or a file system mounted below the root): its
+    /// file ID or inode would mean another file there. On every system.
     OtherVolume,
     /// The folder is not below the journal's root: by the path it was
     /// opened at, or by where it is now.
@@ -545,7 +588,9 @@ impl Journal {
     /// cleanup then knows it too. `dir` must be
     /// `root` or a folder opened below it by name; one renamed or moved
     /// since, and still below `root`, is recorded where it is now (see the
-    /// [crate] docs).
+    /// [crate] docs). One on another volume or device than `root`'s, or
+    /// reached through a folder that is, is refused with
+    /// [`JournalError::OtherVolume`], on every system.
     pub fn started(
         &self,
         place: u32,
@@ -1424,6 +1469,9 @@ pub(crate) mod seams {
         pub static DIR_SYNCS: Cell<u32> = unset();
         /// The journal's root acted out as on another volume (Windows).
         pub static OTHER_VOLUME: Cell<bool> = unset();
+        /// A folder, by its file ID or inode, acted out as a mount point:
+        /// the walks read it as on this device.
+        pub static OTHER_DEVICE: Cell<Option<(u128, u64)>> = unset();
         /// The next segment of this thread's journal fails to begin, once.
         pub static FAIL_ROLL: Cell<bool> = unset();
         /// A crash to act out at the next segment.

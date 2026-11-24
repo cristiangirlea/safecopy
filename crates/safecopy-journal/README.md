@@ -126,7 +126,8 @@ how long and how many journals cleanup keeps for a later try (30 days,
   and each folder below it by name with its device and inode. Cleanup opens
   the root and compares it, then each level by name relative to the one
   above, no link followed, comparing each: a level renamed, replaced or
-  turned into a link stops the walk. The partial is opened without
+  turned into a link stops the walk, and so does one recorded on another
+  device than the root's. The partial is opened without
   following a link, its inode compared, and its name removed while it is
   still that file; a swap in that moment is not caught. A journal is held
   by an exclusive `flock`, which other programs see only if they lock.
@@ -229,11 +230,8 @@ below the root's path is judged the same way, by where it really is:
 recorded under its real names when that is below the root, refused with
 `NotBelow` when the link leads outside.
 
-A folder on another volume than the root's is refused on Windows
-(`OtherVolume`), where a file ID means a file on one volume only. Unix
-does not check it today: a folder on a disk mounted below the root is
-walked and recorded like any other, each level with its own device, and
-cleanup finds it again by those names and devices.
+A folder on another volume or device than the root's is refused on every
+system (`OtherVolume`): see [A folder on another file system](#a-folder-on-another-file-system).
 
 What the journal does when it does not read where a held folder is now
 depends on why:
@@ -281,8 +279,73 @@ After a crash, cleanup:
   name where the folder used to be is left: it is another file, in
   another folder.
 
+## A folder on another file system
+
+Every partial of a journal is on the root's own volume or device, on
+every system. `started`, `started_many` and `PartialAt::of` refuse with
+`JournalError::OtherVolume` a folder that is on another one, and a folder
+reached through one that is: another volume on Windows, a file system
+mounted below the root on Unix. A partial is found again by its file ID
+or its inode, which names a file on one volume or device only. A caller
+that writes below such a folder starts a journal whose root is on that
+file system.
+
+The device is the one the system reports for the open folder (`st_dev`
+on Unix, the volume's serial number on Windows), compared with the
+root's at each level of the walk down from it. Nothing else is asked, so
+what counts as another file system is the system's answer:
+
+- a folder of the root's own file system bound to a second place below
+  the root reports the root's device where a bind mount keeps it (Linux
+  does) and is taken;
+- a btrfs subvolume reports a device number of its own, and is refused
+  like any mount; so is an overlay, a network or a memory file system
+  mounted below the root;
+- a way that leaves the root's device and comes back to it (the root's
+  file system bound inside another mount) is refused at the level that
+  leaves.
+
+Finding a partial again goes by the same rule (`Location::open`,
+`PartialAt::reopen`, `try_reopen`, `present` and `remove`, cleanup and
+`recover`):
+
+- **A recorded level on another device than the root's** stops the walk
+  before anything is opened at it: `Left::Volume`. Only a journal
+  written on Unix before this rule holds one, or a damaged one. `reopen` and `present`
+  give `None`, `remove` removes nothing, and cleanup counts the partial
+  as left and never removes it: nothing crosses the boundary. No later
+  cleanup would find it either, so the entry keeps no journal: the
+  journal goes once its other partials are done, and the partial file
+  stays where it is.
+- **A file system mounted since over a recorded folder** puts another
+  device and inode under the folder's name: `Left::Replaced`, as for any
+  folder put in its place. The partial below the mount is left.
+- **Windows** opens a recorded folder by its ID on the root's volume
+  only: one recorded with another volume's serial number is
+  `Left::Volume`.
+
 ## Changes
 
+- **A folder on another file system below the root is refused on Unix,
+  as on Windows.** `started`, `started_many` and `PartialAt::of` now
+  return `JournalError::OtherVolume` for a folder on a file system
+  mounted below the journal's root, and for one reached through such a
+  folder; the device is compared at every level of the walk
+  (`a_folder_on_or_below_another_device_is_refused`, and with a real
+  mount `a_folder_on_a_file_system_mounted_below_the_root_is_refused`).
+  Before, Unix walked the mount and recorded what it found, and a
+  cleanup removed that partial on the other file system. A caller whose
+  transfer wrote below a mount under one journal sees `OtherVolume`
+  from `started` there now, the error it already handles on Windows,
+  and starts a journal with its root on that file system; so does one
+  that makes a `safecopy-resume` record's place with `PartialAt::of`. A
+  journal an older version left with such an entry is still read: the
+  partial is never opened or removed (`Left::Volume`), counts as left,
+  and keeps no journal
+  (`an_older_record_below_another_device_is_left_and_never_found`).
+  Nothing in a segment's bytes changes. The mount test runs where the
+  process may mount (Linux, as root or with the capability), and is
+  skipped elsewhere unless `SAFECOPY_REQUIRE_MOUNT` is set.
 - **Names cut with their extension kept need nothing new here.**
   `safecopy-names` now cuts a long name in its stem and keeps the
   extension. Recovery looks for the name the journal was given, cut by
@@ -542,10 +605,11 @@ original code behaved as below, this crate does not:
   a pipe included. It now opens only `\\?\Volume{GUID}\` and leaves the
   partials of any other
   (`a_recorded_volume_that_is_not_a_volume_guid_path_is_never_opened`).
-- On Windows a partial, or its folder, on another volume than the
-  journal's is refused with `JournalError::OtherVolume`; a partial on
-  another volume than its own folder's is refused on every system
-  (`a_partial_on_another_volume_than_the_journal_s_is_refused`).
+- A partial, or its folder, on another volume or device than the
+  journal's root is refused with `JournalError::OtherVolume`, and so is
+  a partial on another one than its own folder's, on every system
+  (`a_partial_on_another_volume_than_the_journal_s_is_refused`,
+  `a_folder_on_or_below_another_device_is_refused`).
 - A panic in another thread while it held the journal made every later
   call panic too; the journal now carries on
   (`a_panic_while_the_journal_is_held_does_not_stop_it`).
