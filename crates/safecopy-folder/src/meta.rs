@@ -76,7 +76,13 @@ pub struct Meta {
 impl Meta {
     /// What `file` says of itself, read through its handle.
     pub fn read(file: &File) -> io::Result<Self> {
-        let meta = file.metadata()?;
+        Ok(Self::of(&file.metadata()?))
+    }
+
+    /// What metadata already read says, as [`Self::read`] would: for a
+    /// caller that holds it from a listing, so nothing is read twice and
+    /// no file is opened for it.
+    pub fn of(meta: &std::fs::Metadata) -> Self {
         let modified = meta.modified().ok().and_then(Time::from_system);
         #[cfg(unix)]
         let executable = {
@@ -85,10 +91,10 @@ impl Meta {
         };
         #[cfg(not(unix))]
         let executable = false;
-        Ok(Self {
+        Self {
             modified,
             executable,
-        })
+        }
     }
 }
 

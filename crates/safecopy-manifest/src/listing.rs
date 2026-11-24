@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use safecopy_folder::{Directory, is_link, refusal};
+use safecopy_folder::{Directory, Meta, is_link, refusal};
 
 use crate::sources::unreadable;
 use crate::{Limits, ManifestError};
@@ -38,6 +38,11 @@ pub struct Listed {
     pub folder: bool,
     /// A file's size when it was listed; a folder's is 0.
     pub size: u64,
+    /// Its modified time and execute bit when it was listed, from the
+    /// metadata the walk read through the handle it opens each entry
+    /// with: nothing more is opened for them. A folder has its time and is
+    /// never executable.
+    pub meta: Meta,
     /// Its names on disk below the listed folder.
     parts: Vec<OsString>,
 }
@@ -83,7 +88,10 @@ impl Listing {
     /// Walks the folder at `root` by handle: what goes, and what is
     /// skipped. Links and junctions inside are skipped, not followed; one
     /// at `root` itself is refused. More than [`Limits::entries`] names in
-    /// all refuses the folder as soon as the one past it is read.
+    /// all refuses the folder as soon as the one past it is read. The walk
+    /// opens each file for reading: on Windows that fetches a file a cloud
+    /// service marked to be fetched when opened, and skips one another
+    /// program holds for itself.
     pub fn list(root: &Path, limits: &Limits) -> Result<Self, ManifestError> {
         let name = root
             .file_name()
@@ -102,14 +110,16 @@ impl Listing {
         };
         let mut found = 0usize;
         // Depth first, each folder's files before what is below them.
-        let mut folders = vec![(Vec::<OsString>::new(), name, 1usize)];
-        while let Some((parts, at, depth)) = folders.pop() {
+        // The listed folder itself is never an entry: its `Meta` is not read.
+        let mut folders = vec![(Vec::<OsString>::new(), name, 1usize, Meta::default())];
+        while let Some((parts, at, depth, meta)) = folders.pop() {
             // A folder with nothing in it to send still goes, as a folder of
             // its own: one that cannot be read, or holds only links.
             let own = Listed {
                 name: format!("{at}/"),
                 folder: true,
                 size: 0,
+                meta,
                 parts: parts.clone(),
             };
             let read = open_directory(&listing.root, &parts)
@@ -163,7 +173,7 @@ impl Listing {
                     });
                 } else if meta.is_dir() {
                     kept += 1;
-                    below.push((child_parts, path, depth + 1));
+                    below.push((child_parts, path, depth + 1, Meta::of(&meta)));
                 } else if meta.is_file() {
                     kept += 1;
                     listing.files += 1;
@@ -173,6 +183,7 @@ impl Listing {
                         name: path,
                         folder: false,
                         size,
+                        meta: Meta::of(&meta),
                         parts: child_parts,
                     });
                 } else {
@@ -194,9 +205,11 @@ impl Listing {
     /// opened parent and no link followed: a file to read with its size
     /// now, or `None` for a folder that is still there. A file larger than
     /// it was listed is [`ManifestError::Changed`], so nothing that grew is
-    /// sent; a smaller one opens, with its smaller size. One that is no
-    /// longer a regular file (a folder, a device, a pipe or a socket under
-    /// its name) is [`ManifestError::NotAFile`].
+    /// sent; a smaller one opens, with its smaller size. A file whose
+    /// execute bit is not [`Listed::meta`]'s is `Changed` too, since the
+    /// other side was told what the listing read; its modified time is not
+    /// compared. One that is no longer a regular file (a folder, a device,
+    /// a pipe or a socket under its name) is [`ManifestError::NotAFile`].
     ///
     /// An error's `at` is the part of the path that failed, not the whole
     /// entry: [`ManifestError::Link`] names the folder on the way that is
@@ -224,7 +237,7 @@ impl Listing {
         if !meta.is_file() {
             return Err(ManifestError::NotAFile { at: whole() });
         }
-        if meta.len() > entry.size {
+        if meta.len() > entry.size || Meta::of(&meta).executable != entry.meta.executable {
             return Err(ManifestError::Changed);
         }
         Ok(Some((file, meta.len())))

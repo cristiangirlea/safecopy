@@ -77,6 +77,10 @@ original code behaved as below, this crate does not:
 
 ## Changes
 
+- `Meta::of(&Metadata)`: the `Meta` of metadata already read, as
+  `Meta::read` gives it, for a caller that holds it from a listing and
+  opens no file (`meta_read_gives_the_owners_execute_bit_on_unix`,
+  `meta_read_on_windows_never_says_executable`).
 - `Directory::reopen(name)`: a regular file already in the folder, opened
   for reading and writing with no link followed and nothing created, so a
   kept partial file can be appended to after a drop; a folder, a device, a

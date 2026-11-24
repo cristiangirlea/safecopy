@@ -15,7 +15,8 @@
 //!   bytes; [`read_end`] checks nothing follows.
 //! - [`save_verified`]: a whole file into a held folder: write, hash,
 //!   compare, mark, time and execute bit, publish; the partial file is
-//!   removed after any failure.
+//!   removed after any failure, and [`Hooks::ended`] hears what became of
+//!   it ([`PartialFate`]).
 //! - [`CandidateHash::hash`]: the hash of a file already at the
 //!   destination, checked unchanged before and after.
 //!
@@ -44,7 +45,7 @@ pub use copy::{
     FRAMING, copy_exact, hash_prefix, read_end, read_meta, read_trailer, read_version, write_meta,
     write_trailer, write_version,
 };
-pub use save::{Hooks, SaveOptions, Saved, save_verified};
+pub use save::{Hooks, PartialFate, SaveOptions, Saved, save_verified};
 
 /// The chunk: a resumed file continues from a multiple of it. 4 MiB.
 pub const CHUNK: u64 = 4 << 20;
@@ -310,6 +311,19 @@ impl std::error::Error for ChunkError {}
 impl From<io::Error> for ChunkError {
     fn from(e: io::Error) -> Self {
         Self::Io(e.kind())
+    }
+}
+
+/// Switches tests use to act out a system's refusals.
+#[cfg(test)]
+// Android's emulated thread locals make Clippy ask for the `const` already there.
+#[allow(clippy::missing_const_for_thread_local)]
+mod seams {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// The next removal of a partial file fails with this system code.
+        pub static DISCARD_ERROR: Cell<Option<i32>> = const { Cell::new(None) };
     }
 }
 

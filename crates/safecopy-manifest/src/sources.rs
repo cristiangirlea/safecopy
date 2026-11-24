@@ -7,7 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use safecopy_folder::{Directory, FileId, Refusal, Unfit, identity, is_link, refusal};
+use safecopy_folder::{Directory, FileId, Meta, Refusal, Time, Unfit, identity, is_link, refusal};
 use safecopy_names::Siblings;
 
 use crate::{Entry, Kind, Limits, Manifest, ManifestError, add_within, check};
@@ -30,6 +30,8 @@ struct Source {
     id: FileId,
     size: u64,
     modified: Option<SystemTime>,
+    /// The owner's execute bit; never set for a folder.
+    executable: bool,
     online_only: bool,
 }
 
@@ -50,6 +52,7 @@ pub struct Opened {
     pub file: File,
     size: u64,
     modified: Option<SystemTime>,
+    executable: bool,
 }
 
 impl Opened {
@@ -58,12 +61,16 @@ impl Opened {
         self.size
     }
 
-    /// Whether the file still has the size and modified time it was listed
-    /// with: check it again while and after it is read, since another
-    /// program can write to it meanwhile.
+    /// Whether the file still has the size, modified time and execute bit
+    /// it was listed with: check it again while and after it is read, since
+    /// another program can write to it meanwhile. The bit counts alone: the
+    /// other side was told what [`Sources::meta`] gave.
     pub fn unchanged(&self) -> Result<(), ManifestError> {
         let meta = self.file.metadata().map_err(|_| ManifestError::Changed)?;
-        if meta.len() != self.size || meta.modified().ok() != self.modified {
+        if meta.len() != self.size
+            || meta.modified().ok() != self.modified
+            || Meta::of(&meta).executable != self.executable
+        {
             return Err(ManifestError::Changed);
         }
         Ok(())
@@ -117,11 +124,25 @@ impl Sources {
             .is_some_and(|source| source.online_only)
     }
 
+    /// Entry `n`'s modified time and execute bit as they were when it was
+    /// listed, or `None` when the list has no such entry. They come from
+    /// the metadata the listing read: no file is opened for them, and an
+    /// online-only file is not fetched. A folder has its time and is never
+    /// executable. [`Meta::modified`] is `None` when the time could not be
+    /// read, or is past what [`Time`] holds.
+    pub fn meta(&self, n: u32) -> Option<Meta> {
+        self.entries.get(n as usize).map(|source| Meta {
+            modified: source.modified.and_then(Time::from_system),
+            executable: source.executable,
+        })
+    }
+
     /// Opens entry `n` from the held folders, following no link: a file to
     /// read, or `None` for a folder that is still there. A file that is no
     /// longer a regular file (a folder, a device, a pipe or a socket under
     /// its name) is [`ManifestError::NotAFile`]; anything else not as it
-    /// was listed is [`ManifestError::Changed`].
+    /// was listed is [`ManifestError::Changed`], a file whose execute bit
+    /// alone differs from [`Self::meta`]'s included.
     pub fn open(&self, n: u32) -> Result<Option<Opened>, ManifestError> {
         let changed = |_| ManifestError::Changed;
         let source = self
@@ -165,6 +186,7 @@ impl Sources {
                     file,
                     size: source.size,
                     modified: source.modified,
+                    executable: source.executable,
                 };
                 opened.unchanged()?;
                 Ok(Some(opened))
@@ -430,6 +452,8 @@ impl Walk<'_> {
             return Err(ManifestError::KeptOut);
         }
         let modified = meta.modified().ok();
+        // From the metadata just read: nothing is opened for the bit.
+        let executable = Meta::of(&meta).executable;
         if meta.is_file() {
             let online_only = online_only(attributes(&meta, name), at)?;
             let size = meta.len();
@@ -447,6 +471,7 @@ impl Walk<'_> {
                 id,
                 size,
                 modified,
+                executable,
                 online_only,
             });
             return Ok(());
@@ -472,6 +497,7 @@ impl Walk<'_> {
             id,
             size: 0,
             modified,
+            executable: false,
             online_only: false,
         });
         let room = most.saturating_sub(self.entries.len() + self.pending);

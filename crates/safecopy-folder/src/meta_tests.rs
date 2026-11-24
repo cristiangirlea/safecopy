@@ -333,6 +333,8 @@ fn meta_read_on_windows_never_says_executable() {
         let meta = Meta::read(&file).unwrap();
         assert!(!meta.executable, "{name}");
         assert_eq!(meta.modified, Some(modified(&to.join(name))));
+        // The same from metadata read without opening the file.
+        assert_eq!(Meta::of(&std::fs::metadata(to.join(name)).unwrap()), meta);
     }
     std::fs::remove_dir_all(&to).unwrap();
 }
@@ -350,10 +352,13 @@ fn meta_read_gives_the_owners_execute_bit_on_unix() {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
         let meta = Meta::read(&File::open(&path).unwrap()).unwrap();
         assert_eq!(meta.executable, executable, "{mode:o}");
+        // The same from metadata read without opening the file.
+        assert_eq!(Meta::of(&std::fs::metadata(&path).unwrap()), meta);
     }
     // A folder is searchable, not a program.
     let folder = File::open(&to).unwrap();
     assert!(!Meta::read(&folder).unwrap().executable);
+    assert!(!Meta::of(&std::fs::metadata(&to).unwrap()).executable);
     std::fs::remove_dir_all(&to).unwrap();
 }
 

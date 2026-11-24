@@ -29,7 +29,12 @@ file before it gets its name.
   that fails anywhere, its hash included, is removed before it gets a
   name. `Hooks` (`before_create`, `created`, `before_publish`,
   `ended`) let the caller keep a crash record or refuse; an error from any
-  removes the partial file.
+  removes the partial file. `ended` is not called for a save whose future
+  is dropped: its partial file stays for the crash cleanup. `ended` hears
+  what became of the partial file
+  (`PartialFate`): published, removed, never created, replaced by another
+  file under its name, or left because the system refused to remove it,
+  with the error's kind and raw code.
 - `CandidateHash::hash`: the hash of a file already at the destination
   (`Directory::candidate`), counted only when the file was unchanged before
   and after.
@@ -45,6 +50,22 @@ not a setting). The rest are settings with defaults: a receiver keeps 1
 boundary, a sender 4, and the metadata block holds at most 4 KiB.
 
 The framing is fuzzed: `fuzz/fuzz_targets/framing.rs`.
+
+## Changes
+
+- **`Hooks::ended` is told what became of the partial file.** It takes a
+  second argument, `PartialFate`: `NotCreated`, `Published`, `Removed`,
+  `Replaced` (Linux and macOS: another file had its name, and was left),
+  or `Left { kind, raw }` when the save failed and the system refused to
+  remove the partial, so a caller keeps its record of it without looking
+  for the file by name. `save_verified` still returns the error that
+  stopped the save. `Published` says the file has its name, not that the
+  partial name is gone: one the system would not remove after the file
+  was linked or copied into its name stays, unreported.
+  Tests: `a_partial_that_cannot_be_removed_is_reported_left_and_is_still_there`,
+  `a_partial_whose_name_another_file_took_is_reported_replaced`,
+  `a_save_that_cannot_create_its_partial_says_none_was_created`,
+  `hooks_run_in_order_and_an_error_in_any_removes_the_partial`.
 
 Uses `safecopy-folder` and `ring` (SHA-256).
 
