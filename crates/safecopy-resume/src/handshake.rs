@@ -62,7 +62,7 @@ impl Reply {
 }
 
 /// The receiver's side: states what it holds from this peer (as
-/// [`crate::Store::held_from`] lists it), then reads the sender's reply
+/// [`crate::Store::kept_by`] lists it), then reads the sender's reply
 /// for each, in order.
 pub async fn answer<S>(
     stream: &mut S,

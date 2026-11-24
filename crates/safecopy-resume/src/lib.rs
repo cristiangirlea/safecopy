@@ -11,7 +11,13 @@
 //!   (the SHA-256 of those bytes); the sender keeps which file it was
 //!   sending. One file per transfer, two checksummed slots, so a torn
 //!   write leaves the other slot whole. Records are bounded in count and
-//!   bytes and expire, never while their session runs.
+//!   bytes and expire, never while their session runs. Several processes
+//!   may share one folder: each holds the records it writes, and reads
+//!   the others'. What is kept is listed without reading it
+//!   ([`Store::kept_by`]); a kept partial is checked when it is
+//!   continued ([`Store::reopen_hashed`]), and the hasher of that check
+//!   handed on, so the save (`safecopy_chunks::save_resumable`) reads
+//!   the prefix once.
 //! - **The checks** ([`receiver_takes`], [`sender_checks`], [`Resent`]):
 //!   what the receiver states it holds, what the sender checks of its own
 //!   file, and what a stream under a kept key may be.
@@ -23,6 +29,27 @@
 //! ([`TransferKey`], [`Resumable`], [`Held`], [`Verdict`]), held by
 //! golden-bytes tests, and the chunk. Everything else is a setting
 //! ([`Limits`]).
+//!
+//! # What a matching hash proves
+//!
+//! A file gets its name only when the hash of its bytes equals the
+//! sender's. Those bytes are hashed where they pass, never read back:
+//!
+//! - **A new file:** each byte as it is written.
+//! - **A resumed file:** the kept bytes as they are read from the disk at
+//!   [`Store::reopen_hashed`], through the handle the save then appends
+//!   through, so the partial is held from the check on; the rest as it
+//!   is written.
+//!
+//! So a match proves the stream was whole and unchanged, and that the
+//! kept bytes were the sender's when they were read. It does not prove
+//! what the disk holds afterwards: nothing is read again before or after
+//! the file is published, and a byte changed later, by a disk that fails
+//! without an error or by another program writing the partial, is not
+//! seen. A hasher from [`Store::held_hashed`] proves less: no handle is
+//! on the partial between that check and the reopening, and bytes
+//! changed in between are published under a hash that matches. Use it
+//! only where nothing else can write the folder.
 //!
 //! Records hold no file contents and are not sealed: whoever can write the
 //! records' folder runs as the person. A tampered receiving record can
@@ -154,6 +181,11 @@ pub struct Limits {
     pub rewrite_every: Duration,
     /// The most bytes of the caller's `same` a record keeps: 4 KiB.
     pub same_bytes: usize,
+    /// The most sending records kept: 256. Past it, the oldest goes.
+    pub sending: usize,
+    /// The most record files a store's index remembers: 1024, twice what
+    /// the caps above keep. Any past it are read at each lookup.
+    pub indexed: usize,
 }
 
 impl Default for Limits {
@@ -166,6 +198,8 @@ impl Default for Limits {
             rewrite_bytes: 64 << 20,
             rewrite_every: Duration::from_secs(1),
             same_bytes: 4096,
+            sending: 256,
+            indexed: 1024,
         }
     }
 }
@@ -186,6 +220,17 @@ pub enum ResumeError {
     /// The partial file or its folder is not there any more, or another
     /// file has its name.
     Gone,
+    /// The partial file's disk or folder cannot be read now: a disk away,
+    /// a place the system would not show. Nothing is removed for it.
+    Unreachable,
+    /// The partial file's first `have` bytes do not hash to the record's
+    /// `prefix`: changed on the disk since they were recorded.
+    PrefixChanged,
+    /// The record or its partial file is in use: another store on the
+    /// same folder holds the record, this store holds it and is asked to
+    /// reopen its partial again, or the partial is open elsewhere. It is
+    /// not written, reopened or removed here.
+    Busy,
     /// The caller's `same` is longer than [`Limits::same_bytes`], or a
     /// record would not fit its slot.
     TooLarge {

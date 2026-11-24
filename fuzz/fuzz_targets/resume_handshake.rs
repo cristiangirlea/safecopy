@@ -221,10 +221,20 @@ fuzz_target!(|data: &[u8]| {
                 prefix: Digest(checks.prefix),
             };
             let next =
-                runtime().block_on(sender_checks(Some(&sending), Some(&opened), &held, None));
-            if let Ok(Next::Continue { from }) = next {
+                runtime().block_on(sender_checks(
+                    Some(&sending),
+                    Some(&opened),
+                    &held,
+                    None,
+                    &Default::default(),
+                ));
+            if let Ok((Next::Continue { from }, hasher)) = next {
                 assert!(from <= opened.size && from.is_multiple_of(CHUNK));
                 assert_eq!(from, checks.have);
+                // The hasher it hands back stands where the stream continues.
+                assert_eq!(hasher.map(|h| h.position()), Some(from));
+            } else if let Ok((_, hasher)) = next {
+                assert!(hasher.is_none());
             }
         }
     }

@@ -1238,3 +1238,915 @@ async fn a_candidate_locked_against_reading_is_no_match() {
     drop((locker, candidate, dir));
     std::fs::remove_dir_all(&to).unwrap();
 }
+
+// A save that keeps its partial at a cut, and one that continues it.
+
+/// Hooks that note each whole chunk and how the save ended, and fail at
+/// the chunk named.
+#[derive(Default)]
+struct Wholes {
+    seen: Mutex<Vec<(u64, Digest, u64)>>,
+    fates: Fates,
+    fail_at: Option<u64>,
+    cancel: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl Wholes {
+    fn seen(&self) -> Vec<(u64, Digest)> {
+        let seen = self.seen.lock().unwrap();
+        seen.iter()
+            .map(|(have, prefix, _)| (*have, *prefix))
+            .collect()
+    }
+}
+
+impl Hooks for Wholes {
+    fn whole(&self, file: &File, have: u64, prefix: Digest) -> io::Result<()> {
+        let len = file.metadata()?.len();
+        self.seen.lock().unwrap().push((have, prefix, len));
+        if let Some(cancel) = &self.cancel {
+            cancel.notify_one();
+        }
+        if self.fail_at == Some(have) {
+            return Err(io::ErrorKind::StorageFull.into());
+        }
+        Ok(())
+    }
+
+    fn ended(&self, outcome: Result<&Saved, &ChunkError>, partial: PartialFate) {
+        self.fates.ended(outcome, partial);
+    }
+}
+
+fn cut_short(error: &ChunkError) -> bool {
+    matches!(error, ChunkError::CutShort { .. })
+}
+
+/// What a sender writes to continue `bytes` from `from`: the rest, then
+/// the hash of the whole file.
+fn rest(bytes: &[u8], from: u64) -> Vec<u8> {
+    let mut out = bytes[from as usize..].to_vec();
+    out.extend_from_slice(&sha(bytes).0);
+    out
+}
+
+/// A kept partial made by hand, with chunks of `chunk` bytes: `on_disk` in
+/// `name`, and a hasher over the first `have` bytes of `bytes`.
+fn kept_by_hand(
+    dir: &Directory,
+    name: &str,
+    bytes: &[u8],
+    on_disk: &[u8],
+    have: usize,
+    chunk: u64,
+) -> Start {
+    let mut file = dir.create(OsStr::new(name)).unwrap();
+    file.write_all(on_disk).unwrap();
+    let mut hasher = Hasher::with_chunk(1, small(chunk));
+    hasher.update(&bytes[..have]);
+    Start::Resume(Box::new(Kept {
+        file,
+        partial: name.into(),
+        hasher,
+    }))
+}
+
+#[tokio::test]
+async fn a_cut_stream_keeps_whole_chunks_and_a_later_save_appends_and_publishes() {
+    let to = temp("keep-resume");
+    let dir = Directory::open(&to).unwrap();
+    let c = CHUNK as usize;
+    let bytes = data(2 * c + c / 2 + 7);
+    let size = bytes.len() as u64;
+    let stream = framed(&bytes).await;
+    // The stream is cut halfway through the second chunk.
+    let cut = c + c / 2;
+    let hooks = Wholes::default();
+    let stopped = save_resumable(
+        &mut &stream[..cut],
+        Target {
+            dir: &dir,
+            name: "report.pdf",
+            size,
+        },
+        Start::New,
+        &cut_short,
+        &SaveOptions::default(),
+        &hooks,
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        stopped.error,
+        ChunkError::CutShort {
+            got: cut as u64,
+            size
+        }
+    );
+    let kept = stopped.kept.expect("the rule keeps a cut stream");
+    assert_eq!(kept.have(), CHUNK);
+    assert_eq!(kept.prefix(), sha(&bytes[..c]));
+    assert_eq!(kept.partial, "report.pdf.part");
+    assert_eq!(kept.file.metadata().unwrap().len(), CHUNK, "cut back");
+    assert_eq!(files_in(&to), ["report.pdf.part"]);
+    assert_eq!(
+        std::fs::read(to.join("report.pdf.part")).unwrap(),
+        bytes[..c]
+    );
+    assert_eq!(hooks.seen(), [(CHUNK, sha(&bytes[..c]))]);
+    assert_eq!(
+        *hooks.fates.0.lock().unwrap(),
+        [PartialFate::Kept { have: CHUNK }]
+    );
+
+    // Later: the sender continues from what is kept.
+    let rules = PublishRules {
+        mark: true,
+        ..PublishRules::default()
+    };
+    let sent = Time {
+        secs: 1_000_000_000,
+        nanos: 0,
+    };
+    let options = SaveOptions {
+        publish: &rules,
+        meta: Meta {
+            modified: Some(sent),
+            executable: true,
+        },
+        meta_rules: MetaRules {
+            times: true,
+            executable: true,
+        },
+        ..SaveOptions::default()
+    };
+    let hooks = Wholes::default();
+    let more = rest(&bytes, kept.have());
+    let saved = save_resumable(
+        &mut &more[..],
+        Target {
+            dir: &dir,
+            name: "report.pdf",
+            size,
+        },
+        Start::Resume(kept),
+        &cut_short,
+        &options,
+        &hooks,
+        std::future::pending(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.digest, sha(&bytes), "the hash of the whole file");
+    assert_eq!(saved.path, to.join("report.pdf"));
+    assert_eq!(saved.applied.time, TimeApplied::Set);
+    #[cfg(unix)]
+    assert_eq!(saved.applied.executable, BitApplied::Set);
+    #[cfg(windows)]
+    assert_eq!(saved.applied.executable, BitApplied::NotHere);
+    #[cfg(windows)]
+    assert_eq!(saved.marked, Marked::Marked);
+    #[cfg(unix)]
+    assert_eq!(saved.marked, Marked::NotOnThisSystem);
+    // Only the chunk that came now is told.
+    assert_eq!(hooks.seen(), [(2 * CHUNK, sha(&bytes[..2 * c]))]);
+    assert_eq!(*hooks.fates.0.lock().unwrap(), [PartialFate::Published]);
+    drop(dir);
+    assert_eq!(files_in(&to), ["report.pdf"]);
+    assert!(std::fs::read(to.join("report.pdf")).unwrap() == bytes);
+    let modified = std::fs::metadata(to.join("report.pdf"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(Time::from_system(modified), Some(sent));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(to.join("report.pdf"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o100, 0, "the execute bit");
+    }
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+#[tokio::test]
+async fn a_cancel_and_a_damaged_hash_keep_nothing_whatever_the_rule_says() {
+    let to = temp("never-kept");
+    let dir = Directory::open(&to).unwrap();
+    let c = CHUNK as usize;
+    let bytes = data(c + c / 2);
+    let size = bytes.len() as u64;
+    let always = |_: &ChunkError| true;
+
+    // A bit flipped in the first chunk: every byte came, the hash is wrong.
+    let mut damaged = framed(&bytes).await;
+    damaged[100] ^= 1;
+    let hooks = Wholes::default();
+    let stopped = save_resumable(
+        &mut &damaged[..],
+        Target {
+            dir: &dir,
+            name: "a.bin",
+            size,
+        },
+        Start::New,
+        &always,
+        &SaveOptions::default(),
+        &hooks,
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stopped.error, ChunkError::Damaged);
+    assert!(stopped.kept.is_none());
+    assert_eq!(hooks.seen().len(), 1, "a whole chunk was there to keep");
+    assert_eq!(*hooks.fates.0.lock().unwrap(), [PartialFate::Removed]);
+    assert!(files_in(&to).is_empty());
+
+    // A cancel that comes once the first whole chunk is written.
+    let stream = framed(&bytes).await;
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    let hooks = Wholes {
+        cancel: Some(cancel.clone()),
+        ..Wholes::default()
+    };
+    // The sender never ends its stream: only the cancel ends the save.
+    let (mut sending, mut receiving) = tokio::io::duplex(1 << 16);
+    let sender = async {
+        sending.write_all(&stream[..c + 10]).await.unwrap();
+        std::future::pending::<()>().await;
+    };
+    let options = SaveOptions::default();
+    let saving = save_resumable(
+        &mut receiving,
+        Target {
+            dir: &dir,
+            name: "b.bin",
+            size,
+        },
+        Start::New,
+        &always,
+        &options,
+        &hooks,
+        cancel.notified(),
+    );
+    let stopped = tokio::select! {
+        stopped = saving => stopped.unwrap_err(),
+        () = sender => unreachable!(),
+    };
+    assert_eq!(stopped.error, ChunkError::Cancelled);
+    assert!(stopped.kept.is_none());
+    assert_eq!(hooks.seen().len(), 1);
+    assert_eq!(*hooks.fates.0.lock().unwrap(), [PartialFate::Removed]);
+    assert!(files_in(&to).is_empty());
+
+    // The same cut with no cancel is kept: the rule was the one asked.
+    let hooks = Wholes::default();
+    let stopped = save_resumable(
+        &mut &stream[..c + 10],
+        Target {
+            dir: &dir,
+            name: "c.bin",
+            size,
+        },
+        Start::New,
+        &always,
+        &SaveOptions::default(),
+        &hooks,
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stopped.kept.unwrap().have(), CHUNK);
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+#[tokio::test]
+async fn a_cut_before_the_first_whole_chunk_keeps_nothing() {
+    let to = temp("under-a-chunk");
+    let dir = Directory::open(&to).unwrap();
+    let c = CHUNK as usize;
+    let bytes = data(c + 5);
+    let stream = framed(&bytes).await;
+    let hooks = Wholes::default();
+    let stopped = save_resumable(
+        &mut &stream[..c - 1],
+        Target {
+            dir: &dir,
+            name: "a.bin",
+            size: bytes.len() as u64,
+        },
+        Start::New,
+        &|_: &ChunkError| true,
+        &SaveOptions::default(),
+        &hooks,
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(stopped.error, ChunkError::CutShort { .. }));
+    assert!(stopped.kept.is_none());
+    assert!(hooks.seen().is_empty());
+    assert_eq!(*hooks.fates.0.lock().unwrap(), [PartialFate::Removed]);
+    assert!(files_in(&to).is_empty());
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+#[tokio::test]
+async fn whole_fires_once_per_whole_chunk_and_its_error_fails_the_save() {
+    let to = temp("whole-hook");
+    let dir = Directory::open(&to).unwrap();
+    let c = CHUNK as usize;
+    // Two chunks and a half; then a file that ends on a chunk.
+    for (len, wholes) in [(2 * c + c / 2, 2), (2 * c, 2), (c - 1, 0)] {
+        let bytes = data(len);
+        let stream = framed(&bytes).await;
+        let hooks = Wholes::default();
+        save_verified(
+            &mut &stream[..],
+            &dir,
+            "a.bin",
+            len as u64,
+            &SaveOptions::default(),
+            &hooks,
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+        let expected: Vec<(u64, Digest)> = (1..=wholes)
+            .map(|n| (n as u64 * CHUNK, sha(&bytes[..n * c])))
+            .collect();
+        assert_eq!(hooks.seen(), expected, "{len}");
+        // Each chunk was written when its call came.
+        for (have, _, written) in hooks.seen.lock().unwrap().iter() {
+            assert!(written >= have, "{len}: {written} of {have}");
+        }
+        std::fs::remove_file(to.join("a.bin")).unwrap();
+    }
+    // An error at the second chunk ends the save, and nothing is left.
+    let bytes = data(3 * c);
+    let stream = framed(&bytes).await;
+    let hooks = Wholes {
+        fail_at: Some(2 * CHUNK),
+        ..Wholes::default()
+    };
+    let saved = save_verified(
+        &mut &stream[..],
+        &dir,
+        "a.bin",
+        bytes.len() as u64,
+        &SaveOptions::default(),
+        &hooks,
+        std::future::pending(),
+    )
+    .await;
+    assert_eq!(saved, Err(ChunkError::Hook(io::ErrorKind::StorageFull)));
+    assert_eq!(hooks.seen().len(), 2, "no chunk after the one refused");
+    assert_eq!(*hooks.fates.0.lock().unwrap(), [PartialFate::Removed]);
+    assert!(files_in(&to).is_empty());
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+#[tokio::test]
+async fn a_resumed_save_checks_its_stream_and_its_partial_as_a_new_one_does() {
+    let to = temp("resume-checks");
+    let dir = Directory::open(&to).unwrap();
+    let chunk = 1024;
+    let bytes = data(3 * 1024 + 100);
+    let size = bytes.len() as u64;
+    let have = 2 * 1024;
+    let resume = |start: Start, stream: Vec<u8>, size: u64| {
+        let dir = &dir;
+        async move {
+            let hooks = Fates::default();
+            let saved = save_resumable(
+                &mut &stream[..],
+                Target {
+                    dir,
+                    name: "a.bin",
+                    size,
+                },
+                start,
+                &|_: &ChunkError| false,
+                &SaveOptions::default(),
+                &hooks,
+                std::future::pending(),
+            )
+            .await
+            .map_err(|stopped| stopped.error);
+            let fate = hooks.0.lock().unwrap()[0];
+            (saved, fate)
+        }
+    };
+    let good = rest(&bytes, have as u64);
+    // Fewer bytes than the rest, counted from the file's first byte.
+    let start = kept_by_hand(&dir, "a.bin.part", &bytes, &bytes[..have], have, chunk);
+    let (saved, fate) = resume(start, good[..500].to_vec(), size).await;
+    let got = have as u64 + 500;
+    assert_eq!(saved, Err(ChunkError::CutShort { got, size }));
+    assert_eq!(fate, PartialFate::Removed);
+    assert!(files_in(&to).is_empty());
+    // More than the rest and its trailer.
+    let start = kept_by_hand(&dir, "a.bin.part", &bytes, &bytes[..have], have, chunk);
+    let mut longer = good.clone();
+    longer.push(0);
+    assert_eq!(
+        resume(start, longer, size).await.0,
+        Err(ChunkError::TooLong)
+    );
+    // A trailer that is not the whole file's hash.
+    let start = kept_by_hand(&dir, "a.bin.part", &bytes, &bytes[..have], have, chunk);
+    let mut wrong = good.clone();
+    *wrong.last_mut().unwrap() ^= 1;
+    assert_eq!(resume(start, wrong, size).await.0, Err(ChunkError::Damaged));
+    // A partial shorter than its hasher says.
+    let start = kept_by_hand(&dir, "a.bin.part", &bytes, &bytes[..have - 1], have, chunk);
+    let short = ChunkError::PartialShort {
+        have: have as u64,
+        len: have as u64 - 1,
+    };
+    assert_eq!(resume(start, good.clone(), size).await.0, Err(short));
+    // A hasher off a chunk, and one past the size.
+    let start = kept_by_hand(&dir, "a.bin.part", &bytes, &bytes[..have], have - 1, chunk);
+    assert!(matches!(
+        resume(start, good.clone(), size).await.0,
+        Err(ChunkError::Offset { .. })
+    ));
+    let start = kept_by_hand(&dir, "a.bin.part", &bytes, &bytes[..have], have, chunk);
+    assert_eq!(
+        resume(start, good.clone(), 1024).await.0,
+        Err(ChunkError::Offset {
+            from: have as u64,
+            size: 1024,
+            hashed: have as u64
+        })
+    );
+    assert!(files_in(&to).is_empty(), "{:?}", files_in(&to));
+    // Longer on the disk than its hasher says: cut to it, then appended to.
+    let start = kept_by_hand(&dir, "a.bin.part", &bytes, &bytes[..have + 50], have, chunk);
+    let (saved, _) = resume(start, good.clone(), size).await;
+    assert_eq!(saved.unwrap().digest, sha(&bytes));
+    assert_eq!(std::fs::read(to.join("a.bin")).unwrap(), bytes);
+    std::fs::remove_file(to.join("a.bin")).unwrap();
+    // A file that is whole but for its trailer.
+    let whole = data(2 * 1024);
+    let start = kept_by_hand(&dir, "a.bin.part", &whole, &whole, 2 * 1024, chunk);
+    let (saved, _) = resume(start, sha(&whole).0.to_vec(), 2 * 1024).await;
+    assert_eq!(saved.unwrap().digest, sha(&whole));
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// What the rule may not keep, it may not keep of a resumed save either,
+/// which has whole chunks from its first moment.
+#[tokio::test]
+async fn a_resumed_save_keeps_nothing_after_a_cancel_a_wrong_hash_or_a_matched_one() {
+    let to = temp("resume-never-kept");
+    let dir = Directory::open(&to).unwrap();
+    let bytes = data(3 * 1024 + 100);
+    let size = bytes.len() as u64;
+    let always = |_: &ChunkError| true;
+    let good = rest(&bytes, 1024);
+    let start = || kept_by_hand(&dir, "a.bin.part", &bytes, &bytes[..1024], 1024, 1024);
+
+    // The rule is asked, and keeps a cut.
+    let hooks = Wholes::default();
+    let options = SaveOptions::default();
+    let stopped = save_resumable(
+        &mut &good[..10],
+        Target {
+            dir: &dir,
+            name: "a.bin",
+            size,
+        },
+        start(),
+        &always,
+        &options,
+        &hooks,
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stopped.kept.unwrap().have(), 1024);
+    std::fs::remove_file(to.join("a.bin.part")).unwrap();
+
+    // A wrong hash.
+    let mut wrong = good.clone();
+    wrong[5] ^= 1;
+    let hooks = Wholes::default();
+    let stopped = save_resumable(
+        &mut &wrong[..],
+        Target {
+            dir: &dir,
+            name: "a.bin",
+            size,
+        },
+        start(),
+        &always,
+        &options,
+        &hooks,
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stopped.error, ChunkError::Damaged);
+    assert!(stopped.kept.is_none());
+    assert_eq!(*hooks.fates.0.lock().unwrap(), [PartialFate::Removed]);
+    assert!(files_in(&to).is_empty());
+
+    // A cancel, once the next whole chunk is written.
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    let hooks = Wholes {
+        cancel: Some(cancel.clone()),
+        ..Wholes::default()
+    };
+    let (mut sending, mut receiving) = tokio::io::duplex(1 << 16);
+    let sender = async {
+        sending.write_all(&good[..1024 + 10]).await.unwrap();
+        std::future::pending::<()>().await;
+    };
+    let saving = save_resumable(
+        &mut receiving,
+        Target {
+            dir: &dir,
+            name: "a.bin",
+            size,
+        },
+        start(),
+        &always,
+        &options,
+        &hooks,
+        cancel.notified(),
+    );
+    let stopped = tokio::select! {
+        stopped = saving => stopped.unwrap_err(),
+        () = sender => unreachable!(),
+    };
+    assert_eq!(stopped.error, ChunkError::Cancelled);
+    assert!(stopped.kept.is_none());
+    assert!(files_in(&to).is_empty());
+
+    // A hook that refuses after the hash matched: whole and checked, not kept.
+    let hooks = Recorder::failing("before_publish");
+    let stopped = save_resumable(
+        &mut &good[..],
+        Target {
+            dir: &dir,
+            name: "a.bin",
+            size,
+        },
+        start(),
+        &always,
+        &options,
+        &hooks,
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        stopped.error,
+        ChunkError::Hook(io::ErrorKind::PermissionDenied)
+    );
+    assert!(stopped.kept.is_none());
+    assert_eq!(
+        hooks.steps().last().unwrap(),
+        "ended Err(Hook(PermissionDenied)) Removed"
+    );
+    assert!(files_in(&to).is_empty());
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// A kept partial cut again keeps what it had and the chunks that came.
+#[tokio::test]
+async fn a_resumed_save_that_is_cut_keeps_its_partial_again() {
+    let to = temp("resume-again");
+    let dir = Directory::open(&to).unwrap();
+    let bytes = data(4 * 1024 + 9);
+    let size = bytes.len() as u64;
+    let more = rest(&bytes, 1024);
+    let mut start = kept_by_hand(&dir, "a.bin.part", &bytes, &bytes[..1024], 1024, 1024);
+    // Cut at once, then a chunk and a half later.
+    for (cut, have) in [(0, 1024), (1024 + 512, 2 * 1024)] {
+        let stopped = save_resumable(
+            &mut &more[..cut],
+            Target {
+                dir: &dir,
+                name: "a.bin",
+                size,
+            },
+            start,
+            &cut_short,
+            &SaveOptions::default(),
+            &(),
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        let kept = stopped.kept.expect("kept again");
+        assert_eq!(kept.have(), have);
+        assert_eq!(kept.prefix(), sha(&bytes[..have as usize]));
+        assert_eq!(kept.file.metadata().unwrap().len(), have);
+        start = Start::Resume(kept);
+    }
+    let more = rest(&bytes, 2 * 1024);
+    let saved = save_resumable(
+        &mut &more[..],
+        Target {
+            dir: &dir,
+            name: "a.bin",
+            size,
+        },
+        start,
+        &cut_short,
+        &SaveOptions::default(),
+        &(),
+        std::future::pending(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.digest, sha(&bytes));
+    assert_eq!(std::fs::read(to.join("a.bin")).unwrap(), bytes);
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// Hooks that leave the file's position somewhere else each time.
+struct Wandering;
+
+impl Hooks for Wandering {
+    fn created(&self, mut file: &File, _: &OsStr) -> io::Result<()> {
+        io::Seek::seek(&mut file, io::SeekFrom::Start(77)).map(|_| ())
+    }
+
+    fn whole(&self, mut file: &File, _: u64, _: Digest) -> io::Result<()> {
+        let mut first = [0; 16];
+        io::Seek::seek(&mut file, io::SeekFrom::Start(3))?;
+        io::Read::read_exact(&mut file, &mut first)
+    }
+}
+
+/// The digest is of the stream, so only the file's bytes show a chunk
+/// that landed in the wrong place.
+#[tokio::test]
+async fn a_hook_that_moves_the_files_position_moves_no_byte() {
+    let to = temp("wandering");
+    let dir = Directory::open(&to).unwrap();
+    let c = CHUNK as usize;
+    let bytes = data(2 * c + 9);
+    let stream = framed(&bytes).await;
+    let target = Target {
+        dir: &dir,
+        name: "a.bin",
+        size: bytes.len() as u64,
+    };
+    let options = SaveOptions::default();
+    let keep = |_: &ChunkError| false;
+    let pending = std::future::pending();
+    let saved = save_resumable(
+        &mut &stream[..],
+        target,
+        Start::New,
+        &keep,
+        &options,
+        &Wandering,
+        pending,
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.digest, sha(&bytes));
+    assert!(std::fs::read(to.join("a.bin")).unwrap() == bytes);
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// A kept partial with no byte kept, its handle left past the start.
+#[tokio::test]
+async fn a_resumed_save_from_zero_writes_from_the_files_first_byte() {
+    let to = temp("resume-zero");
+    let dir = Directory::open(&to).unwrap();
+    let bytes = data(2 * 1024 + 5);
+    let start = kept_by_hand(&dir, "a.bin.part", &bytes, b"left from before", 0, 1024);
+    let target = Target {
+        dir: &dir,
+        name: "a.bin",
+        size: bytes.len() as u64,
+    };
+    let more = rest(&bytes, 0);
+    let options = SaveOptions::default();
+    let pending = std::future::pending();
+    let saved = save_resumable(
+        &mut &more[..],
+        target,
+        start,
+        &cut_short,
+        &options,
+        &(),
+        pending,
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.digest, sha(&bytes));
+    assert_eq!(std::fs::read(to.join("a.bin")).unwrap(), bytes);
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// One resumed save of `stream` over a partial of one 1024-byte chunk of
+/// `bytes`, under a rule that keeps every error.
+async fn resumed_keeping_all(
+    dir: &Directory,
+    bytes: &[u8],
+    start: Start,
+    stream: &[u8],
+    hooks: &Wholes,
+) -> Stopped {
+    let target = Target {
+        dir,
+        name: "a.bin",
+        size: bytes.len() as u64,
+    };
+    let always = |_: &ChunkError| true;
+    let options = SaveOptions::default();
+    let pending = std::future::pending();
+    save_resumable(
+        &mut &stream[..],
+        target,
+        start,
+        &always,
+        &options,
+        hooks,
+        pending,
+    )
+    .await
+    .unwrap_err()
+}
+
+#[tokio::test]
+async fn a_write_that_fails_within_a_chunk_keeps_the_whole_chunks_before_it() {
+    let to = temp("write-fails");
+    let dir = Directory::open(&to).unwrap();
+    let bytes = data(4 * 1024 + 100);
+    let good = rest(&bytes, 1024);
+    let start = kept_by_hand(&dir, "a.bin.part", &bytes, &bytes[..1024], 1024, 1024);
+    // The disk fills halfway through the fourth chunk.
+    crate::seams::WRITE_ERROR_AT.set(Some(3 * 1024 + 512));
+    let hooks = Wholes::default();
+    let stopped = resumed_keeping_all(&dir, &bytes, start, &good, &hooks).await;
+    assert_eq!(crate::seams::WRITE_ERROR_AT.get(), None, "the write failed");
+    assert_eq!(stopped.error, ChunkError::Io(io::ErrorKind::StorageFull));
+    let kept = stopped.kept.expect("the rule keeps every error");
+    assert_eq!(kept.have(), 3 * 1024);
+    assert_eq!(kept.prefix(), sha(&bytes[..3 * 1024]));
+    assert_eq!(kept.file.metadata().unwrap().len(), kept.have());
+    assert_eq!(
+        *hooks.fates.0.lock().unwrap(),
+        [PartialFate::Kept { have: 3 * 1024 }]
+    );
+    assert_eq!(
+        std::fs::read(to.join("a.bin.part")).unwrap(),
+        bytes[..3 * 1024]
+    );
+    drop((kept, dir));
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+#[tokio::test]
+async fn a_partial_that_cannot_be_cut_back_is_removed() {
+    let to = temp("cut-fails");
+    let dir = Directory::open(&to).unwrap();
+    let bytes = data(4 * 1024 + 100);
+    let good = rest(&bytes, 1024);
+    let start = kept_by_hand(&dir, "a.bin.part", &bytes, &bytes[..1024], 1024, 1024);
+    crate::seams::CUT_ERROR.set(true);
+    let hooks = Wholes::default();
+    let stopped = resumed_keeping_all(&dir, &bytes, start, &good[..1024 + 512], &hooks).await;
+    assert!(!crate::seams::CUT_ERROR.get(), "the cut was tried");
+    assert!(matches!(stopped.error, ChunkError::CutShort { .. }));
+    assert!(stopped.kept.is_none(), "half a chunk past its hash");
+    assert_eq!(*hooks.fates.0.lock().unwrap(), [PartialFate::Removed]);
+    assert!(files_in(&to).is_empty());
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// Whole and checked, it has no stream left to continue: the flush and
+/// the publish are not the rule's to keep, as the hook before them is not.
+#[tokio::test]
+async fn a_flush_or_a_publish_that_fails_after_the_hash_matched_keeps_nothing() {
+    let to = temp("after-match");
+    let dir = Directory::open(&to).unwrap();
+    let bytes = data(3 * 1024 + 100);
+    let good = rest(&bytes, 1024);
+    for (step, kind) in [
+        ("flush", io::ErrorKind::StorageFull),
+        ("publish", io::ErrorKind::PermissionDenied),
+    ] {
+        let start = kept_by_hand(&dir, "a.bin.part", &bytes, &bytes[..1024], 1024, 1024);
+        let seam = if step == "flush" {
+            &crate::seams::SYNC_ERROR
+        } else {
+            &crate::seams::PUBLISH_ERROR
+        };
+        seam.set(true);
+        let hooks = Wholes::default();
+        let stopped = resumed_keeping_all(&dir, &bytes, start, &good, &hooks).await;
+        assert!(!seam.get(), "{step}: reached");
+        assert_eq!(stopped.error, ChunkError::Io(kind), "{step}");
+        assert!(stopped.kept.is_none(), "{step}");
+        assert_eq!(hooks.seen().len(), 2, "{step}: whole chunks were there");
+        assert_eq!(
+            *hooks.fates.0.lock().unwrap(),
+            [PartialFate::Removed],
+            "{step}"
+        );
+        assert!(files_in(&to).is_empty(), "{step}");
+    }
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// Nothing shows which of its bytes are the file's.
+#[tokio::test]
+async fn a_short_partial_and_a_wrong_offset_are_removed_whatever_the_rule_says() {
+    let to = temp("unfit-kept");
+    let dir = Directory::open(&to).unwrap();
+    let bytes = data(3 * 1024 + 100);
+    let good = rest(&bytes, 2 * 1024);
+    // Shorter than its hasher says; a hasher off a chunk.
+    for (on_disk, have) in [(2 * 1024 - 1, 2 * 1024), (2 * 1024, 2 * 1024 - 1)] {
+        let start = kept_by_hand(&dir, "a.bin.part", &bytes, &bytes[..on_disk], have, 1024);
+        let hooks = Wholes::default();
+        let stopped = resumed_keeping_all(&dir, &bytes, start, &good, &hooks).await;
+        assert!(
+            matches!(
+                stopped.error,
+                ChunkError::PartialShort { .. } | ChunkError::Offset { .. }
+            ),
+            "{:?}",
+            stopped.error
+        );
+        assert!(stopped.kept.is_none(), "{have}");
+        assert_eq!(*hooks.fates.0.lock().unwrap(), [PartialFate::Removed]);
+        assert!(files_in(&to).is_empty(), "{have}");
+    }
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// The chunk the hook refused is written and hashed: it is kept with the
+/// ones before it.
+#[tokio::test]
+async fn an_error_from_whole_that_the_rule_keeps_keeps_the_chunk_it_was_told_of() {
+    let to = temp("whole-kept");
+    let dir = Directory::open(&to).unwrap();
+    let bytes = data(4 * 1024 + 100);
+    let good = rest(&bytes, 1024);
+    let start = kept_by_hand(&dir, "a.bin.part", &bytes, &bytes[..1024], 1024, 1024);
+    let hooks = Wholes {
+        fail_at: Some(3 * 1024),
+        ..Wholes::default()
+    };
+    let stopped = resumed_keeping_all(&dir, &bytes, start, &good, &hooks).await;
+    assert_eq!(stopped.error, ChunkError::Hook(io::ErrorKind::StorageFull));
+    let kept = stopped.kept.expect("the rule keeps a hook's error");
+    assert_eq!(kept.have(), 3 * 1024);
+    assert_eq!(kept.prefix(), sha(&bytes[..3 * 1024]));
+    assert_eq!(kept.file.metadata().unwrap().len(), 3 * 1024);
+    assert_eq!(hooks.seen().len(), 2, "no chunk after the one refused");
+    assert_eq!(
+        *hooks.fates.0.lock().unwrap(),
+        [PartialFate::Kept { have: 3 * 1024 }]
+    );
+    drop((kept, dir));
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// A program runs its saves on a runtime's workers.
+#[test]
+fn a_resumable_save_can_run_on_another_thread() {
+    fn sendable<T: Send>(_: &T) {}
+    let dir = Directory::open(&temp("send")).unwrap();
+    let mut reader: &[u8] = &[];
+    let options = SaveOptions::default();
+    let saving = save_resumable(
+        &mut reader,
+        Target {
+            dir: &dir,
+            name: "a.bin",
+            size: 0,
+        },
+        Start::New,
+        &cut_short,
+        &options,
+        &(),
+        std::future::pending(),
+    );
+    sendable(&saving);
+}

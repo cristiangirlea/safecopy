@@ -1,16 +1,16 @@
 //! The resume records of one program, in a folder it passes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use safecopy_chunks::{CHUNK, hash_prefix};
+use safecopy_chunks::{CHUNK, Hasher, Kept};
 use safecopy_folder::Directory;
-use safecopy_journal::{Cleaned, PartialAt, files};
+use safecopy_journal::{Cleaned, Left, PartialAt, files};
 
 use crate::record::{Record, SLOT, newest, slot};
 use crate::{Held, Limits, PeerId, Receiving, ResumeError, Sending, TransferKey};
@@ -28,7 +28,31 @@ pub struct Expired {
     pub kept_bytes: u64,
 }
 
+/// A record file's length says how often it was written: its two slots
+/// and up to this many bytes less one, the sequence number's remainder. A
+/// rewrite so changes the length, which a folder's listing shows at once
+/// on every system, where it shows a held file's new time only later.
+const TAIL: u64 = 256;
+
+/// The longest a record file is.
+const MOST: usize = 2 * SLOT + TAIL as usize - 1;
+
+fn file_len(seq: u64) -> u64 {
+    2 * SLOT as u64 + seq % TAIL
+}
+
+/// What became of a record file this store asked to hold.
+enum Hold {
+    /// It held it already: what it knows of it is current.
+    Had,
+    /// Held now, with what it holds read again; `None` when no slot reads.
+    Taken(Option<Box<Found>>),
+    /// The file is gone.
+    Gone,
+}
+
 /// One record file read.
+#[derive(Debug, Clone)]
 struct Found {
     name: String,
     record: Record,
@@ -36,16 +60,71 @@ struct Found {
     slot: usize,
 }
 
+/// What a folder's listing says of a record file, without opening it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+/// A record file as the index remembers it.
+#[derive(Debug)]
+struct Indexed {
+    /// The listing's stamp when it was read; `None` for one this store
+    /// wrote, which it holds.
+    stamp: Option<Stamp>,
+    /// What it held; `None` when no slot read.
+    found: Option<Found>,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    /// The record files this store holds, as their only writer.
+    held: HashMap<String, File>,
+    /// What each record file held when it was last read.
+    index: HashMap<String, Indexed>,
+}
+
 /// The resume records of one program, one file per transfer in a folder
-/// the caller passes (see the [crate] docs). A record this store wrote is
-/// held open while the store lasts (without write sharing on Windows,
-/// locked on Unix), so another program's store leaves it alone.
+/// the caller passes (see the [crate] docs).
+///
+/// **A record in use.** A record a store writes or reopens is held by
+/// it, as the record's only writer, until the store is dropped, forgets
+/// it or lets it go ([`Self::release`], [`Self::release_peer`]): with
+/// read sharing only on Windows, under an exclusive lock on Unix. While
+/// it is held, the store takes a save of its own to be using the partial
+/// file: it does not reopen it a second time ([`ResumeError::Busy`]), so
+/// one key coming on two connections never has its partial cut under the
+/// save appending to it, and [`Self::held_from`] and
+/// [`Self::held_hashed`] pass it by, neither hashing nor removing it.
+/// Let a record go when its save has ended without publishing, and
+/// forget it when the file is published.
+///
+/// **Several stores on one folder** (several processes). Another store
+/// still reads a held record, so its lookups, [`Self::keeps`],
+/// [`Self::kept_by`] and [`Self::held_from`] see it; it cannot write it
+/// or reopen its partial ([`ResumeError::Busy`]), nor remove either. A
+/// record file is named by its kind, peer and key, so two stores that
+/// first write the same one at the same moment make one file, and the
+/// second is told [`ResumeError::Busy`].
+///
+/// **Lookups** go through an index in memory, built when the store opens:
+/// what each record file held when it was last read. Each lookup lists the
+/// folder once and opens only the files the listing shows as new or
+/// changed (another length or modified time; every rewrite changes a
+/// record file's length), and forgets the ones that are gone. A record
+/// this store holds is never read again: nothing else writes it. Before a
+/// store writes a record it does not hold, it takes it and reads it again
+/// through that handle, so a write never follows a stale reading. The
+/// index remembers at most [`Limits::indexed`] files; any past that are
+/// read at each lookup.
 #[derive(Debug)]
 pub struct Store {
     dir: PathBuf,
     limits: Limits,
     journal: safecopy_journal::Settings,
-    held: Mutex<HashMap<String, File>>,
+    chunks: safecopy_chunks::Settings,
+    state: Mutex<State>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -60,12 +139,16 @@ impl Store {
     /// The store in the folder `dir`, made when missing.
     pub fn open(dir: &Path, limits: Limits) -> Result<Self, ResumeError> {
         std::fs::create_dir_all(dir)?;
-        Ok(Self {
+        let store = Self {
             dir: dir.to_path_buf(),
             limits,
             journal: safecopy_journal::Settings::default(),
-            held: Mutex::new(HashMap::new()),
-        })
+            chunks: safecopy_chunks::Settings::default(),
+            state: Mutex::new(State::default()),
+        };
+        // The index, from what is there.
+        store.all()?;
+        Ok(store)
     }
 
     /// The journal's settings the store removes partial files by: which
@@ -75,60 +158,65 @@ impl Store {
         self
     }
 
+    /// The settings a receiver's hasher is made with
+    /// ([`Self::held_hashed`], [`Self::reopen_hashed`]): how many chunk
+    /// boundaries it keeps.
+    pub fn with_chunk_settings(mut self, settings: safecopy_chunks::Settings) -> Self {
+        self.chunks = settings;
+        self
+    }
+
     /// Its limits.
     pub fn limits(&self) -> &Limits {
         &self.limits
     }
 
-    /// The bytes of the record file `name`, through the handle this store
-    /// holds or opened for reading.
-    fn read(&self, name: &str) -> Option<Vec<u8>> {
-        let mut bytes = Vec::new();
-        let held = lock(&self.held);
-        let result = match held.get(name) {
-            Some(file) => {
-                let mut file = file;
-                file.seek(SeekFrom::Start(0))
-                    .and_then(|_| std::io::Read::read_to_end(&mut file, &mut bytes))
-            }
-            None => {
-                drop(held);
-                files::open_read(&self.dir.join(name)).and_then(|file| {
-                    std::io::Read::read_to_end(
-                        &mut std::io::Read::take(file, 2 * SLOT as u64 + 1),
-                        &mut bytes,
-                    )
-                })
-            }
-        };
-        result
-            .ok()
-            .filter(|_| bytes.len() <= 2 * SLOT)
-            .map(|_| bytes)
-    }
-
-    /// Every record file's name, and what it holds when a slot reads.
+    /// Every record file's name, and what it holds when a slot reads:
+    /// from the index, reading only the files the listing shows as new or
+    /// changed.
     fn all(&self) -> Result<Vec<(String, Option<Found>)>, ResumeError> {
+        let mut state = lock(&self.state);
+        let State { held, index } = &mut *state;
         let mut out = Vec::new();
+        let mut seen = HashSet::new();
         for entry in std::fs::read_dir(&self.dir)? {
-            let path = entry?.path();
+            let entry = entry?;
+            let path = entry.path();
             if path.extension() != Some(OsStr::new(EXTENSION)) {
                 continue;
             }
             let Some(name) = path.file_name().and_then(OsStr::to_str) else {
                 continue;
             };
-            let found = self.read(name).and_then(|bytes| {
-                let (record, seq, slot) = newest(&bytes)?;
-                Some(Found {
-                    name: name.to_string(),
-                    record,
-                    seq,
-                    slot,
-                })
+            let stamp = entry.metadata().ok().map(|meta| Stamp {
+                len: meta.len(),
+                modified: meta.modified().ok(),
             });
+            // A file it holds has no other writer; another is as it was
+            // read while the listing says the same of it.
+            let current = index
+                .get(name)
+                .filter(|was| held.contains_key(name) || (stamp.is_some() && was.stamp == stamp));
+            let found = match current {
+                Some(was) => was.found.clone(),
+                None => {
+                    let bytes = match held.get(name) {
+                        Some(file) => read_held(file),
+                        None => read_path(&path),
+                    };
+                    let found = bytes.and_then(|bytes| parse(name, &bytes));
+                    if index.len() < self.limits.indexed || index.contains_key(name) {
+                        let found = found.clone();
+                        index.insert(name.to_string(), Indexed { stamp, found });
+                    }
+                    found
+                }
+            };
+            seen.insert(name.to_string());
             out.push((name.to_string(), found));
         }
+        index.retain(|name, _| seen.contains(name));
+        held.retain(|name, _| seen.contains(name));
         Ok(out)
     }
 
@@ -157,68 +245,241 @@ impl Store {
     }
 
     /// Writes `record`: into a new file, or over the older slot of the
-    /// file holding its key, then flushed to the disk.
+    /// file holding its key, then flushed to the disk. A file another
+    /// store holds is not written: [`ResumeError::Busy`].
     fn write(&self, record: &Record) -> Result<(), ResumeError> {
         let receiving = matches!(record, Record::Receiving(_));
         let existing = self.find(record.peer(), record.key(), receiving);
         let payload = record.encode();
-        let (seq, at) = existing
-            .as_ref()
-            .map_or((1, 0), |f| (f.seq + 1, 1 - f.slot));
-        let bytes = slot(seq, &payload).ok_or(ResumeError::TooLarge { most: SLOT })?;
-        let mut held = lock(&self.held);
-        let mut new = false;
-        let name = match &existing {
-            Some(found) => {
-                if !held.contains_key(&found.name) {
-                    let (file, _) = files::take(&self.dir.join(&found.name), 0)?;
-                    held.insert(found.name.clone(), file);
-                }
-                found.name.clone()
-            }
-            None => {
-                let name = format!("{}.{EXTENSION}", hex(&TransferKey::random()?.0));
-                let file = files::create(&self.dir.join(&name))?;
-                file.set_len(2 * SLOT as u64)?;
-                held.insert(name.clone(), file);
-                new = true;
-                name
-            }
-        };
-        let mut file = held.get(&name).expect("held above");
-        file.seek(SeekFrom::Start((at * SLOT) as u64))?;
-        #[cfg(test)]
-        if crate::tests::seams::TEAR.replace(false) {
-            // Cut within its payload: the crash came halfway through.
-            file.write_all(&bytes[..(12 + payload.len()) / 2])?;
-            return Ok(());
+        // Before a file is made for it.
+        if slot(0, &payload).is_none() {
+            return Err(ResumeError::TooLarge { most: SLOT });
         }
-        file.write_all(&bytes)?;
-        file.sync_data()?;
-        if new {
-            // The new file's name reaches the disk too.
+        #[cfg(test)]
+        if let Some(hook) = crate::tests::seams::LOOKED.take() {
+            hook();
+        }
+        let mut state = lock(&self.state);
+        // Where the newest record of the file is: its name, sequence
+        // number and slot.
+        let mut place = None;
+        if let Some(found) = existing {
+            match self.hold(&mut state, &found.name)? {
+                Hold::Had => place = Some((found.name, found.seq, found.slot)),
+                // Another store may have written it since it was read.
+                Hold::Taken(now) => {
+                    let (seq, slot) = now.map_or((0, 1), |now| (now.seq, now.slot));
+                    place = Some((found.name, seq, slot));
+                }
+                // Removed since: written as a new one.
+                Hold::Gone => {}
+            }
+        }
+        let (name, seq, newest, new) = match place {
+            Some((name, seq, slot)) => (name, seq, slot, false),
+            None => self.make(&mut state, record)?,
+        };
+        let (seq, at) = (seq + 1, 1 - newest);
+        let bytes = slot(seq, &payload).ok_or(ResumeError::TooLarge { most: SLOT })?;
+        let written = (|| -> Result<bool, ResumeError> {
+            let mut file = state.held.get(&name).expect("held above");
+            file.seek(SeekFrom::Start((at * SLOT) as u64))?;
             #[cfg(test)]
-            crate::tests::seams::DIR_SYNCS.set(crate::tests::seams::DIR_SYNCS.get() + 1);
-            files::sync_dir(&self.dir)?;
+            if crate::tests::seams::FULL.replace(false) {
+                return Err(ResumeError::Io(std::io::ErrorKind::StorageFull));
+            }
+            #[cfg(test)]
+            if crate::tests::seams::TEAR.replace(false) {
+                // Cut within its payload: the crash came halfway through.
+                file.write_all(&bytes[..(12 + payload.len()) / 2])?;
+                return Ok(false);
+            }
+            file.write_all(&bytes)?;
+            // After the bytes, so a store that sees the new length reads them.
+            file.set_len(file_len(seq))?;
+            file.sync_data()?;
+            if new {
+                // The new file's name reaches the disk too.
+                #[cfg(test)]
+                crate::tests::seams::DIR_SYNCS.set(crate::tests::seams::DIR_SYNCS.get() + 1);
+                files::sync_dir(&self.dir)?;
+            }
+            Ok(true)
+        })();
+        match written {
+            Ok(true) => {}
+            Ok(false) => return Ok(()),
+            Err(e) => {
+                // A new file that holds no record is not left: nothing
+                // would read it, and this store would hold it for good.
+                if new && let Some(file) = state.held.remove(&name) {
+                    let _ = files::delete(&file, &self.dir.join(&name));
+                }
+                return Err(e);
+            }
+        }
+        let found = Some(Found {
+            name: name.clone(),
+            record: record.clone(),
+            seq,
+            slot: at,
+        });
+        if state.index.len() < self.limits.indexed || state.index.contains_key(&name) {
+            state.index.insert(name, Indexed { stamp: None, found });
         }
         Ok(())
     }
 
-    /// The record file `name`, for this store alone: the handle it holds,
-    /// or taken whole, so one another store holds is left. `None` when it
-    /// cannot be had.
-    fn claim(&self, name: &str) -> Option<File> {
-        if let Some(file) = lock(&self.held).remove(name) {
-            return Some(file);
+    /// The file for a record that `find` showed none of, held by this
+    /// store: its name, the sequence number and slot of the newest record
+    /// in it (0 and 1 when it has none), and whether it was made now.
+    ///
+    /// It is made under the one name its transfer has. When another
+    /// store made it since this one looked, whoever holds it has the
+    /// transfer ([`ResumeError::Busy`]); one nobody holds is taken.
+    fn make(
+        &self,
+        state: &mut State,
+        record: &Record,
+    ) -> Result<(String, u64, usize, bool), ResumeError> {
+        let receiving = matches!(record, Record::Receiving(_));
+        let name = file_name(receiving, record.peer(), record.key());
+        let exists = match files::create(&self.dir.join(&name)) {
+            Ok(file) => {
+                state.held.insert(name.clone(), file);
+                return Ok((name, 0, 1, true));
+            }
+            Err(e) => e,
+        };
+        // On Unix a file is made, then locked: another store may lock it between.
+        if exists.kind() != std::io::ErrorKind::AlreadyExists && !files::busy(&exists) {
+            return Err(exists.into());
         }
-        files::take(&self.dir.join(name), 0)
-            .ok()
-            .map(|(file, _)| file)
+        let (now, had) = match self.hold(state, &name)? {
+            Hold::Taken(now) => (now.map(|now| *now), false),
+            // A write of this store's own since this one looked, or one
+            // that was torn: what the file holds now is read, so this
+            // record is the newer of the two.
+            Hold::Had => {
+                let bytes = state.held.get(&name).and_then(read_held);
+                (bytes.and_then(|bytes| parse(&name, &bytes)), true)
+            }
+            // Removed in this very moment: the caller's next write makes it.
+            Hold::Gone => return Err(ResumeError::Busy),
+        };
+        let other = now.as_ref().is_some_and(|now| {
+            matches!(now.record, Record::Receiving(_)) != receiving
+                || now.record.peer() != record.peer()
+                || now.record.key() != record.key()
+        });
+        if other {
+            if !had {
+                self.drop_hold(state, &name);
+            }
+            return Err(ResumeError::Busy);
+        }
+        let (seq, slot) = now.map_or((0, 1), |now| (now.seq, now.slot));
+        Ok((name, seq, slot, false))
     }
 
-    /// Removes the record file `name`, claimed first.
+    /// Makes this store the only writer of the record file `name`, read
+    /// again through the handle when it was not held before:
+    /// [`ResumeError::Busy`] when another store holds it.
+    fn hold(&self, state: &mut State, name: &str) -> Result<Hold, ResumeError> {
+        if state.held.contains_key(name) {
+            return Ok(Hold::Had);
+        }
+        match files::hold(&self.dir.join(name)) {
+            Ok(file) => {
+                let now = read_held(&file).and_then(|bytes| parse(name, &bytes));
+                state.held.insert(name.to_string(), file);
+                if let Some(was) = state.index.get_mut(name) {
+                    *was = Indexed {
+                        stamp: None,
+                        found: now.clone(),
+                    };
+                }
+                Ok(Hold::Taken(now.map(Box::new)))
+            }
+            Err(e) if files::busy(&e) => Err(ResumeError::Busy),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                state.index.remove(name);
+                Ok(Hold::Gone)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Stops holding the record file `name`: read again when next looked up.
+    fn drop_hold(&self, state: &mut State, name: &str) {
+        state.held.remove(name);
+        state.index.remove(name);
+    }
+
+    /// The receiving record of `key` from `peer`, taken by this store to
+    /// reopen its partial: the only one that may then touch that file.
+    /// One it holds already is in use, by a save it started or by an
+    /// earlier reopening: [`ResumeError::Busy`], on every system.
+    fn take_received(&self, peer: PeerId, key: TransferKey) -> Result<Found, ResumeError> {
+        let found = self.find(peer, key, true).ok_or(ResumeError::NotHeld)?;
+        let mut state = lock(&self.state);
+        let now = match self.hold(&mut state, &found.name)? {
+            Hold::Had => return Err(ResumeError::Busy),
+            Hold::Taken(now) => now.map(|now| *now),
+            Hold::Gone => None,
+        };
+        let now = now.filter(
+            |now| matches!(&now.record, Record::Receiving(r) if r.peer == peer && r.key == key),
+        );
+        if now.is_none() {
+            self.drop_hold(&mut state, &found.name);
+        }
+        now.ok_or(ResumeError::NotHeld)
+    }
+
+    /// What a reopening that failed leaves: nothing held by this store.
+    /// The record goes, with its partial, when the partial is no longer
+    /// what it says ([`lost`]); otherwise it is let go as it is.
+    fn settle<T>(&self, found: &Found, opened: Result<T, ResumeError>) -> Result<T, ResumeError> {
+        match &opened {
+            Ok(_) => {}
+            Err(e) if lost(e) => {
+                self.remove(found);
+            }
+            Err(_) => self.drop_hold(&mut lock(&self.state), &found.name),
+        }
+        opened
+    }
+
+    /// The record file `name`, for this store alone: the handle it holds,
+    /// or taken whole, so one another store holds is left. `None` when it
+    /// cannot be had, or when one taken no longer holds the record of
+    /// sequence number `seq` (`None`: no record that reads): it was judged
+    /// by an older reading, and is left for the next look.
+    ///
+    /// With `own`, one this store holds is given up to the claim: the
+    /// caller's own word (a forget, an expiry past its `live` list).
+    /// Without, it is left: a save of this store's may be using it.
+    fn claim(&self, name: &str, seq: Option<u64>, own: bool) -> Option<File> {
+        let mut state = lock(&self.state);
+        if state.held.contains_key(name) {
+            if !own {
+                return None;
+            }
+            state.index.remove(name);
+            return state.held.remove(name);
+        }
+        let taken = files::take(&self.dir.join(name), MOST);
+        state.index.remove(name);
+        let (file, bytes) = taken.ok()?;
+        let now = newest(&bytes).map(|(_, seq, _)| seq);
+        (now == seq).then_some(file)
+    }
+
+    /// Removes the record file `name`, which no slot of reads, claimed
+    /// first.
     fn remove_file(&self, name: &str) -> bool {
-        match self.claim(name) {
+        match self.claim(name, None, true) {
             Some(file) => files::delete(&file, &self.dir.join(name)).is_ok(),
             None => false,
         }
@@ -228,13 +489,60 @@ impl Store {
     /// identity. The record is claimed first: one another store holds
     /// keeps its record and its partial.
     fn remove(&self, found: &Found) -> bool {
-        let Some(file) = self.claim(&found.name) else {
+        self.remove_claimed(found, true)
+    }
+
+    /// [`Self::remove`] for a listing, which leaves a record this store
+    /// holds: nothing said it may go.
+    fn remove_unheld(&self, found: &Found) -> bool {
+        self.remove_claimed(found, false)
+    }
+
+    fn remove_claimed(&self, found: &Found, own: bool) -> bool {
+        let Some(file) = self.claim(&found.name, Some(found.seq), own) else {
             return false;
         };
         if let Record::Receiving(r) = &found.record {
             r.at.remove(&self.journal);
         }
         files::delete(&file, &self.dir.join(&found.name)).is_ok()
+    }
+
+    /// Lets go of the record files named by `which`, removing none.
+    fn let_go(&self, which: impl Fn(&Record) -> bool) -> usize {
+        let Ok(all) = self.all() else {
+            return 0;
+        };
+        let mut state = lock(&self.state);
+        let mut released = 0;
+        for found in all.into_iter().filter_map(|(_, found)| found) {
+            if which(&found.record) && state.held.remove(&found.name).is_some() {
+                // No longer its only writer: read again when next looked up.
+                state.index.remove(&found.name);
+                released += 1;
+            }
+        }
+        released
+    }
+
+    /// Stops holding the records of `key` from or to `peer`, without
+    /// removing them: its save has ended. This store may then list and
+    /// reopen the partial again, and another store may write the record,
+    /// or remove it with its partial file. Whether any was held. This
+    /// store takes one again when it next writes or reopens it: write
+    /// first ([`Self::keep`] at a drop), then release.
+    pub fn release(&self, peer: PeerId, key: TransferKey) -> bool {
+        self.let_go(|record| record.peer() == peer && record.key() == key) > 0
+    }
+
+    /// Stops holding every record of `peer`, as [`Self::release`] does for
+    /// one. How many were held. It lets go of all of them, whichever
+    /// connection of the peer was saving each: call it only when no save
+    /// of that peer's still runs, and [`Self::release`] for one file
+    /// otherwise. A record let go under a running save is no longer kept
+    /// from a second reopening.
+    pub fn release_peer(&self, peer: PeerId) -> usize {
+        self.let_go(|record| record.peer() == peer)
     }
 
     /// Starts keeping a file being received, from its first whole chunk:
@@ -297,12 +605,72 @@ impl Store {
         self.write(&Record::Sending(record.clone()))
     }
 
+    /// What this side keeps from `peer`, by the records and the folders'
+    /// listings alone: each receiving record of `peer` whose partial file
+    /// is still the recorded one under its name
+    /// ([`PartialAt::present`]) and at least `have` bytes long. Oldest
+    /// first, at most [`Limits::per_peer`].
+    ///
+    /// No byte of a partial is read and no record file whose listing is
+    /// unchanged is opened, so the other side cannot make this side read
+    /// its kept files by connecting. A partial open in a running save is
+    /// listed too. The others are passed by, and nothing is removed:
+    /// [`Self::expire`] and [`Self::clean_up`] do that. What is listed is
+    /// what the records say; the bytes are checked when a file is
+    /// continued ([`Self::reopen_hashed`]).
+    pub fn kept_by(&self, peer: PeerId) -> Result<Vec<Held>, ResumeError> {
+        let mut kept = Vec::new();
+        for found in self.all()?.into_iter().filter_map(|(_, found)| found) {
+            let Record::Receiving(record) = found.record else {
+                continue;
+            };
+            if record.peer != peer || record.at.present().is_none_or(|len| len < record.have) {
+                continue;
+            }
+            let held = Held {
+                key: record.key,
+                have: record.have,
+                prefix: record.prefix,
+            };
+            kept.push((record.created, record.last, held));
+        }
+        kept.sort_by_key(|(created, last, _)| (*created, *last));
+        kept.truncate(self.limits.per_peer);
+        Ok(kept.into_iter().map(|(_, _, held)| held).collect())
+    }
+
     /// What this side keeps from `peer`, each checked first: its partial
     /// opened by identity, at least `have` bytes long, its first `have`
-    /// bytes hashing to `prefix`. One that fails is removed, with its
-    /// record, and not listed: it will come from zero. Oldest first, at
-    /// most [`Limits::per_peer`].
+    /// bytes hashing to `prefix`. Oldest first, at most
+    /// [`Limits::per_peer`]. [`Self::held_hashed`] without the hashers.
+    ///
+    /// It reads `have` bytes of every kept file: for a check the program
+    /// itself decides on, never for each connection of the other side,
+    /// which [`Self::kept_by`] answers without reading.
+    ///
+    /// A record is removed, with its partial, and not listed, only when
+    /// the check says the file is no longer what was recorded: gone or
+    /// replaced under its name, shorter than `have`, or with other bytes
+    /// in its prefix. One whose partial is open elsewhere (Windows: a
+    /// save is writing it, or a [`Kept`] is still held) or cannot be
+    /// reached now is passed by and stays. So is every record this store
+    /// holds: its own save may be using it.
     pub async fn held_from(&self, peer: PeerId) -> Result<Vec<Held>, ResumeError> {
+        let hashed = self.held_hashed(peer).await?;
+        Ok(hashed.into_iter().map(|(held, _)| held).collect())
+    }
+
+    /// [`Self::held_from`], each with the hasher its check built: standing
+    /// at `have`, over the bytes of the partial as they were read.
+    ///
+    /// No handle is kept on the partial after the check, so the hasher
+    /// says nothing of bytes changed since. Continue a file from it
+    /// ([`Self::reopen`], [`Kept`]) only where nothing else can have
+    /// written the partial in between; otherwise a changed prefix is
+    /// published under a hash that matches the sender's.
+    /// [`Self::reopen_hashed`] reads the prefix through the handle it
+    /// hands on, and is the one to use when in doubt.
+    pub async fn held_hashed(&self, peer: PeerId) -> Result<Vec<(Held, Hasher)>, ResumeError> {
         let mut kept = Vec::new();
         for (_, found) in self.all()? {
             let Some(found) = found else {
@@ -311,38 +679,106 @@ impl Store {
             let Record::Receiving(record) = &found.record else {
                 continue;
             };
-            if record.peer != peer {
+            // One this store holds is in use by it, as far as it knows.
+            if record.peer != peer || lock(&self.state).held.contains_key(&found.name) {
                 continue;
             }
-            if check_partial(record).await {
-                kept.push((
-                    record.created,
-                    record.last,
-                    Held {
+            match hash_partial(record, &self.chunks).await {
+                Ok((_, _, hasher)) => {
+                    let held = Held {
                         key: record.key,
                         have: record.have,
                         prefix: record.prefix,
-                    },
-                ));
-            } else {
-                self.remove(&found);
+                    };
+                    kept.push((record.created, record.last, held, hasher));
+                }
+                Err(e) if lost(&e) => {
+                    self.remove_unheld(&found);
+                }
+                // Open elsewhere, or not reachable now: it may be whole.
+                Err(_) => {}
             }
         }
-        kept.sort_by_key(|(created, last, _)| (*created, *last));
+        kept.sort_by_key(|(created, last, ..)| (*created, *last));
         kept.truncate(self.limits.per_peer);
-        Ok(kept.into_iter().map(|(_, _, held)| held).collect())
+        Ok(kept
+            .into_iter()
+            .map(|(_, _, held, hasher)| (held, hasher))
+            .collect())
     }
 
     /// The kept partial of `key` from `peer`, opened by identity for
     /// writing and cut to its `have`, to append the rest; with its folder.
+    /// Its bytes are not read: [`Self::reopen_hashed`] checks them. The
+    /// folder is opened by identity, which on Windows gives it no path: a
+    /// file published into it reports its name alone.
+    ///
+    /// The record is taken first, and stays held while the file is
+    /// continued. One in use is [`ResumeError::Busy`], and its partial is
+    /// not touched: held by another store, held by this one (a save it
+    /// started, or a reopening not yet released, on every system), or
+    /// with its partial open elsewhere (Windows). A reopening that fails
+    /// leaves nothing held: the record is removed with its partial when
+    /// that is gone, replaced or shorter than `have`
+    /// ([`ResumeError::Gone`], [`ResumeError::WrongSize`]), and let go as
+    /// it is otherwise.
     pub fn reopen(&self, peer: PeerId, key: TransferKey) -> Result<(Directory, File), ResumeError> {
-        let record = self.received(peer, key).ok_or(ResumeError::NotHeld)?;
-        let (dir, file) = record.at.reopen().ok_or(ResumeError::Gone)?;
-        if file.metadata()?.len() < record.have {
-            return Err(ResumeError::WrongSize);
-        }
-        file.set_len(record.have)?;
-        Ok((dir, file))
+        let found = self.take_received(peer, key)?;
+        let opened = match &found.record {
+            Record::Receiving(record) => open_partial(record).and_then(|(dir, file)| {
+                file.set_len(record.have)?;
+                Ok((dir, file))
+            }),
+            Record::Sending(_) => Err(ResumeError::NotHeld),
+        };
+        self.settle(&found, opened)
+    }
+
+    /// [`Self::reopen`], with the partial's first `have` bytes read once
+    /// and checked against the record's `prefix`: its folder, and the
+    /// partial as a save continues it (`safecopy_chunks::Start::Resume`),
+    /// its hasher standing at `have`. Bytes that do not hash to `prefix`
+    /// are [`ResumeError::PrefixChanged`], and the record and the partial
+    /// are removed: nothing is appended, and the file comes from zero.
+    /// Busy records and failures are as [`Self::reopen`] has them.
+    ///
+    /// The bytes are read through the handle handed back, the one the
+    /// save appends through, so no moment passes between the check and
+    /// the save in which the partial is not held. Dropped while it
+    /// reads, it leaves the record as it was and not held.
+    pub async fn reopen_hashed(
+        &self,
+        peer: PeerId,
+        key: TransferKey,
+    ) -> Result<(Directory, Kept), ResumeError> {
+        let found = self.take_received(peer, key)?;
+        let Record::Receiving(record) = &found.record else {
+            return self.settle(&found, Err(ResumeError::NotHeld));
+        };
+        // The reading may be long, and its future dropped before it ends.
+        let mut reading = Reading {
+            store: self,
+            name: &found.name,
+            under_way: true,
+        };
+        let hashed = match hash_partial(record, &self.chunks).await {
+            Ok((dir, file, hasher)) => match file.set_len(record.have) {
+                Ok(()) => Ok((dir, file, hasher)),
+                Err(e) => Err(e.into()),
+            },
+            Err(e) => Err(e),
+        };
+        reading.under_way = false;
+        let (dir, file, hasher) = self.settle(&found, hashed)?;
+        let partial = record.at.partial.clone().into();
+        Ok((
+            dir,
+            Kept {
+                file,
+                partial,
+                hasher,
+            },
+        ))
     }
 
     /// Forgets the file of `key` from or to `peer`: its records go, and a
@@ -395,25 +831,36 @@ impl Store {
     }
 
     /// The journals' cleanup in `journals`, leaving the partials this
-    /// store's records keep.
+    /// store's records keep, and the journals that list them: when a
+    /// record is gone or no longer reads, the next cleanup removes its
+    /// partial, and then the journal. The journals kept are held to
+    /// `settings`, raised to what this store may keep: at least
+    /// [`Limits::total`] journals, for at least [`Limits::keep_for`].
     pub fn clean_up(
         &self,
         journals: &Path,
         settings: &safecopy_journal::Settings,
     ) -> Result<Cleaned, ResumeError> {
+        let settings = safecopy_journal::Settings {
+            keep_most: settings.keep_most.max(self.limits.total),
+            keep_for: settings.keep_for.max(self.limits.keep_for),
+            ..settings.clone()
+        };
         Ok(safecopy_journal::clean_up_keeping(
             journals,
-            settings,
+            &settings,
             &|at| self.keeps(at),
         )?)
     }
 
     /// Removes what is past its time or the caps, never a record of `live`
-    /// (sessions still running, moving or paused):
+    /// (the files of sessions still running, moving or paused, each by its
+    /// peer and its key: a key names a file to one peer only):
     ///
     /// - a file with no slot that reads (its journal entry removes the
     ///   partial);
     /// - any record whose last byte is older than `keep_for` at `now`;
+    /// - past [`Limits::sending`] sending records, the oldest;
     /// - past [`Limits::per_peer`] files of one peer, that peer's oldest;
     /// - past [`Limits::total`] files, the oldest of the peer keeping the
     ///   most, so one peer filling the cap loses its own first;
@@ -423,18 +870,19 @@ impl Store {
         &self,
         now: u64,
         keep_for: Duration,
-        live: &[TransferKey],
+        live: &[(PeerId, TransferKey)],
     ) -> Result<Expired, ResumeError> {
         let mut expired = Expired::default();
         let mut kept: Vec<Found> = Vec::new();
+        let mut sending: Vec<Found> = Vec::new();
         for (name, found) in self.all()? {
             let Some(found) = found else {
-                if !lock(&self.held).contains_key(&name) && self.remove_file(&name) {
+                if !lock(&self.state).held.contains_key(&name) && self.remove_file(&name) {
                     expired.removed += 1;
                 }
                 continue;
             };
-            if live.contains(&found.record.key()) {
+            if live.contains(&(found.record.peer(), found.record.key())) {
                 continue;
             }
             let age = Duration::from_secs(now.saturating_sub(found.record.last()));
@@ -444,7 +892,15 @@ impl Store {
             }
             if matches!(found.record, Record::Receiving(_)) {
                 kept.push(found);
+            } else {
+                sending.push(found);
             }
+        }
+        // Sending records hold no file, only their count: the oldest go.
+        sending.sort_by_key(|f| (f.record.last(), f.record.peer(), f.record.key()));
+        let over = sending.len().saturating_sub(self.limits.sending);
+        for found in &sending[..over] {
+            expired.removed += usize::from(self.remove(found));
         }
         // Oldest first.
         kept.sort_by_key(|f| (f.record.last(), f.record.key()));
@@ -534,6 +990,24 @@ impl Store {
     }
 }
 
+/// A record taken to reopen its partial, while the prefix is read: let go
+/// when that reading's future is dropped, so a reopening that was
+/// cancelled does not leave the file in use for good.
+struct Reading<'a> {
+    store: &'a Store,
+    name: &'a str,
+    under_way: bool,
+}
+
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        if self.under_way {
+            self.store
+                .drop_hold(&mut lock(&self.store.state), self.name);
+        }
+    }
+}
+
 /// Whether two places name one partial: the same folder by identity (the
 /// last level's, or the root's), the same name in it and the same file ID,
 /// whatever root each was recorded from.
@@ -576,17 +1050,93 @@ fn have_of(found: &Found) -> u64 {
     }
 }
 
-/// Whether a kept partial is still whole: there, at least `have` bytes,
-/// its first `have` hashing to `prefix`.
-async fn check_partial(record: &Receiving) -> bool {
-    let Some((_, file)) = record.at.reopen() else {
-        return false;
-    };
-    if file.metadata().map(|m| m.len()).unwrap_or(0) < record.have {
-        return false;
+/// Whether `error`, of a kept partial checked, says the file is no longer
+/// what its record says, so both go: not there or replaced, too short, or
+/// with other bytes. Any other error says nothing of the file (open
+/// elsewhere, a disk away), and removes nothing.
+fn lost(error: &ResumeError) -> bool {
+    matches!(
+        error,
+        ResumeError::Gone | ResumeError::WrongSize | ResumeError::PrefixChanged
+    )
+}
+
+/// A kept partial opened by identity, with its folder:
+/// [`ResumeError::Gone`] when it is not there or another file has its
+/// name, [`ResumeError::Busy`] when it is open elsewhere,
+/// [`ResumeError::Unreachable`] when its disk or folder cannot be read
+/// now, [`ResumeError::WrongSize`] when it is shorter than `have`.
+fn open_partial(record: &Receiving) -> Result<(Directory, File), ResumeError> {
+    let (dir, file) = record.at.try_reopen().map_err(|left| match left {
+        Left::Gone | Left::Replaced => ResumeError::Gone,
+        Left::Busy => ResumeError::Busy,
+        _ => ResumeError::Unreachable,
+    })?;
+    if file.metadata()?.len() < record.have {
+        return Err(ResumeError::WrongSize);
     }
-    let mut file = tokio::fs::File::from_std(file);
-    matches!(hash_prefix(&mut file, record.have).await, Ok(d) if d == record.prefix)
+    Ok((dir, file))
+}
+
+/// [`open_partial`], with the hasher over its first `have` bytes, read
+/// once: [`ResumeError::PrefixChanged`] when they do not hash to `prefix`.
+async fn hash_partial(
+    record: &Receiving,
+    settings: &safecopy_chunks::Settings,
+) -> Result<(Directory, File, Hasher), ResumeError> {
+    let (dir, file) = open_partial(record)?;
+    #[cfg(test)]
+    crate::tests::seams::stall().await;
+    #[cfg(test)]
+    crate::tests::seams::PREFIX_BYTES.set(crate::tests::seams::PREFIX_BYTES.get() + record.have);
+    let mut hasher = settings.receiving();
+    let mut reader = tokio::fs::File::from_std(file.try_clone()?);
+    hasher.read(&mut reader, record.have).await?;
+    if hasher.clone().finish() != record.prefix {
+        return Err(ResumeError::PrefixChanged);
+    }
+    Ok((dir, file, hasher))
+}
+
+/// What a record file's bytes hold, when a slot reads.
+fn parse(name: &str, bytes: &[u8]) -> Option<Found> {
+    let (record, seq, slot) = newest(bytes)?;
+    Some(Found {
+        name: name.to_string(),
+        record,
+        seq,
+        slot,
+    })
+}
+
+/// The bytes of a record file this store holds, through its handle.
+fn read_held(mut file: &File) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    file.seek(SeekFrom::Start(0)).ok()?;
+    file.take(MOST as u64 + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() <= MOST).then_some(bytes)
+}
+
+/// The bytes of a record file opened for reading: one another store may
+/// hold.
+fn read_path(path: &Path) -> Option<Vec<u8>> {
+    #[cfg(test)]
+    crate::tests::seams::OPENS.set(crate::tests::seams::OPENS.get() + 1);
+    let mut bytes = Vec::new();
+    let file = files::open_read(path).ok()?;
+    file.take(MOST as u64 + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() <= MOST).then_some(bytes)
+}
+
+/// A record file's name: the SHA-256 of its kind, peer and key. One
+/// transfer has one name, so the second of two stores that first write
+/// it at the same moment finds the file made.
+fn file_name(receiving: bool, peer: PeerId, key: TransferKey) -> String {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    context.update(&[u8::from(receiving)]);
+    context.update(&peer.0);
+    context.update(&key.0);
+    format!("{}.{EXTENSION}", hex(context.finish().as_ref()))
 }
 
 fn hex(bytes: &[u8]) -> String {

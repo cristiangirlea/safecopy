@@ -4,7 +4,8 @@
 //!
 //! On Windows a held file is open without write or delete sharing; on Unix
 //! it holds an exclusive lock (`flock`), which only other programs that
-//! lock see.
+//! lock see. Either way another process still reads it ([`open_read`]),
+//! and none takes it ([`take`]) or holds it too ([`hold`]).
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -108,6 +109,80 @@ pub fn take(path: &Path, most: usize) -> io::Result<(File, Vec<u8>)> {
         .take(most.saturating_add(1) as u64)
         .read_to_end(&mut bytes)?;
     Ok((file, bytes))
+}
+
+/// A record file that is already there, held as [`create`] holds a new
+/// one: for this process to write, while others still read it
+/// ([`open_read`]) and none takes it or holds it too. On Windows it is
+/// open with read sharing only; on Unix under an exclusive lock, which
+/// readers do not ask for. A link is opened as itself and refused; one
+/// already held or taken fails ([`busy`] tells that error from others),
+/// and one removed in the moment it was opened is
+/// [`io::ErrorKind::NotFound`].
+pub fn hold(path: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+            FILE_SHARE_READ,
+        };
+        options
+            .access_mode((FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE).0)
+            .share_mode(FILE_SHARE_READ.0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+    }
+    if !meta.is_file() {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    #[cfg(test)]
+    if let Some(hook) = crate::seams::HOLD_OPENED.take() {
+        hook();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        file.try_lock().map_err(io::Error::from)?;
+        // Its last holder may have removed it since it was opened: a lock
+        // on a file with no name holds nothing.
+        let named = std::fs::symlink_metadata(path)?;
+        if named.dev() != meta.dev() || named.ino() != meta.ino() {
+            return Err(io::ErrorKind::NotFound.into());
+        }
+    }
+    Ok(file)
+}
+
+/// Whether `error`, from [`hold`] or [`take`], says another holder has
+/// the file: a sharing or lock violation on Windows, a lock that would
+/// wait on Unix.
+pub fn busy(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        // ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION.
+        matches!(error.raw_os_error(), Some(32 | 33))
+    }
+    #[cfg(not(windows))]
+    {
+        error.kind() == io::ErrorKind::WouldBlock
+    }
 }
 
 /// A record file opened for reading only, as itself: a link, a junction, a

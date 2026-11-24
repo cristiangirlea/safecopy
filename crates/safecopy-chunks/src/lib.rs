@@ -17,8 +17,27 @@
 //!   compare, mark, time and execute bit, publish; the partial file is
 //!   removed after any failure, and [`Hooks::ended`] hears what became of
 //!   it ([`PartialFate`]).
+//! - [`save_resumable`]: the same save from a new partial file or from one
+//!   kept before ([`Start`]), which keeps the partial file, cut to its last
+//!   whole chunk, when it stops on an error the caller's rule names
+//!   ([`Stopped`], [`Kept`]); [`Hooks::whole`] hears of each whole chunk.
 //! - [`CandidateHash::hash`]: the hash of a file already at the
 //!   destination, checked unchanged before and after.
+//!
+//! **What a matching hash proves.** The hash compared with the trailer is
+//! of the bytes as they came off the stream and were handed to the system
+//! to write; a save never reads its own file back, before or after it
+//! gets its name. So a match says the stream was whole and unchanged, and
+//! that those bytes were written: not what a disk that fails without an
+//! error holds, nor what another program wrote into the partial file
+//! while it had no name. For a resumed file the hash covers the kept
+//! bytes through the hasher handed in ([`Kept::hasher`]): the caller
+//! answers for it being the hash of what the partial file holds at that
+//! moment. `safecopy-resume` gives one read from the disk through the
+//! very handle the save then writes; with it, a resumed file's kept
+//! bytes are proven as read at that reopening, and the rest as written.
+//! Bytes changed on the disk after they were hashed are not seen again
+//! in either case.
 //!
 //! What both sides must agree on is in the framing: [`FRAMING`], the
 //! chunk size ([`CHUNK`]), the trailer. Everything else is a setting
@@ -45,7 +64,10 @@ pub use copy::{
     FRAMING, copy_exact, hash_prefix, read_end, read_meta, read_trailer, read_version, write_meta,
     write_trailer, write_version,
 };
-pub use save::{Hooks, PartialFate, SaveOptions, Saved, save_verified};
+pub use save::{
+    Hooks, Kept, PartialFate, SaveOptions, Saved, Start, Stopped, Target, save_resumable,
+    save_verified,
+};
 
 /// The chunk: a resumed file continues from a multiple of it. 4 MiB.
 pub const CHUNK: u64 = 4 << 20;
@@ -161,6 +183,11 @@ impl Hasher {
     /// How many bytes it has hashed.
     pub fn position(&self) -> u64 {
         self.position
+    }
+
+    /// The chunk whose boundaries it keeps.
+    pub(crate) fn chunk(&self) -> u64 {
+        self.chunk
     }
 
     /// Hashes the next bytes of the file.
@@ -293,6 +320,14 @@ pub enum ChunkError {
         /// Where the hasher stood.
         hashed: u64,
     },
+    /// A partial file handed to [`save_resumable`] holds fewer bytes than
+    /// its hasher has hashed.
+    PartialShort {
+        /// The bytes the hasher has hashed.
+        have: u64,
+        /// The bytes the file holds.
+        len: u64,
+    },
     /// One of the caller's [`Hooks`] refused, with its error's kind.
     Hook(io::ErrorKind),
     /// The system refused.
@@ -324,6 +359,15 @@ mod seams {
     thread_local! {
         /// The next removal of a partial file fails with this system code.
         pub static DISCARD_ERROR: Cell<Option<i32>> = const { Cell::new(None) };
+        /// The write that would pass this byte of the file fails, with the
+        /// bytes before it written.
+        pub static WRITE_ERROR_AT: Cell<Option<u64>> = const { Cell::new(None) };
+        /// The next cut of a kept partial to its whole chunks fails.
+        pub static CUT_ERROR: Cell<bool> = const { Cell::new(false) };
+        /// The next flush of a checked file to the disk fails.
+        pub static SYNC_ERROR: Cell<bool> = const { Cell::new(false) };
+        /// The next publish of a checked file fails.
+        pub static PUBLISH_ERROR: Cell<bool> = const { Cell::new(false) };
     }
 }
 
