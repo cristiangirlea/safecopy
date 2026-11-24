@@ -14,6 +14,9 @@ opened relative to that handle, one name at a time:
   goes through a handle checked to be the file meant, and on Unix a name
   is removed for an open file only while its device and inode are still
   that file's;
+- a published file can come back held open (`PublishRules::hold`), and
+  `Directory::take_back` then removes it only while its name is still
+  that file;
 - the downloaded-file mark (Windows' Mark of the Web) goes on before the
   name, when the caller turns it on in `PublishRules`.
 
@@ -77,6 +80,62 @@ original code behaved as below, this crate does not:
 
 ## Changes
 
+- **A publish says which file it published, and that file can be taken
+  back with proof.** `Published` said where the file is and whether it
+  was marked, never which file it is: a caller that had to take the file
+  back at once (a cancel arriving as the publish ends) had nothing to
+  compare the name with where the file was copied into it, and elsewhere
+  only a number. A number proves nothing once a file is gone: Unix gives
+  a removed file's inode to the next file made, and a FAT or exFAT volume
+  makes a file ID from where the file's entry sits in its folder, so a
+  new file under the name of one just deleted usually has the old one's
+  ID (NTFS and ReFS keep an ID for the life of a file). An open handle is
+  the file itself on every system and volume, so that is what a publish
+  gives: with the new `PublishRules::hold`, `Published::held` is a `Held`,
+  the published file open, whether it was linked, renamed or copied into
+  its name. `Directory::take_back(held)` removes it only while its name
+  in that folder is still that file: another file under the name is left
+  with `Refusal::Replaced`, a free name is `NotFound`, and a published
+  file that was renamed is not looked for under its new name. Only the
+  published name goes: a partial Linux could not remove after linking is
+  still the caller's. A `Held` of another folder removes nothing (Unix
+  refuses it with the new `Refusal::OtherFolder`). Windows
+  deletes through the held handle itself, so no other file can go
+  whatever a volume's IDs are worth, after reading from that handle that
+  the file is still under its name (a file the caller opened sharing
+  delete, renamed in the moment between, goes under its new name: still
+  the published file); where the system cannot say where
+  the file is, it removes nothing and fails with the new
+  `Refusal::Unproven`. Unix compares the name's device and inode with the
+  held file's, which no other file can have while it is held, then
+  removes the name; a swap in the moment between the two is not caught,
+  as in `discard`
+  (`a_published_file_is_taken_back_however_it_was_published`,
+  `a_file_made_under_the_name_of_a_deleted_published_file_is_left`,
+  `a_file_put_under_the_name_of_a_renamed_published_file_is_left`,
+  `a_renamed_published_file_is_not_taken_back_under_its_new_name`,
+  `on_a_volume_with_weak_file_ids_the_held_file_is_still_proven`,
+  `a_held_file_whose_place_cannot_be_read_is_not_taken_back`).
+  **What holding costs.** On Unix a descriptor. On Windows the folder
+  the file is in, and every folder above it, cannot be renamed or moved
+  while the file is held, and the file stays as locked as while it was
+  written (through this crate, without delete sharing): no one else
+  can rename or delete it, and a program must share writing and deleting
+  to open it. So `hold` is off by default, a publish
+  without it opens nothing more than before, and a caller that asks for
+  it drops the `Held` (or the whole `Published`) as soon as the file is
+  no longer to be taken back; dropped, nothing is removed
+  (`nothing_is_held_unless_asked`,
+  `a_published_file_dropped_untaken_stays_and_leaves_no_handle`).
+  `publish_path` publishes a closed file by path and never holds one.
+  **Breaking:** `PublishRules` has the new field `hold`: a caller that
+  writes it out in full adds `hold: false`, or ends the literal with
+  `..PublishRules::default()`. `Published` has the new field `held` and
+  is now `#[non_exhaustive]`, so later fields break no one: outside this
+  crate it can no longer be built with a literal, and a pattern on it
+  needs `..`; reading `path` and `marked` is unchanged. It is no longer
+  `Clone`, `PartialEq` or `Eq`, since an open file is none of them:
+  compare or clone its `path` and `marked`.
 - **The search for a free name has a limit.** A publish tried
   `name.ext`, `name (2).ext` and so on without end, and so did
   `Directory::claim` for a folder and `unique`: in a folder holding very

@@ -11,7 +11,10 @@
 //!   replaces a file that took the name meanwhile, and takes the next
 //!   numbered name instead;
 //! - removal never goes through a link or outside the held folder; a file
-//!   removed for an open handle is checked to be that file first.
+//!   removed for an open handle is checked to be that file first;
+//! - a published file can come back held open ([`PublishRules::hold`]),
+//!   and is then taken back ([`Directory::take_back`]) only while its
+//!   name is still that file.
 //!
 //! Errors are [`std::io::Error`]s. A refusal of this crate's own carries a
 //! [`Refusal`], read back with [`refusal`].
@@ -38,6 +41,23 @@
 //!   with [`Refusal::Replaced`]. A swap in the moment between that check
 //!   and the removal is not caught. [`Directory::remove`] has no open file
 //!   to compare: it removes the name.
+//! - **Which file a name is.** A file's number (Unix's device and inode,
+//!   Windows' volume and file ID: [`identity`]) tells two files apart
+//!   only while both are there. Unix gives a removed file's inode to the
+//!   next file made. Windows keeps an ID for the life of a file on NTFS
+//!   and ReFS, but a FAT or exFAT volume makes it from where the file's
+//!   entry sits in its folder: a file renamed gets another, and a new
+//!   file under the name of one just deleted usually gets the old one.
+//!   So wherever this crate removes a file it made, it goes by an open
+//!   handle, never by a number kept from before: Unix compares the
+//!   name's device and inode with those of a handle still open (an inode
+//!   is not given away while its file is open), and Windows deletes
+//!   through the handle itself and reads no ID. [`Directory::discard`],
+//!   a copy that failed or was dropped, and [`Directory::take_back`] all
+//!   work so. A file system that gives two files at once the same number
+//!   (some FUSE and network file systems on Unix) cannot be told apart:
+//!   nothing here can check for that. By path ([`publish_path`]) no
+//!   handle is held: see there.
 //! - Where linking through procfs fails for the folder (procfs absent or
 //!   denied, as in Android apps and some containers),
 //!   [`Directory::publish`] remembers it on that handle and goes straight
@@ -78,7 +98,8 @@ use win as platform;
 pub use candidate::Candidate;
 pub use meta::{Applied, BitApplied, Meta, MetaRules, Time, TimeApplied};
 pub use publish::{
-    Finish, Marked, PublishError, PublishRules, Published, mark_path, part, publish_path, unique,
+    Finish, Held, Marked, PublishError, PublishRules, Published, mark_path, part, publish_path,
+    unique,
 };
 
 /// How many names a search for a free one tries where the caller sets no
@@ -118,6 +139,14 @@ pub enum Refusal {
         /// The names tried.
         tried: usize,
     },
+    /// The system could not say where the held file is now, so nothing
+    /// proves the name is still that file, and nothing was removed
+    /// ([`Directory::take_back`], Windows).
+    Unproven,
+    /// The held file was published in another folder than the one asked
+    /// to take it back; nothing was removed ([`Directory::take_back`],
+    /// Unix).
+    OtherFolder,
 }
 
 impl fmt::Display for Refusal {
@@ -409,6 +438,49 @@ impl Directory {
         platform::discard(&self.file, file, name)
     }
 
+    /// Takes back a file this folder published: removes it from its name
+    /// only while that name is still the file `held` holds open
+    /// ([`Published::held`]). When another file has the name it is left
+    /// and the call fails with [`Refusal::Replaced`]; when the name is
+    /// free (the published file was renamed or removed), with
+    /// [`io::ErrorKind::NotFound`]. A published file that was renamed is
+    /// not looked for under its new name: whoever renamed it has it (a
+    /// name that differs only in case is a new name too). No link is
+    /// followed, as in [`Self::discard`]. Whatever the outcome, the
+    /// handle is closed when this returns.
+    ///
+    /// Only the published name goes. Where Linux or Android left the
+    /// partial behind as a second name of the file (see
+    /// [`Self::publish`]), it is still the caller's to remove. A `held`
+    /// of another folder removes nothing: Unix refuses it with
+    /// [`Refusal::OtherFolder`], and Windows finds the name here free or
+    /// another file's.
+    ///
+    /// **Windows** deletes through the held handle itself, so no other
+    /// file can go, on any volume and whatever its file IDs are worth.
+    /// Before that it reads from the handle where the file is now, and
+    /// deletes only when that is still its name in this folder. A file
+    /// written through [`Self::create`] or [`Self::reopen`], or copied
+    /// into its name, cannot be renamed by anyone else while it is held;
+    /// one the caller opened sharing delete can, and renamed in the
+    /// moment between the look and the delete it goes under its new
+    /// name: still the published file, never another. Where the
+    /// system cannot say (some network shares), it fails with
+    /// [`Refusal::Unproven`] and removes nothing. The name is free once
+    /// the caller's own handle of the file is closed too, where it still
+    /// has one; on a volume that removes a name only with its file's
+    /// last handle (FAT, exFAT), once every program's is.
+    ///
+    /// **Unix** has no delete by handle: it compares the name's device
+    /// and inode with the held file's, which no other file can have while
+    /// it is held, then removes the name. A swap in the moment between
+    /// the two is not caught, as in [`Self::discard`].
+    pub fn take_back(&self, held: Held) -> io::Result<()> {
+        let (file, name, folder) = held.into_parts();
+        component(&name)?;
+        platform::take_back(&self.file, folder.as_ref(), &file, &name)
+    }
+
     /// Marks the file `name` here as downloaded from the Internet (on
     /// Windows its `Zone.Identifier` stream, the Mark of the Web), so the
     /// system warns before it runs. A link or a rename keeps the mark.
@@ -549,6 +621,13 @@ mod seams {
         pub static NO_RENAME: Cell<bool> = const { Cell::new(false) };
         pub static FINISH_ERRORS: RefCell<VecDeque<i32>> = const { RefCell::new(VecDeque::new()) };
         pub static REMOVE_ERRORS: RefCell<VecDeque<i32>> = const { RefCell::new(VecDeque::new()) };
+        /// Every file ID read is the same one: a volume whose IDs tell
+        /// no two files apart (Windows).
+        pub static WEAK_IDS: Cell<bool> = const { Cell::new(false) };
+        /// The next copy kept cannot be given a second handle to hold it by.
+        pub static NO_COPY_HANDLE: Cell<bool> = const { Cell::new(false) };
+        /// A held file's place cannot be read from its handle (Windows).
+        pub static NO_PLACE: Cell<bool> = const { Cell::new(false) };
         pub static SET_TIMES_ERROR: Cell<Option<i32>> = const { Cell::new(None) };
         pub static CHMOD_ERROR: Cell<Option<i32>> = const { Cell::new(None) };
         /// One entry per `apply`: `Some` fails that call with the error.
