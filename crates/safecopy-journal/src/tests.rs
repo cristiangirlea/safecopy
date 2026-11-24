@@ -589,6 +589,26 @@ fn a_record_file_removed_while_it_is_being_held_is_not_held() {
     assert!(files::hold(&path).is_ok());
 }
 
+/// The names of a file are counted through its handle, after the open: a
+/// second name it is given between the two is seen, and it is not held.
+#[test]
+fn a_file_given_a_second_name_while_it_is_being_held_is_not_held() {
+    let (_scratch, place, _) = scratch("hold-linked-late");
+    let (path, other) = (place.join("a.resume"), place.join("notes.txt"));
+    std::fs::write(&path, b"one").unwrap();
+    let (from, to) = (path.clone(), other.clone());
+    seams::HOLD_OPENED.set(Some(Box::new(move || {
+        std::fs::hard_link(&from, &to).unwrap();
+    })));
+    let held = files::hold(&path).unwrap_err();
+    assert_eq!(held.kind(), io::ErrorKind::InvalidInput);
+    assert!(files::refused(&held) && !files::busy(&held));
+    assert_eq!(std::fs::read(&other).unwrap(), b"one");
+    // With the one name again, it is held.
+    std::fs::remove_file(&other).unwrap();
+    assert!(files::hold(&path).is_ok());
+}
+
 use std::fs::File;
 use std::process::Command;
 

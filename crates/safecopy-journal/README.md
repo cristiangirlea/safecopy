@@ -206,6 +206,10 @@ After a crash, cleanup:
 
 ## Changes
 
+- **Tested:** a file given a second name between `files::hold`'s open
+  and its count of names is not held: the count is read from the handle
+  after the open
+  (`a_file_given_a_second_name_while_it_is_being_held_is_not_held`).
 - **Only a name that is a partial's is opened.** `PartialAt::reopen`,
   `try_reopen` and `present` opened whatever name was recorded, where
   `remove` checked it first: a record read from a disk can name any file

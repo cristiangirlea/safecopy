@@ -53,10 +53,39 @@
 //! changed in between are published under a hash that matches. Use it
 //! only where nothing else can write the folder.
 //!
-//! Records hold no file contents and are not sealed: whoever can write the
-//! records' folder runs as the person. A tampered receiving record can
-//! only make a file start from zero, since every byte is checked against
-//! the whole-file hash.
+//! # The store's folder is its program's alone
+//!
+//! Records hold no file contents and are not sealed, and nothing in one
+//! proves that the store wrote it. The folder passed to [`Store::open`]
+//! must be writable only by the program that owns it, as its journals'
+//! folder must: a program that can write there can write the journals
+//! too, and no check here stands against it. What a record file planted
+//! in that folder can and cannot do:
+//!
+//! - **It cannot** have a byte written through a link, nor have a file
+//!   opened, cut, written or removed that is not named as a partial
+//!   (`safecopy_journal::PartialAt::is_partial`), nor be written over a
+//!   file that is not that record (see [`Store`]). One that names a file
+//!   which is no partial counts toward no cap, and goes at the next
+//!   [`Store::expire`].
+//! - **It can** name any file whose name ends in the partial ending, in
+//!   any folder the person can write, by that folder's identity, the name
+//!   and the file ID: another program's unfinished file, or on Unix this
+//!   store's own running save under another key. [`Store::reopen`] cuts
+//!   that file to the record's `have` and hands it out to be continued;
+//!   [`Store::reopen_hashed`] does once the file's first `have` bytes
+//!   hash to the record's `prefix`, both of which whoever planted the
+//!   record chose. Whatever removes the record removes that file with it
+//!   (an expiry, [`Store::forget`], [`Store::remove_all`], a check that
+//!   finds it changed), and until then the record counts toward the caps
+//!   with the `have` it claims, so an expiry may remove older kept files
+//!   for it.
+//!
+//! What is published is still decided by the hashes alone: of the kept
+//! bytes as read at [`Store::reopen_hashed`], and of the whole file at
+//! the end, against the sender's. A planted record gets a file named as
+//! a partial cut, continued or removed; it gets no byte published that
+//! the sender did not send.
 //!
 //! # A save's hooks, and how it ends
 //!
@@ -76,23 +105,63 @@
 //!
 //! [`Store::forget`] is [`ResumeError::Busy`] for a file being received,
 //! so the same key on a second connection cannot have the first's record
-//! and partial removed, whatever a check answered for it.
+//! and partial removed, whatever a check answered for it. A sending
+//! record it forgets whatever is being received under its key.
+//!
+//! A save whose future is dropped leaves no write behind
+//! (`safecopy_chunks::save_resumable`): when its drop returns, no write
+//! of it is running and none can start, so nothing of the dropped stream
+//! lands in the partial once a later save has reopened and hashed it.
+//! That drop waits for a write already under way, for as long as that
+//! one write takes: 64 KiB at most, and on a disk that stalls, as long
+//! as it stalls.
 //!
 //! # Blocking
 //!
-//! [`Store`]'s functions are synchronous but for three, and do file work
-//! under the store's lock. On an async runtime run [`Store::kept_by`],
-//! [`Store::expire`] and [`Store::clean_up`] on its blocking pool, and
-//! [`Saving::kept`] and [`Saving::forget`], whose guard borrows the
-//! store, inside `tokio::task::block_in_place`. A save's `whole` hook runs on
-//! the thread that polls the save: the [`Store::keep`] in it returns at
-//! once except when a rewrite is due ([`Limits::rewrite_bytes`],
-//! [`Limits::rewrite_every`]), when it flushes the partial and the
-//! record; on a multi-threaded runtime wrap it in
-//! `tokio::task::block_in_place`, or give the save a thread of its own.
-//! [`Store::reopen_hashed`], [`Store::held_hashed`] and
-//! [`Store::held_from`] hold the lock across no wait; their futures are
-//! `Send`.
+//! Every function of [`Store`] that reads or changes records, but the
+//! three async ones, is synchronous and does file work, most of it under
+//! the store's lock: none belongs on a thread that must not wait for a
+//! disk. Each of them lists the store's folder at least once (some two
+//! or three times) and opens the record files a listing shows as new or
+//! changed. What each does besides:
+//!
+//! - [`Store::received`], [`Store::sent`], [`Store::saving`],
+//!   [`Store::keeps`], [`Store::kept_bytes`], [`Store::release`] and
+//!   [`Store::release_peer`]: nothing more. Dropping a [`Saving`] lists
+//!   nothing.
+//! - [`Store::open`]: makes the folder and reads every record in it.
+//! - [`Store::kept_by`]: inspects each kept partial's name in its folder.
+//! - [`Store::reopen`]: takes the record file, finds the partial's folder
+//!   by identity, opens the partial and cuts it.
+//! - [`Store::receiving`]: flushes the partial to the disk, then writes
+//!   the record and flushes it. [`Store::sending`] writes and flushes
+//!   its record. [`Store::keep`] does as `receiving` when a rewrite is
+//!   due ([`Limits::rewrite_bytes`], [`Limits::rewrite_every`]) or at a
+//!   drop, and so [`Saving::kept`]; otherwise it only looks the record
+//!   up.
+//! - [`Store::forget`], [`Saving::forget`], [`Store::remove_all`],
+//!   [`Store::expire`] and [`Store::clean_up`]: remove record files and
+//!   partials; `expire` reads each disk's free space, and `clean_up` the
+//!   journals.
+//!
+//! On an async runtime, run them on its blocking pool
+//! (`tokio::task::spawn_blocking`, with the store in an `Arc`) or inside
+//! `tokio::task::block_in_place`. A [`Saving`] borrows its store and does
+//! not move to another thread's task: take it ([`Store::saving`]) and end
+//! it ([`Saving::kept`], [`Saving::forget`]) inside `block_in_place`. A
+//! save's `whole` hook runs on the thread that polls the save: the
+//! [`Store::keep`] in it lists the folder each time and flushes the
+//! partial and the record when a rewrite is due; on a multi-threaded
+//! runtime wrap it in `tokio::task::block_in_place`, or give the save a
+//! thread of its own.
+//!
+//! The three async functions ([`Store::reopen_hashed`],
+//! [`Store::held_hashed`], [`Store::held_from`]) do the same file work
+//! on the thread that polls them, before, between and after their
+//! waits: the folder listed, a record taken, each partial opened, cut or
+//! removed with its record. Only a partial's bytes are read on the
+//! blocking pool. They hold the lock across no wait, and their futures
+//! are `Send`.
 
 use std::fmt;
 use std::io;

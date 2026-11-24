@@ -59,7 +59,14 @@ file before it gets its name.
   is. `created` and `whole` get the save's own handle: reading or
   seeking it, there or later through a clone kept, on any thread, moves
   no byte, since every byte is written at its own offset in the file
-  (a positioned write) and never at the handle's position.
+  (a positioned write) and never at the handle's position; where the
+  disk makes the file be copied into its name, that copy reads at its
+  own offsets too. A save whose future is dropped leaves no write to
+  its partial behind: when the drop returns, none is running and none
+  can start, and the handle it wrote through is closed; the drop waits
+  for a write already under way on the blocking pool, for as long as
+  that one write takes (one slice, 64 KiB, at most; on a disk that
+  stalls, as long as it stalls).
   `save_verified` is this save from `Start::New`, keeping nothing. The
   caller answers for a handed-in hasher matching the partial's bytes
   (`safecopy-resume` gives one read from the disk and checked).
@@ -96,20 +103,33 @@ The framing is fuzzed: `fuzz/fuzz_targets/framing.rs`.
 - **`save_resumable` takes a `Target { dir, name, size }`** where it took
   the three as arguments: `save_resumable(reader, target, start, keep,
   options, hooks, cancel)`. `save_verified` is as it was.
+- **A dropped save leaves no write behind.** Each write runs on the
+  blocking pool, and one handed there outlived the save's future: under
+  a busy pool it could start much later, and on Unix land in the partial
+  after a later save had reopened and hashed it, so a sender that sent
+  other bytes on the dropped connection and came back at once got them
+  written over checked bytes. The writer now shares a gate with each
+  write: a write takes it, writes nothing when it is shut, and holds it
+  while it writes; dropping the writer takes it and shuts it. Dropping a
+  save so waits for a write under way, one slice, where it never
+  waited before: on a disk that stalls, for as long as it stalls. Every other end (published,
+  cut and kept, failed) shuts the gate before the partial is cut back,
+  handed back or published
+  (`a_write_still_waiting_when_its_save_is_dropped_writes_nothing`,
+  `a_write_under_way_when_its_save_is_dropped_is_whole_when_the_drop_returns`).
 - **Every byte is written at its own offset**, by a positioned write
-  (`pwrite`, or a write with its offset on Windows), where the position
-  was set before each chunk and the bytes then written at it: a clone of
-  the file kept by a hook and moved while a chunk was written still
-  moved where its bytes landed. Nothing done to the handle's position
-  does now
-  (`a_clone_of_the_file_moved_on_another_thread_moves_no_byte`).
-- **Each chunk is written at its own offset.** The writer shared its
-  position with the handle given to `Hooks::created` and `Hooks::whole`,
-  and with the one a `Kept` came with: a hook that read or sought the
-  file, or a `Kept` with no byte kept whose handle stood past the start,
-  moved where the next bytes landed, under a hash that still matched
+  (`pwrite`, or a write with its offset on Windows). The writer shared
+  its position with the handle given to `Hooks::created` and
+  `Hooks::whole`, and with the one a `Kept` came with: a hook that read
+  or sought the file, a clone of it kept and moved on another thread
+  while a chunk was written, or a `Kept` with no byte kept whose handle
+  stood past the start, moved where the next bytes landed, under a hash
+  that still matched. Nothing done to the handle's position does now
   (`a_hook_that_moves_the_files_position_moves_no_byte`,
-  `a_resumed_save_from_zero_writes_from_the_files_first_byte`).
+  `a_clone_of_the_file_moved_on_another_thread_moves_no_byte`,
+  `a_resumed_save_from_zero_writes_from_the_files_first_byte`). The
+  copy into the name, where a disk needs one, reads at its own offsets
+  as well (`safecopy-folder`).
 - **What is kept, pinned by tests:**
   `a_write_that_fails_within_a_chunk_keeps_the_whole_chunks_before_it`,
   `a_partial_that_cannot_be_cut_back_is_removed`,

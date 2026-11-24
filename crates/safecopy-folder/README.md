@@ -77,6 +77,15 @@ original code behaved as below, this crate does not:
 
 ## Changes
 
+- **The copy into a name reads at its own offsets.** Where a disk has
+  neither hard links nor renames, `publish` copies the open file into
+  its name; it did so through the file's position, set to the start
+  once and shared with every clone of the handle, so a clone read or
+  moved on another thread during the copy changed what was published,
+  after the caller had checked the bytes. Each slice is now read and
+  written at an explicit offset (`pread` and `pwrite`, or their Windows
+  forms), and no handle's position is relied on
+  (`a_clone_moved_during_a_folder_copy_fallback_changes_no_byte`).
 - `Meta::of(&Metadata)`: the `Meta` of metadata already read, as
   `Meta::read` gives it, for a caller that holds it from a listing and
   opens no file (`meta_read_gives_the_owners_execute_bit_on_unix`,

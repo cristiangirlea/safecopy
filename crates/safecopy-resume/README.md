@@ -33,7 +33,13 @@ hash before the file gets its name (`safecopy-chunks`).
     file this store is receiving: a `Saving` is on it, or its receiving
     record is held. The save's own `Saving::forget` removes it then;
     so do `remove_all` (the person's word) and `expire` for a key left
-    out of its `live` list.
+    out of its `live` list. A sending record is forgotten first, whatever
+    is being received: the other side knows the key of a file sent to
+    it, and a stream it holds open under that key does not keep the
+    sender's record. When one was removed, the answer is `Ok` and a
+    file coming under the same key is left to its save. A record the
+    call found and could not remove (taken by a reopening meanwhile, or
+    held by another store) is `Busy` too: `Ok` says none is left.
   - `kept_by(peer) -> Result<Vec<Held>, ResumeError>`: what is kept from
     one peer, from the records and the folders' listings alone: each
     record whose partial is still the recorded file under its name and
@@ -71,7 +77,11 @@ hash before the file gets its name (`safecopy-chunks`).
     keeping the most), past a quarter of a disk's free space and what
     they hold (the oldest there), or past 256 sending records (the
     oldest); never a record of `live`, the `(peer, key)` of each file of
-    the sessions still running, moving or paused.
+    the sessions still running, moving or paused. A file that reads as
+    no record, and a receiving record whose file is not named as a
+    partial, go at once by their own name alone, whatever their age:
+    neither counts toward a cap. `kept_bytes` leaves such a record out
+    too, and its sum stops at the largest `u64`.
   - `clean_up(journals, ..)`: the journals' cleanup, leaving the partials a
     valid record keeps and the journals that list them, so a partial whose
     record is later gone or torn is still removed.
@@ -109,6 +119,26 @@ each program words them, and maps each `Verdict` to its own codes.
 
 With `safecopy_chunks::save_resumable` and a journal, in order.
 
+**Before anything: the store's folder is the program's alone.** Give
+`Store::open` a folder only the program that owns it can write, as its
+journals' folder is. A record is not sealed and nothing in it proves the
+store wrote it, and no check can: a program able to write that folder
+could write the journals too. A record file planted there **cannot** have
+a byte written through a link, have a file opened, cut, written or
+removed that is not named as a partial, or be written over a file that
+is not that record; one naming a file that is no partial counts toward
+no cap and goes at the next `expire`. It **can** name any file whose name
+ends in the partial ending, in any folder the person can write, by the
+folder's identity, the name and the file ID (another program's
+unfinished file, or on Unix this store's own running save under another
+key): step 6's `reopen_hashed` cuts that file and hands it out once its
+first `have` bytes hash to the record's `prefix`, both chosen by whoever
+planted the record, and `reopen` does without reading; whatever removes
+the record removes that file with it, and until then it counts toward
+the caps with the `have` it claims. The hash at the reopening and the
+whole file's hash at the end still decide what is published: no byte
+the sender did not send gets a name.
+
 **For every stream that brings a file, first:** `let saving =
 store.saving(peer, key)?`, before a check's answer is acted on.
 `ResumeError::Busy` says a save of this store is on that file already
@@ -134,7 +164,12 @@ The first time, on the receiver:
      record would stay held, and offered by `kept_by`, until an expiry.
    - The save's future is dropped, or it panics: nothing to call. The
      guard, dropped with the task, lets the record go as it was last
-     written, and the partial is continued or expired later.
+     written, and the partial is continued or expired later. When the
+     save's drop returns, no write of it is running and none can start,
+     so nothing of the dropped stream lands in the partial after a later
+     reopening; the drop waits for a write already under way, for as
+     long as that one write takes (64 KiB at most; on a disk that
+     stalls, as long as it stalls).
 
 The hooks of the two saves differ:
 
@@ -217,23 +252,38 @@ means the file is in use, by another process or by a save of this one
 stream. `ResumeError::Unreachable` means its disk is away: nothing is
 removed, and it may be tried again.
 
-**Where the blocking calls run.** The store's calls are synchronous and
-most do file work: the lookups and `saving` list the records' folder
-under the store's lock, and `kept_by` then inspects each partial's name;
-`receiving`, `keep` when a rewrite is due (every 64 MiB
-and second, and at a drop), `Saving::kept` and `Saving::forget` flush
-the partial and write or remove a record. On an async runtime, run
-`kept_by`, `expire` and `clean_up` on its blocking pool
-(`tokio::task::spawn_blocking`, with the store in an `Arc`), and the
-guard's `kept` and `forget` inside `tokio::task::block_in_place`: the
-guard borrows its store and does not move to another thread's task.
-`Hooks::whole` is called on the thread that polls the save: the
-`Store::keep` in it returns at once but when a rewrite is due, and then
-holds that thread for two flushes; on a multi-threaded runtime wrap it
-in `tokio::task::block_in_place`, or give the save a thread of its own.
-The crate's async functions (`reopen_hashed`, `held_hashed`,
-`held_from`) hold the store's lock across no wait, and their futures are
-`Send`.
+**Where the blocking calls run.** Every call of the store that reads or
+changes records, but the three async ones, is synchronous and does file
+work, most of it under the store's lock; none belongs on a thread that
+must not wait for a disk. Each lists the records' folder at least once
+(some two or three times) and opens the record files a listing shows as
+new or changed. Besides that:
+
+| call | file work |
+|---|---|
+| `received`, `sent`, `saving`, `keeps`, `kept_bytes`, `release`, `release_peer` | the listing only (dropping a `Saving` lists nothing) |
+| `Store::open` | makes the folder, reads every record |
+| `kept_by` | inspects each kept partial's name in its folder |
+| `reopen` | takes the record file, finds the partial's folder by identity, opens the partial and cuts it |
+| `receiving` | flushes the partial, writes the record and flushes it, each time |
+| `sending` | writes the record and flushes it |
+| `keep`, `Saving::kept` | as `receiving` when a rewrite is due (every 64 MiB and second) or at a drop; otherwise the lookup only |
+| `forget`, `Saving::forget`, `remove_all`, `expire`, `clean_up` | remove record files and partials; `expire` reads each disk's free space, `clean_up` the journals |
+
+On an async runtime, run them on its blocking pool
+(`tokio::task::spawn_blocking`, with the store in an `Arc`) or inside
+`tokio::task::block_in_place`. A `Saving` borrows its store and does not
+move to another thread's task: take it and end it (`kept`, `forget`)
+inside `block_in_place`. `Hooks::whole` is called on the thread that
+polls the save: the `Store::keep` in it lists the folder each time, and
+when a rewrite is due holds that thread for two flushes; on a
+multi-threaded runtime wrap it in `tokio::task::block_in_place`, or give
+the save a thread of its own. The crate's async functions
+(`reopen_hashed`, `held_hashed`, `held_from`) do the same file work on
+the thread that polls them, before, between and after their waits (the
+folder listed, a record taken, each partial opened, cut or removed with
+its record), and read only a partial's bytes on the blocking pool; they
+hold the store's lock across no wait, and their futures are `Send`.
 
 ## Systems
 
@@ -292,8 +342,19 @@ or handed out to be written. `kept_by` does not list it; `reopen`,
 `ResumeError::Gone` and remove the record alone; `receiving` and `keep`
 are `ResumeError::NotPartial` and write nothing. `expire`, `forget` and
 `remove_all` remove such a record's own file and leave the file it
-names, as a journal's cleanup does. Two stores on one folder must so be
-given the same ending: each takes the other's records for these.
+names, as a journal's cleanup does; `expire` removes it at once,
+whatever its age or its `live` list, and neither it nor `kept_bytes`
+counts what it says it keeps. Two stores on one folder must so be
+given the same ending: each takes the other's records for these, and
+its `expire` removes them.
+
+**A save dropped while it writes.** A save's writes run on the blocking
+pool, and one handed there does not end with the future that asked for
+it. The save's writer shares a gate with each of them: dropped, it waits
+for the write that holds the gate (one slice, for as long as the disk
+takes over it) and shuts every later one out. So on every system a write of a dropped save never lands
+in the partial after a later save reopened and hashed it, whatever the
+other side sent on the dropped connection.
 
 **A partial open elsewhere.** On Windows a partial file being written is
 open without delete sharing, which shuts out the reopening a check or a
@@ -325,14 +386,63 @@ record's path is kept as the system holds it (UTF-16 on
 Windows, bytes on Unix), so a record is read on the system that wrote it; with the rest it must fit
 one 16 KiB slot. A handshake list naming one key twice is refused.
 
-Records hold no file contents and are not sealed: whoever can write the
-records' folder runs as the person. A tampered receiving record can only
-make a file start from zero.
+Records hold no file contents and are not sealed: the store's folder
+must be writable only by the program that owns it. What a record planted
+there can and cannot do is said at the top of "How to resume a file":
+it gets a file named as a partial cut, continued or removed, never a
+file under another name, and no byte published that the sender did not
+send.
 
 The handshake and the checks are fuzzed: `fuzz/fuzz_targets/resume_handshake.rs`.
 
 ## Changes
 
+- **What a record planted in the store's folder can do is said.** The
+  docs said a tampered receiving record could only make a file start
+  from zero. It can name any file that ends in the partial ending, in
+  any folder the person can write, and have it cut, continued or
+  removed. The folder must be writable only by its program; "How to
+  resume a file" and the crate docs say what such a record can and
+  cannot do, and that the hashes still decide what is published.
+- **A dropped save leaves no write behind** (`safecopy-chunks`): on Unix
+  a write of a dropped save still on the blocking pool could land after
+  a later save had reopened and hashed the partial, with whatever the
+  other side had sent on the dropped connection. `Saving`'s docs said
+  that was harmless; it was only for an honest sender.
+- **`Store::forget` lets go of no record it did not take.** It claimed
+  the file with a save's guard, and that guard, dropped, let go of the
+  receiving record: one taken by a `reopen` while the `forget` ran lost
+  its hold, and a second reopening could cut the partial under the
+  first. A `forget` that leaves a record it found now answers `Busy`,
+  where it answered `Ok`
+  (`a_forget_lets_go_of_no_record_a_reopening_took_meanwhile`).
+- **`Store::forget` removes a sending record whatever is being
+  received.** The claim was by peer and key with no direction, so the
+  other side, which knows the key of a file sent to it, could hold a
+  stream open under that key and have the sender's `forget` answer
+  `Busy`. The sending record now goes first, held or not; when there
+  was one the answer is `Ok`, and a file coming under the same key is
+  left to its save
+  (`a_sending_record_is_forgotten_while_a_file_comes_under_its_key`).
+- **`Store::expire` and `Store::kept_bytes` count only records the
+  store acts on.** A record whose file is not named as a partial was
+  kept, counted toward every cap with the `have` it claimed, had its
+  folder opened for its free space, and could push the oldest real
+  partials out. `expire` now removes it at once, by its own name, and
+  `kept_bytes` leaves it out
+  (`a_planted_record_of_no_partial_pushes_nothing_out_and_goes_at_an_expiry`).
+  A record that says it keeps more bytes than its size no longer reads
+  as a record
+  (`a_record_keeping_more_than_its_size_is_not_read_as_a_record`), and
+  the sums of kept bytes stop at the largest `u64`, where they wrapped
+  or panicked
+  (`kept_bytes_past_what_a_number_holds_do_not_overflow`).
+- **Where the blocking calls run** names every call that lists the
+  folder or does file work: `saving`, `received`, `sent`, `reopen` and
+  `receiving` were missing.
+- **Tested:** an empty file with a second name under a record's name is
+  not written
+  (`an_empty_file_with_a_second_name_under_a_records_name_is_not_written`).
 - **The store acts only on a record whose file is named as a partial.**
   `reopen` and `reopen_hashed` opened the file a record named, whatever
   its name, and cut it to the record's `have`: a record file put into

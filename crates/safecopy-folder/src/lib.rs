@@ -540,8 +540,6 @@ mod seams {
 
     /// Runs `hook` once, when the code reaches `point`: a swap acted out
     /// between two steps.
-    // Only the Unix tests swap files: Windows holds them without delete sharing.
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn on(point: &'static str, hook: impl FnOnce() + 'static) {
         HOOKS.with_borrow_mut(|hooks| hooks.push((point, Box::new(hook))));
     }

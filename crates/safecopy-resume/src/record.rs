@@ -190,6 +190,13 @@ impl Record {
             _ => return Err(ResumeError::Damaged),
         };
         s.end()?;
+        // No store writes more kept bytes than the file has: such a record
+        // is not one, and its number is not counted anywhere.
+        if let Record::Receiving(r) = &record
+            && r.have > r.size
+        {
+            return Err(ResumeError::Damaged);
+        }
         Ok(record)
     }
 }

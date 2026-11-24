@@ -354,7 +354,8 @@ impl From<io::Error> for ChunkError {
 // Android's emulated thread locals make Clippy ask for the `const` already there.
 #[allow(clippy::missing_const_for_thread_local)]
 mod seams {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::sync::Arc;
 
     thread_local! {
         /// The next removal of a partial file fails with this system code.
@@ -368,6 +369,26 @@ mod seams {
         pub static SYNC_ERROR: Cell<bool> = const { Cell::new(false) };
         /// The next publish of a checked file fails.
         pub static PUBLISH_ERROR: Cell<bool> = const { Cell::new(false) };
+        /// Told of each step of the writes of the next save this thread
+        /// starts, on the thread that takes the step.
+        pub static WRITES: RefCell<Option<Writes>> = const { RefCell::new(None) };
+    }
+
+    /// What hears of a save's writes: it may hold a step for as long as a
+    /// test needs.
+    pub type Writes = Arc<dyn Fn(Step) + Send + Sync>;
+
+    /// A step of a save's writer.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Step {
+        /// A write is on the blocking pool and has not taken the gate.
+        Queued,
+        /// It holds the gate and is about to write.
+        Writing,
+        /// It has let the gate go, written or not.
+        Ended,
+        /// The writer is being dropped and is about to take the gate.
+        Closing,
     }
 }
 

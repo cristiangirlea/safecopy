@@ -23,6 +23,9 @@ pub(crate) mod seams {
         /// This thread's hashing of a prefix does not end: a slow disk,
         /// for as long as a test needs it.
         pub static STALL: Cell<bool> = const { Cell::new(false) };
+        /// Runs once, in this thread's next `forget`, after it claimed the
+        /// file and before it removes anything.
+        pub static FORGETTING: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
     }
 
     pub async fn stall() {
@@ -1337,8 +1340,10 @@ async fn another_store_on_the_same_folder_leaves_this_ones_records_and_partials(
     let day = 24 * 60 * 60;
     let expired = other.expire(30 * day, Duration::from_secs(1), &[]).unwrap();
     assert_eq!(expired.removed, 0);
-    other.forget(PEER, key(62)).unwrap();
-    other.forget(PEER, key(64)).unwrap();
+    // Held by the first store: left, and said to be in use.
+    let busy = Some(ResumeError::Busy);
+    assert_eq!(other.forget(PEER, key(62)).err(), busy);
+    assert_eq!(other.forget(PEER, key(64)).err(), busy);
     assert_eq!(other.remove_all(None).unwrap(), 0);
     let listed = other.held_from(PEER).await.unwrap();
     assert_eq!(listed.iter().map(|h| h.key).collect::<Vec<_>>(), [key(62)]);
@@ -1810,7 +1815,9 @@ async fn two_stores_on_one_folder_read_each_others_records_and_write_only_their_
     // Nor removes it, or its partial, by any way.
     let day = 24 * 60 * 60;
     for (store, other) in [(a, key(111)), (&b, key(110))] {
-        store.forget(PEER, other).unwrap();
+        assert_eq!(store.forget(PEER, other).err(), Some(ResumeError::Busy));
+    }
+    for store in [a, &b] {
         let expired = store.expire(30 * day, Duration::from_secs(1), &[(PEER, key(0))]);
         assert_eq!(expired.unwrap().removed, 1, "its own, past its time");
     }
@@ -2907,17 +2914,26 @@ fn ordinary(side: &Side, name: &str, bytes: &[u8]) -> File {
 /// file `file`, recorded under `name`, is a partial holding one whole
 /// chunk of `bytes`. Its path.
 fn forged(side: &Side, key: TransferKey, file: &File, name: &str, bytes: &[u8]) -> PathBuf {
-    let record = Receiving {
-        peer: PEER,
-        key,
-        same: Vec::new(),
-        size: bytes.len() as u64,
-        at: PartialAt::of(&side.root, &side.root, file, OsStr::new(name)).unwrap(),
-        have: C,
-        prefix: hash(&bytes[..C as usize]),
-        created: 5,
-        last: 5,
-    };
+    planted(
+        side,
+        Receiving {
+            peer: PEER,
+            key,
+            same: Vec::new(),
+            size: bytes.len() as u64,
+            at: PartialAt::of(&side.root, &side.root, file, OsStr::new(name)).unwrap(),
+            have: C,
+            prefix: hash(&bytes[..C as usize]),
+            created: 5,
+            last: 5,
+        },
+    )
+}
+
+/// The record file of `record` as a store writes one first, put into the
+/// store's folder by someone else. Its path.
+fn planted(side: &Side, record: Receiving) -> PathBuf {
+    let key = record.key;
     let payload = crate::record::Record::Receiving(record).encode();
     let mut written = crate::record::slot(1, &payload).unwrap();
     written.resize(2 * crate::record::SLOT + 1, 0);
@@ -2973,14 +2989,13 @@ async fn a_forged_record_naming_another_file_cuts_and_opens_nothing() {
     assert!(store.held_from(PEER).await.unwrap().is_empty());
     untouched();
 
-    // Listed by nothing, it waits for an expiry: its name goes then, and
-    // the file it names stays.
+    // Listed by nothing, it goes at the next expiry, whatever its age:
+    // its name alone, and the file it names stays.
     forge();
     assert!(store.kept_by(PEER).unwrap().is_empty());
     assert!(record.exists());
     let hour = Duration::from_secs(3600);
-    assert_eq!(store.expire(6, hour, &[]).unwrap().removed, 0);
-    assert_eq!(store.expire(5 + 7200, hour, &[]).unwrap().removed, 1);
+    assert_eq!(store.expire(6, hour, &[]).unwrap().removed, 1);
     assert!(!record.exists());
     untouched();
 
@@ -3147,4 +3162,237 @@ async fn a_store_keeps_partials_of_its_own_ending_only() {
         side.store.receiving(&own, &ordinary(&side, "h.bin", b"")),
         Err(ResumeError::NotPartial)
     );
+}
+
+/// More bytes than fit a number, in whole chunks.
+const HUGE: u64 = u64::MAX / C * C;
+
+/// A record put into the store's folder that names a file which is no
+/// partial, and claims to keep more than any disk holds: it has no place
+/// among the kept, so no kept file is removed to make room for it, and
+/// it goes at the next expiry, in `live` or not.
+#[tokio::test]
+async fn a_planted_record_of_no_partial_pushes_nothing_out_and_goes_at_an_expiry() {
+    let side = side("planted-huge", Limits::default());
+    let store = &side.store;
+    kept_zeros(&side, PEER, key(220), "real", 1, 5);
+    later(&side);
+    let bytes = data(C);
+    let file = ordinary(&side, "thesis.docx", &bytes);
+    let record = planted(
+        &side,
+        Receiving {
+            peer: PEER,
+            key: key(221),
+            same: Vec::new(),
+            size: HUGE,
+            at: PartialAt::of(&side.root, &side.root, &file, OsStr::new("thesis.docx")).unwrap(),
+            have: HUGE,
+            prefix: hash(b""),
+            created: 6,
+            // Newer than the real one: the oldest goes first.
+            last: 6,
+        },
+    );
+    assert_eq!(store.received(PEER, key(221)).unwrap().have, HUGE);
+    assert_eq!(store.kept_bytes(), C, "its bytes are not counted");
+    seams::FREE.set(Some(100 * C));
+    let hour = Duration::from_secs(3600);
+    let expired = store.expire(7, hour, &[(PEER, key(221))]);
+    seams::FREE.set(None);
+    assert_eq!(
+        expired,
+        Ok(Expired {
+            removed: 1,
+            kept_bytes: C
+        })
+    );
+    assert!(!record.exists(), "the planted record went");
+    assert!(std::fs::read(side.place.join("thesis.docx")).unwrap() == bytes);
+    assert_eq!(keys(&store.kept_by(PEER).unwrap()), [key(220)]);
+    assert!(side.place.join("real.part").exists());
+    // An expiry counts the bytes it may remove: a live file's are not in
+    // its sum, and are in the store's.
+    let live = store.expire(7, hour, &[(PEER, key(220))]).unwrap();
+    assert_eq!((live.removed, live.kept_bytes), (0, 0));
+    assert_eq!(store.kept_bytes(), C);
+}
+
+/// No store writes a record that keeps more bytes than its file has: one
+/// that says so does not read as a record, and goes as any file that
+/// reads as nothing.
+#[tokio::test]
+async fn a_record_keeping_more_than_its_size_is_not_read_as_a_record() {
+    let side = side("past-size", Limits::default());
+    let file = side.root.create(OsStr::new("f.part")).unwrap();
+    let record = Receiving {
+        peer: PEER,
+        key: key(222),
+        same: Vec::new(),
+        size: C,
+        at: PartialAt::of(&side.root, &side.root, &file, OsStr::new("f.part")).unwrap(),
+        have: 2 * C,
+        prefix: hash(b""),
+        created: 5,
+        last: 5,
+    };
+    let payload = crate::record::Record::Receiving(record.clone()).encode();
+    assert_eq!(
+        crate::record::Record::decode(&payload),
+        Err(ResumeError::Damaged)
+    );
+    let whole = Receiving {
+        have: C,
+        ..record.clone()
+    };
+    let payload = crate::record::Record::Receiving(whole.clone()).encode();
+    assert_eq!(
+        crate::record::Record::decode(&payload),
+        Ok(crate::record::Record::Receiving(whole)),
+        "all of it kept is a record"
+    );
+    let path = planted(&side, record);
+    assert!(side.store.received(PEER, key(222)).is_none());
+    assert_eq!(side.store.kept_bytes(), 0);
+    let hour = Duration::from_secs(3600);
+    assert_eq!(side.store.expire(6, hour, &[]).unwrap().removed, 1);
+    assert!(!path.exists());
+    assert!(side.place.join("f.part").exists(), "by its name alone");
+}
+
+/// Records that read, and say more is kept than a number holds: the sums
+/// stop at the largest number, and nothing wraps or panics.
+#[tokio::test]
+async fn kept_bytes_past_what_a_number_holds_do_not_overflow() {
+    // A share nothing passes: only the sums are looked at.
+    let limits = Limits {
+        disk_share: (1, 1),
+        ..Limits::default()
+    };
+    let side = side("kept-overflow", limits);
+    for (n, name) in [(223, "a.part"), (224, "b.part")] {
+        let file = side.root.create(OsStr::new(name)).unwrap();
+        planted(
+            &side,
+            Receiving {
+                peer: PEER,
+                key: key(n),
+                same: Vec::new(),
+                size: HUGE,
+                at: PartialAt::of(&side.root, &side.root, &file, OsStr::new(name)).unwrap(),
+                have: HUGE,
+                prefix: hash(b""),
+                created: 5,
+                last: 5,
+            },
+        );
+    }
+    assert_eq!(side.store.kept_bytes(), u64::MAX);
+    seams::FREE.set(Some(u64::MAX));
+    let expired = side.store.expire(6, Duration::from_secs(3600), &[]);
+    seams::FREE.set(None);
+    assert_eq!(
+        expired,
+        Ok(Expired {
+            removed: 0,
+            kept_bytes: u64::MAX
+        })
+    );
+    // A share they are past: counted, they go, and the count comes down.
+    let records = side.base.join("records");
+    let strict = Store::open(&records, Limits::default()).unwrap();
+    seams::FREE.set(Some(u64::MAX));
+    let expired = strict.expire(6, Duration::from_secs(3600), &[]);
+    seams::FREE.set(None);
+    assert_eq!(
+        expired,
+        Ok(Expired {
+            removed: 2,
+            kept_bytes: 0
+        })
+    );
+}
+
+/// A `forget` claims the file as a save does while it removes, and ends
+/// that claim without letting go of a record it never took: one a
+/// reopening took meanwhile is still that reopening's.
+#[tokio::test]
+async fn a_forget_lets_go_of_no_record_a_reopening_took_meanwhile() {
+    use std::sync::{Arc, Mutex};
+    let side = side("forget-hold", Limits::default());
+    let records = side.base.join("records");
+    let store = Arc::new(Store::open(&records, Limits::default()).unwrap());
+    kept_in(&store, &side, PEER, key(225), "f", 1, 5);
+    assert!(store.release(PEER, key(225)));
+    let (reopening, taken) = (store.clone(), Arc::new(Mutex::new(None)));
+    let slot = taken.clone();
+    seams::FORGETTING.set(Some(Box::new(move || {
+        *slot.lock().unwrap() = Some(reopening.reopen(PEER, key(225)).unwrap());
+    })));
+    // Taken since the forget looked: the record stays, with its partial,
+    // and the forget says so.
+    let busy = Some(ResumeError::Busy);
+    assert_eq!(store.forget(PEER, key(225)).err(), busy);
+    assert!(taken.lock().unwrap().is_some(), "the reopening ran");
+    assert!(store.received(PEER, key(225)).is_some());
+    assert!(side.place.join("f.part").exists());
+    assert_eq!(
+        store.reopen(PEER, key(225)).err(),
+        busy,
+        "not reopened under the first"
+    );
+    assert_eq!(store.forget(PEER, key(225)).err(), busy);
+    // And the forget's claim is gone: the file is a save's to take.
+    assert!(store.release(PEER, key(225)));
+    assert!(store.saving(PEER, key(225)).is_ok());
+}
+
+/// The other side knows the key of a file sent to it, and can hold a
+/// stream open under that key: the sender's record is forgotten all the
+/// same, and the file coming under the key is left to its save.
+#[tokio::test]
+async fn a_sending_record_is_forgotten_while_a_file_comes_under_its_key() {
+    let side = side("forget-sent-key", Limits::default());
+    let store = &side.store;
+    source(&side, key(226), b"sent");
+    let guard = store.saving(PEER, key(226)).unwrap();
+    store.forget(PEER, key(226)).unwrap();
+    assert!(store.sent(PEER, key(226)).is_none());
+    // The same once that stream has a record, held by its save.
+    source(&side, key(226), b"sent");
+    kept_zeros(&side, PEER, key(226), "coming", 1, 5);
+    store.forget(PEER, key(226)).unwrap();
+    assert!(store.sent(PEER, key(226)).is_none());
+    assert!(store.received(PEER, key(226)).is_some(), "the save's own");
+    assert!(side.place.join("coming.part").exists());
+    // With no sending record, the file being received is what is asked
+    // for, and is in use.
+    assert_eq!(store.forget(PEER, key(226)).err(), Some(ResumeError::Busy));
+    assert!(store.received(PEER, key(226)).is_some());
+    guard.forget().unwrap();
+    assert!(store.received(PEER, key(226)).is_none());
+    assert!(!side.place.join("coming.part").exists());
+}
+
+/// An empty file is taken for a record not yet written only with the one
+/// name: one that some other name shows too is another file.
+#[tokio::test]
+async fn an_empty_file_with_a_second_name_under_a_records_name_is_not_written() {
+    let side = side("empty-linked", Limits::default());
+    let (record, partial) = unwritten(&side, key(227), "f");
+    let name = side
+        .base
+        .join("records")
+        .join(crate::store::file_name(true, PEER, key(227)));
+    let other = side.place.join("notes.txt");
+    std::fs::write(&other, b"").unwrap();
+    std::fs::hard_link(&other, &name).unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            side.store.receiving(&record, &partial),
+            Err(ResumeError::Busy)
+        );
+        assert_eq!(std::fs::read(&other).unwrap(), b"", "not a byte in it");
+    }
+    assert!(side.store.received(PEER, key(227)).is_none());
 }

@@ -1234,8 +1234,6 @@ fn removable(name: &str, settings: &Settings) -> bool {
 
 /// Switches tests use to act out a failing disk or a crash.
 #[cfg(test)]
-// Android's emulated thread locals make Clippy ask for the `const` already there.
-#[allow(clippy::missing_const_for_thread_local)]
 pub(crate) mod seams {
     use std::cell::Cell;
 
@@ -1250,36 +1248,43 @@ pub(crate) mod seams {
         BeforeOldDeleted,
     }
 
+    /// A seam as it stands until a test sets it. Not a `const` initialiser:
+    /// where thread locals are emulated (Android), Clippy asks for the
+    /// `const` that is already there.
+    fn unset<T: Default>() -> T {
+        T::default()
+    }
+
     thread_local! {
         /// How many of this thread's next appends fail halfway.
-        pub static FAIL_WRITES: Cell<u32> = const { Cell::new(0) };
+        pub static FAIL_WRITES: Cell<u32> = unset();
         /// No recorded volume opens on this thread: a disk unplugged.
-        pub static NO_VOLUME: Cell<bool> = const { Cell::new(false) };
+        pub static NO_VOLUME: Cell<bool> = unset();
         /// How many syncs this thread made.
-        pub static SYNCS: Cell<u32> = const { Cell::new(0) };
+        pub static SYNCS: Cell<u32> = unset();
         /// How many folder syncs this thread made.
-        pub static DIR_SYNCS: Cell<u32> = const { Cell::new(0) };
+        pub static DIR_SYNCS: Cell<u32> = unset();
         /// The journal's root acted out as on another volume (Windows).
-        pub static OTHER_VOLUME: Cell<bool> = const { Cell::new(false) };
+        pub static OTHER_VOLUME: Cell<bool> = unset();
         /// The next segment of this thread's journal fails to begin, once.
-        pub static FAIL_ROLL: Cell<bool> = const { Cell::new(false) };
+        pub static FAIL_ROLL: Cell<bool> = unset();
         /// A crash to act out at the next segment.
-        pub static CRASH: Cell<Option<Crash>> = const { Cell::new(None) };
+        pub static CRASH: Cell<Option<Crash>> = unset();
         /// How this thread reads a held folder's present place.
-        pub static PLACE: Cell<Place> = const { Cell::new(Place::Read) };
+        pub static PLACE: Cell<Place> = unset();
     }
 
     thread_local! {
         /// Run once, when this thread's next `files::hold` has opened its
         /// file and not yet locked it.
-        pub static HOLD_OPENED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-            const { std::cell::RefCell::new(None) };
+        pub static HOLD_OPENED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = unset();
     }
 
     /// A reading of a held folder's present place, acted out.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
     pub enum Place {
         /// As the system reads it.
+        #[default]
         Read,
         /// The system reads it and this reading fails.
         Fails,

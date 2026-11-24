@@ -2226,3 +2226,112 @@ fn a_resumable_save_can_run_on_another_thread() {
     );
     sendable(&saving);
 }
+
+/// One slice of a file on a stream that stays open, and a save of it
+/// polled once: the slice is handed to the blocking pool, and the save
+/// waits for the next.
+macro_rules! one_slice_in {
+    ($to:expr, $bytes:expr, $dir:ident, $save:ident) => {
+        let $dir = Directory::open($to).unwrap();
+        let (mut sending, mut receiving) = tokio::io::duplex(SLICE);
+        sending.write_all(&$bytes[..SLICE]).await.unwrap();
+        let target = Target {
+            dir: &$dir,
+            name: "a.bin",
+            size: $bytes.len() as u64,
+        };
+        let options = SaveOptions::default();
+        let keep = |_: &ChunkError| false;
+        let pending = std::future::pending();
+        let mut $save = Box::pin(save_resumable(
+            &mut receiving,
+            target,
+            Start::New,
+            &keep,
+            &options,
+            &(),
+            pending,
+        ));
+        let polled = std::future::poll_fn(|cx| Poll::Ready($save.as_mut().poll(cx))).await;
+        assert!(polled.is_pending(), "its stream is still open");
+    };
+}
+
+/// A write on the blocking pool does not end with the future that asked
+/// for it. One that had not started when its save was dropped writes
+/// nothing, however late it runs: a save continuing the partial by then
+/// has no byte of the dropped one written over its own.
+#[tokio::test]
+async fn a_write_still_waiting_when_its_save_is_dropped_writes_nothing() {
+    use crate::seams::Step;
+    use std::sync::mpsc;
+    let to = temp("dropped-waiting");
+    let bytes = data(3 * SLICE);
+    let (heard, steps) = mpsc::channel();
+    let (release, go) = mpsc::channel::<()>();
+    let go = Mutex::new(go);
+    crate::seams::WRITES.set(Some(Arc::new(move |step| {
+        let _ = heard.send(step);
+        // Held before it starts, as a busy pool holds it; let go when
+        // the test drops `release`.
+        if step == Step::Queued {
+            let _ = go.lock().unwrap().recv();
+        }
+    })));
+    one_slice_in!(&to, bytes, dir, save);
+    assert_eq!(steps.recv().unwrap(), Step::Queued);
+    drop(save);
+    assert_eq!(steps.recv().unwrap(), Step::Closing);
+    drop(release);
+    assert_eq!(steps.recv().unwrap(), Step::Ended, "it never wrote");
+    assert!(steps.try_recv().is_err());
+    assert_eq!(std::fs::read(to.join("a.bin.part")).unwrap(), b"");
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// Lets a held write go when the test ends, however it ends.
+struct Release(Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().take();
+    }
+}
+
+/// A write that was under way when its save was dropped is whole when the
+/// drop returns: nothing of it is still to land.
+#[tokio::test]
+async fn a_write_under_way_when_its_save_is_dropped_is_whole_when_the_drop_returns() {
+    use crate::seams::Step;
+    use std::sync::mpsc;
+    let to = temp("dropped-writing");
+    let bytes = data(3 * SLICE);
+    let (heard, steps) = mpsc::channel();
+    let (release, go) = mpsc::channel::<()>();
+    let go = Mutex::new(go);
+    let release = Arc::new(Mutex::new(Some(release)));
+    let _release = Release(release.clone());
+    crate::seams::WRITES.set(Some(Arc::new(move |step| {
+        let _ = heard.send(step);
+        match step {
+            // Held with the gate, before its first byte.
+            Step::Writing => {
+                let _ = go.lock().unwrap().recv();
+            }
+            // Let go only once the drop is at the gate.
+            Step::Closing => drop(release.lock().unwrap().take()),
+            _ => {}
+        }
+    })));
+    one_slice_in!(&to, bytes, dir, save);
+    assert_eq!(steps.recv().unwrap(), Step::Queued);
+    assert_eq!(steps.recv().unwrap(), Step::Writing);
+    drop(save);
+    // Read at once, with no wait for the pool.
+    assert!(std::fs::read(to.join("a.bin.part")).unwrap() == bytes[..SLICE]);
+    assert_eq!(steps.recv().unwrap(), Step::Closing);
+    assert_eq!(steps.recv().unwrap(), Step::Ended);
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}

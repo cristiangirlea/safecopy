@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, ready};
 
 use safecopy_folder::{
@@ -33,9 +33,10 @@ pub trait Hooks: Send + Sync {
     /// The partial file `partial` was created as `file`: for a crash record.
     /// Not called for [`Start::Resume`], whose caller holds the file
     /// already. `file` is the save's own handle: reading or seeking it,
-    /// here or later through a clone kept, moves no byte the save writes,
-    /// since every byte is written at its own offset in the file and
-    /// never at the handle's position.
+    /// here or later through a clone kept, on any thread, moves no byte
+    /// the save writes or publishes, since every byte is written at its
+    /// own offset in the file and never at the handle's position, and a
+    /// file that is copied into its name is read the same way.
     fn created(&self, file: &File, partial: &OsStr) -> io::Result<()> {
         let _ = (file, partial);
         Ok(())
@@ -74,7 +75,7 @@ pub trait Hooks: Send + Sync {
     /// find. Called once for
     /// a save that runs to its end, whatever that end is; not called when
     /// the save's future is dropped, and the partial file then stays for
-    /// the crash cleanup.
+    /// the crash cleanup, with no write of the save still to come.
     fn ended(&self, outcome: Result<&Saved, &ChunkError>, partial: PartialFate) {
         let _ = (outcome, partial);
     }
@@ -265,6 +266,13 @@ impl std::error::Error for Stopped {}
 /// failed ([`PartialFate::Left`]).
 ///
 /// `cancel` is watched while the bytes come and while publishing.
+///
+/// Dropping the save's future ends its writing of the partial file: when
+/// the drop returns, no write to it is running and none can start, and
+/// the handle the save wrote through is closed. The drop waits for a
+/// write already under way on the blocking pool, for as long as that
+/// one write takes: one slice ([`crate::SLICE`]) at most, and on a disk
+/// that stalls, as long as it stalls.
 pub async fn save_verified<R: AsyncRead + Unpin + ?Sized>(
     reader: &mut R,
     dir: &Directory,
@@ -312,6 +320,22 @@ pub async fn save_verified<R: AsyncRead + Unpin + ?Sized>(
 /// errors that came while the stream was read. A write that fails within
 /// a chunk keeps the whole chunks before it; an error from
 /// [`Hooks::whole`] keeps the chunk it was told of too.
+///
+/// **Dropped.** A save whose future is dropped leaves its partial file
+/// as its writes left it, and no write behind: each write runs on the
+/// blocking pool behind a gate the save's writer shares with it, and the
+/// drop shuts that gate. When the drop returns, no write of the save is
+/// running and none can start, whatever the pool still holds, so a save
+/// that continues the partial afterwards never has bytes of the dropped
+/// one land over its own. The drop waits for a write already under way,
+/// for as long as that one write takes: one slice ([`crate::SLICE`]) at
+/// most, and on a disk that stalls, as long as it stalls. A copy into
+/// the name that a publish had begun is not the partial: a slice of it
+/// still on the pool ends there, into a copy the drop removes. Every
+/// other end goes through the
+/// same gate first: it is shut before the partial is cut back, handed
+/// back in [`Stopped::kept`], flushed, published or removed, and
+/// [`Hooks::whole`] is called with no write under way.
 ///
 /// What the matching hash proves: see the [crate] docs.
 pub async fn save_resumable<R: AsyncRead + Unpin + ?Sized>(
@@ -564,8 +588,9 @@ async fn fill<R: AsyncRead + Unpin + ?Sized>(
         () = cancel.as_mut() => Err(ChunkError::Cancelled),
         trailer = receiving => trailer,
     };
-    // Every write is done, and its handle closed, before the file is
-    // used for anything else.
+    // Every write is done, and the writer's gate shut and its handle
+    // closed, before the file is used for anything else: no write of
+    // this save runs or starts after a cut-back, a hand-back or an end.
     writer.settle().await;
     drop(writer);
     let trailer = trailer?;
@@ -615,19 +640,38 @@ async fn fill<R: AsyncRead + Unpin + ?Sized>(
 /// position: whatever moves that position, through the handle a hook was
 /// given or a clone of it on any thread, moves no byte. Each write runs on
 /// the blocking pool; its error comes with the next write or the flush.
+///
+/// A write handed to the pool outlives the future that asked for it, so
+/// the writer and its writes share a gate: dropped, the writer waits for
+/// the write that holds it and shuts every later one out.
 pub(crate) struct Placed {
-    file: Arc<File>,
+    gate: Arc<Gate>,
     /// Where the next byte goes.
     at: u64,
     writing: Option<JoinHandle<io::Result<()>>>,
+    #[cfg(test)]
+    seam: Option<crate::seams::Writes>,
+}
+
+/// The handle a writer's writes go through: held for the length of each
+/// write, and empty once the writer is gone.
+struct Gate(Mutex<Option<File>>);
+
+impl Gate {
+    fn lock(&self) -> MutexGuard<'_, Option<File>> {
+        // A write that panicked left the file as whole as it will be.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl Placed {
     pub(crate) fn new(file: &File, at: u64) -> io::Result<Self> {
         Ok(Self {
-            file: Arc::new(file.try_clone()?),
+            gate: Arc::new(Gate(Mutex::new(Some(file.try_clone()?)))),
             at,
             writing: None,
+            #[cfg(test)]
+            seam: crate::seams::WRITES.take(),
         })
     }
 
@@ -648,6 +692,18 @@ impl Placed {
     }
 }
 
+impl Drop for Placed {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(seam) = &self.seam {
+            seam(crate::seams::Step::Closing);
+        }
+        // Waits for the write that holds the gate, one slice, as long
+        // as the disk takes. A write that has not started finds no file.
+        self.gate.lock().take();
+    }
+}
+
 impl AsyncWrite for Placed {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -656,9 +712,30 @@ impl AsyncWrite for Placed {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         ready!(this.poll_done(cx))?;
-        let (file, at, owned) = (this.file.clone(), this.at, bytes.to_vec());
+        let (gate, at, owned) = (this.gate.clone(), this.at, bytes.to_vec());
+        #[cfg(test)]
+        let seam = this.seam.clone();
         this.writing = Some(tokio::task::spawn_blocking(move || {
-            write_at(&file, &owned, at)
+            #[cfg(test)]
+            let step = |step| {
+                if let Some(seam) = &seam {
+                    seam(step);
+                }
+            };
+            #[cfg(test)]
+            step(crate::seams::Step::Queued);
+            let written = match &*gate.lock() {
+                Some(file) => {
+                    #[cfg(test)]
+                    step(crate::seams::Step::Writing);
+                    write_at(file, &owned, at)
+                }
+                // The writer is gone, and its save with it.
+                None => Ok(()),
+            };
+            #[cfg(test)]
+            step(crate::seams::Step::Ended);
+            written
         }));
         this.at += bytes.len() as u64;
         Poll::Ready(Ok(bytes.len()))

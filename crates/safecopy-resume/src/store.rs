@@ -24,7 +24,9 @@ pub struct Expired {
     /// Records removed, with their partial files: too old, past a cap, or
     /// with no slot that reads.
     pub removed: usize,
-    /// Bytes the kept files hold after it.
+    /// Bytes the kept files hold after it, those of `live` left out:
+    /// [`Store::kept_bytes`] counts them all. Never more than a `u64`
+    /// holds.
     pub kept_bytes: u64,
 }
 
@@ -83,7 +85,9 @@ struct State {
     held: HashMap<String, File>,
     /// What each record file held when it was last read.
     index: HashMap<String, Indexed>,
-    /// The files a save of this store is on ([`Saving`]).
+    /// The files being received that a save of this store is on
+    /// ([`Saving`]), or a removal ([`Claimed`]): by the peer they come
+    /// from. A file sent under the same key is not in it.
     saving: HashSet<(PeerId, TransferKey)>,
 }
 
@@ -253,7 +257,8 @@ impl Store {
         })
     }
 
-    /// The receiving record of `key` from `peer`.
+    /// The receiving record of `key` from `peer`. It lists the store's
+    /// folder, as every lookup does: file work.
     pub fn received(&self, peer: PeerId, key: TransferKey) -> Option<Receiving> {
         match self.find(peer, key, true)?.record {
             Record::Receiving(r) => Some(r),
@@ -261,7 +266,8 @@ impl Store {
         }
     }
 
-    /// The sending record of `key` to `peer`.
+    /// The sending record of `key` to `peer`. It lists the store's
+    /// folder, as every lookup does: file work.
     pub fn sent(&self, peer: PeerId, key: TransferKey) -> Option<Sending> {
         match self.find(peer, key, false)?.record {
             Record::Sending(s) => Some(s),
@@ -608,6 +614,10 @@ impl Store {
     /// [`Self::with_journal_settings`]): any other name is
     /// [`ResumeError::NotPartial`], before anything is flushed or
     /// written.
+    ///
+    /// It flushes `partial` and the record to the disk, each time, and
+    /// holds its thread for that long: in a save's `whole` hook on a
+    /// multi-threaded runtime, wrap it in `tokio::task::block_in_place`.
     pub fn receiving(&self, record: &Receiving, partial: &File) -> Result<(), ResumeError> {
         if record.have > record.size {
             return Err(ResumeError::PastSize);
@@ -672,7 +682,8 @@ impl Store {
         Ok(true)
     }
 
-    /// Starts keeping a file being sent.
+    /// Starts keeping a file being sent: its record is written and
+    /// flushed to the disk.
     pub fn sending(&self, record: &Sending) -> Result<(), ResumeError> {
         self.write(&Record::Sending(record.clone()))
     }
@@ -809,7 +820,13 @@ impl Store {
     /// Only a file named as a partial is opened and cut, as the store's
     /// journal settings have it ([`PartialAt::is_partial`]): a record
     /// naming any other file is [`ResumeError::Gone`] with nothing
-    /// opened, and goes; the file it names is not touched.
+    /// opened, and goes; the file it names is not touched. A file that
+    /// is named as one is cut and handed out on the record's word
+    /// alone: the store's folder must be its program's to write and
+    /// nobody else's (see the [crate] docs).
+    ///
+    /// It is synchronous and does file work: the folder listed, the
+    /// record file taken, the partial found by identity, opened and cut.
     pub fn reopen(&self, peer: PeerId, key: TransferKey) -> Result<(Directory, File), ResumeError> {
         let found = self.take_received(peer, key)?;
         let opened = match &found.record {
@@ -875,41 +892,105 @@ impl Store {
     /// received partial is removed by identity.
     ///
     /// A file this store is receiving is not forgotten here:
-    /// [`ResumeError::Busy`], with nothing removed, while a [`Saving`] is
-    /// on it or the store holds its receiving record. The same key coming
-    /// on a second connection so never has its record and its partial
-    /// removed under the save of the first, whatever a check answered for
-    /// the second. The save itself forgets through its guard
-    /// ([`Saving::forget`]); a record held with no save left is let go
-    /// first ([`Self::release`]). [`Self::remove_all`] and
+    /// [`ResumeError::Busy`], with nothing of it removed, while a
+    /// [`Saving`] is on it or the store holds its receiving record. The
+    /// same key coming on a second connection so never has its record
+    /// and its partial removed under the save of the first, whatever a
+    /// check answered for the second. The save itself forgets through
+    /// its guard ([`Saving::forget`]); a record held with no save left is
+    /// let go first ([`Self::release`]). [`Self::remove_all`] and
     /// [`Self::expire`] (for a key not in its `live`) still remove a
     /// file being received: the person's word, and the caller's list.
     /// The refusal is here, and not a question
     /// asked before the call, so that no caller can leave it out or have
     /// the answer change between the two.
+    ///
+    /// A sending record goes first, held or not, whatever is being
+    /// received: the other side knows the key of a file sent to it, and a
+    /// stream it holds open under that key does not keep the sender's
+    /// record. When one was removed, the key is this side's own and the
+    /// file to forget was that one: a file being received under the same
+    /// key is left to its save, and the answer is `Ok`.
+    ///
+    /// `Ok` says no record of the key is left that this call found: one
+    /// it could not remove (taken by a reopening while it ran, or held
+    /// by another store) is [`ResumeError::Busy`] too.
     pub fn forget(&self, peer: PeerId, key: TransferKey) -> Result<(), ResumeError> {
-        // Taken as a save takes it, for as long as the removal: a save
-        // that starts meanwhile is told it is in use.
-        let claim = self.saving(peer, key)?;
-        let forgotten = self.forget_as(peer, key, false);
+        let sent = self.forget_kind(peer, key, false, true)?;
+        // Taken as a save takes the file, for as long as the removal: a
+        // save that starts meanwhile is told it is in use.
+        let claim = match self.claim_received(peer, key) {
+            Ok(claim) => claim,
+            Err(ResumeError::Busy) if sent.removed && !sent.left => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        #[cfg(test)]
+        if let Some(hook) = crate::tests::seams::FORGETTING.take() {
+            hook();
+        }
+        let received = self.forget_kind(peer, key, true, false);
         drop(claim);
-        forgotten
+        if sent.left || received?.left {
+            return Err(ResumeError::Busy);
+        }
+        Ok(())
     }
 
-    /// Removes the records of `key` from or to `peer`. With `saving`, the
-    /// word of the save on that file, its receiving record goes held or
-    /// not; without, one this store holds stays: a save took it since.
-    fn forget_as(&self, peer: PeerId, key: TransferKey, saving: bool) -> Result<(), ResumeError> {
+    /// Removes the records of one kind of `key` from or to `peer`, and
+    /// says what became of them. With `own`, one this store holds goes
+    /// too: a sending record, or the word of the save on that file.
+    /// Without, a held one stays: a save took it since.
+    fn forget_kind(
+        &self,
+        peer: PeerId,
+        key: TransferKey,
+        receiving: bool,
+        own: bool,
+    ) -> Result<Forgotten, ResumeError> {
+        let mut forgotten = Forgotten::default();
         for (_, found) in self.all()? {
             if let Some(found) = found
+                && matches!(found.record, Record::Receiving(_)) == receiving
                 && found.record.peer() == peer
                 && found.record.key() == key
             {
-                let own = saving || matches!(found.record, Record::Sending(_));
-                self.remove_claimed(&found, own);
+                if self.remove_claimed(&found, own) {
+                    forgotten.removed = true;
+                } else {
+                    forgotten.left = true;
+                }
             }
         }
+        Ok(forgotten)
+    }
+
+    /// Marks the file of `key` from `peer` as in use by a save of this
+    /// store, when none is on it: no other guard, and its receiving
+    /// record not held. [`ResumeError::Busy`] otherwise.
+    fn enter(&self, peer: PeerId, key: TransferKey) -> Result<(), ResumeError> {
+        let all = self.all()?;
+        let mut state = lock(&self.state);
+        let held = all.into_iter().filter_map(|(_, found)| found).any(|found| {
+            matches!(&found.record, Record::Receiving(r) if r.peer == peer && r.key == key)
+                && state.held.contains_key(&found.name)
+        });
+        // Looked up and taken under one lock: of two at once, one is told.
+        if held || !state.saving.insert((peer, key)) {
+            return Err(ResumeError::Busy);
+        }
         Ok(())
+    }
+
+    /// The file of `key` from `peer` taken as [`Self::saving`] takes it,
+    /// for a removal: the claim keeps a save from starting and, unlike a
+    /// save's guard, lets go of no record when it ends.
+    fn claim_received(&self, peer: PeerId, key: TransferKey) -> Result<Claimed<'_>, ResumeError> {
+        self.enter(peer, key)?;
+        Ok(Claimed {
+            store: self,
+            peer,
+            key,
+        })
     }
 
     /// Takes the file of `key` from `peer` for one save, before anything
@@ -923,18 +1004,11 @@ impl Store {
     /// [`ResumeError::Busy`] when a save of this store is on that file
     /// already: another guard is, or the store holds its receiving
     /// record. The stream is then refused, and nothing of the file is
-    /// touched. It reads the store's folder, as a lookup does.
+    /// touched. It lists the store's folder, as a lookup does: file
+    /// work, to be called where blocking is allowed (see the [crate]
+    /// docs).
     pub fn saving(&self, peer: PeerId, key: TransferKey) -> Result<Saving<'_>, ResumeError> {
-        let all = self.all()?;
-        let mut state = lock(&self.state);
-        let held = all.into_iter().filter_map(|(_, found)| found).any(|found| {
-            matches!(&found.record, Record::Receiving(r) if r.peer == peer && r.key == key)
-                && state.held.contains_key(&found.name)
-        });
-        // Looked up and taken under one lock: of two at once, one is told.
-        if held || !state.saving.insert((peer, key)) {
-            return Err(ResumeError::Busy);
-        }
+        self.enter(peer, key)?;
         Ok(Saving {
             store: self,
             peer,
@@ -957,16 +1031,19 @@ impl Store {
         Ok(removed)
     }
 
-    /// The bytes the kept files hold.
+    /// The bytes the kept files hold, as their records say: of each
+    /// receiving record whose file is named as a partial
+    /// ([`PartialAt::is_partial`]), the only ones the store acts on.
+    /// Never more than a `u64` holds.
     pub fn kept_bytes(&self) -> u64 {
         self.all()
             .unwrap_or_default()
             .into_iter()
             .filter_map(|(_, f)| match f?.record {
-                Record::Receiving(r) => Some(r.have),
-                Record::Sending(_) => None,
+                Record::Receiving(r) if r.at.is_partial(&self.journal) => Some(r.have),
+                _ => None,
             })
-            .sum()
+            .fold(0, u64::saturating_add)
     }
 
     /// Whether a valid receiving record keeps the partial `at`: a journal's
@@ -1009,6 +1086,10 @@ impl Store {
     /// - a file with no slot that reads, by its name alone (its journal
     ///   entry removes the partial): a record torn at its first write, or
     ///   a file another program put under a record's name;
+    /// - a receiving record whose file is not named as a partial
+    ///   ([`PartialAt::is_partial`]), by its own name alone, at once and
+    ///   whatever its age or `live`: no store wrote it, and it counts
+    ///   toward no cap. The file it names is not touched;
     /// - any record whose last byte is older than `keep_for` at `now`;
     /// - past [`Limits::sending`] sending records, the oldest;
     /// - past [`Limits::per_peer`] files of one peer, that peer's oldest;
@@ -1032,6 +1113,14 @@ impl Store {
                 }
                 continue;
             };
+            // Not a record the store acts on: it holds no place among
+            // the kept, and its folder is not opened for its free space.
+            if let Record::Receiving(r) = &found.record
+                && !r.at.is_partial(&self.journal)
+            {
+                expired.removed += usize::from(self.remove(&found));
+                continue;
+            }
             if live.contains(&(found.record.peer(), found.record.key())) {
                 continue;
             }
@@ -1115,18 +1204,21 @@ impl Store {
             let on_disk: Vec<usize> = (0..kept.len())
                 .filter(|&j| !gone[j] && disk_of(&kept[j]) == Some(disk))
                 .collect();
-            let holds: u64 = on_disk.iter().map(|&j| have_of(&kept[j])).sum();
+            // A record's `have` is whatever its file says: summed wide,
+            // so no count of them wraps.
+            let holds: u128 = on_disk.iter().map(|&j| u128::from(have_of(&kept[j]))).sum();
             // Removing a kept file frees its bytes: free space and what is held
             // together stay the same while the oldest go.
-            let total = u128::from(free) + u128::from(holds);
-            let share =
-                |holds: u64| u128::from(holds) * u128::from(den.max(1)) > total * u128::from(num);
+            let total = u128::from(free).saturating_add(holds);
+            let share = |holds: u128| {
+                holds.saturating_mul(u128::from(den.max(1))) > total.saturating_mul(u128::from(num))
+            };
             let mut holds = holds;
             for &j in &on_disk {
                 if !share(holds) {
                     break;
                 }
-                holds -= have_of(&kept[j]);
+                holds -= u128::from(have_of(&kept[j]));
                 drop_at(j, &mut gone);
             }
         }
@@ -1135,7 +1227,7 @@ impl Store {
             .zip(&gone)
             .filter(|(_, g)| !**g)
             .map(|(f, _)| have_of(f))
-            .sum();
+            .fold(0, u64::saturating_add);
         Ok(expired)
     }
 }
@@ -1155,15 +1247,21 @@ impl Store {
 ///   record last said.
 ///
 /// Dropping it writes nothing, and reads a record file only in a store
-/// with more of them than its index remembers ([`Limits::indexed`]). On
-/// Windows a write of the dropped save still under way on the blocking
-/// pool keeps the partial open for a moment longer: a reopening in that
-/// moment is [`ResumeError::Busy`], and is tried again. On Unix nothing
-/// shuts that reopening out, and such a write (one slice at most) may
-/// land after it, at its own offset past the bytes the record names: the
-/// bytes the dropped stream brought there. A file whose sender's bytes
-/// changed in between is not continued at all (the sender's check), so
-/// they are the bytes the continued stream brings too.
+/// with more of them than its index remembers ([`Limits::indexed`]).
+///
+/// **A save dropped.** The guard lives outside the save's future, so that
+/// future is dropped first, and when its drop returns no write of the
+/// save is running and none can start
+/// (`safecopy_chunks::save_resumable`): one already handed to the
+/// blocking pool has ended, or writes nothing. No byte of the dropped
+/// stream so lands in the partial after a later reopening has hashed
+/// it, on any system and whatever the other side then sends. The save's
+/// drop waits for a write already under way, for as long as that one
+/// write takes (64 KiB at most; on a disk that stalls, as long as it
+/// stalls). On Windows a flush of the
+/// dropped save still under way on the blocking pool keeps the partial
+/// open a moment longer: a reopening in that moment is
+/// [`ResumeError::Busy`], and is tried again.
 #[derive(Debug)]
 pub struct Saving<'a> {
     store: &'a Store,
@@ -1190,7 +1288,9 @@ impl Saving<'_> {
     /// records of the file go, as [`Store::forget`] removes them, with
     /// what is left of a partial, by identity.
     pub fn forget(self) -> Result<(), ResumeError> {
-        self.store.forget_as(self.peer, self.key, true)
+        self.store.forget_kind(self.peer, self.key, false, true)?;
+        self.store.forget_kind(self.peer, self.key, true, true)?;
+        Ok(())
     }
 }
 
@@ -1224,6 +1324,34 @@ impl Drop for Saving<'_> {
             index.remove(&name);
         }
         state.saving.remove(&(peer, key));
+    }
+}
+
+/// What a forget did with the records it found.
+#[derive(Debug, Default, Clone, Copy)]
+struct Forgotten {
+    /// One was removed.
+    removed: bool,
+    /// One stayed: held by this store or another, or changed since it
+    /// was read.
+    left: bool,
+}
+
+/// A removal's claim on a file being received, as a save's guard claims
+/// it. It only stands in the way of a save: ended, it lets go of no
+/// record, since it took none, and one a reopening took meanwhile is
+/// that reopening's to keep.
+struct Claimed<'a> {
+    store: &'a Store,
+    peer: PeerId,
+    key: TransferKey,
+}
+
+impl Drop for Claimed<'_> {
+    fn drop(&mut self) {
+        lock(&self.store.state)
+            .saving
+            .remove(&(self.peer, self.key));
     }
 }
 
@@ -1333,6 +1461,8 @@ async fn hash_partial(
     #[cfg(test)]
     crate::tests::seams::PREFIX_BYTES.set(crate::tests::seams::PREFIX_BYTES.get() + record.have);
     let mut hasher = settings.receiving();
+    // Read from the start of a file just opened, whose position no one
+    // else has: this handle is handed on only after the reading.
     let mut reader = tokio::fs::File::from_std(file.try_clone()?);
     hasher.read(&mut reader, record.have).await?;
     if hasher.clone().finish() != record.prefix {

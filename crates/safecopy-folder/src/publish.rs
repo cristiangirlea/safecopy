@@ -5,10 +5,10 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use safecopy_names::candidates;
-use tokio::io::AsyncWriteExt;
 
 use crate::{Applied, Directory, Meta, MetaRules, Refusal, refusal};
 
@@ -74,6 +74,57 @@ async fn sync_data(file: &File, cancel: impl Future<Output = ()>) -> Result<(), 
             Ok(synced) => synced.map_err(PublishError::Io),
             Err(_) => Err(PublishError::Io(io::ErrorKind::Other.into())),
         },
+    }
+}
+
+/// How many bytes of a file are copied into its name at once, where the
+/// disk makes it be copied.
+const COPY_SLICE: usize = 64 << 10;
+
+/// Copies the bytes of `source` at the offset `at` into `output` at the
+/// same offset, as many as `buffer` takes: how many, and 0 at the end of
+/// `source`. Neither handle's position is read or relied on.
+fn copy_slice(source: &File, output: &File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
+    let read = loop {
+        match read_at(source, buffer, at) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            read => break read?,
+        }
+    };
+    let (mut bytes, mut to) = (&buffer[..read], at);
+    while !bytes.is_empty() {
+        match write_at(output, bytes, to) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                bytes = &bytes[n..];
+                to += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(read)
+}
+
+fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_at(file, buffer, at)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_read(file, buffer, at)
+    }
+}
+
+fn write_at(file: &File, bytes: &[u8], at: u64) -> io::Result<usize> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::write_at(file, bytes, at)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_write(file, bytes, at)
     }
 }
 
@@ -282,7 +333,10 @@ impl Directory {
     ///
     /// The name is claimed with [`Self::finish`], else [`Self::rename`];
     /// where the disk can do neither, the file is copied from its open
-    /// handle into the name created new, and `partial` is discarded. When
+    /// handle into the name created new, and `partial` is discarded. The
+    /// copy reads every byte at its own offset in the file, never at the
+    /// handle's position: a clone of `file` read or moved meanwhile, on
+    /// any thread, changes no byte of what is published. When
     /// linking fails for the folder (no procfs, procfs denied), this handle
     /// remembers it and later names go straight to the rename. A file that
     /// took `partial`'s name meanwhile is never removed.
@@ -403,7 +457,7 @@ impl Directory {
                         || refusal(&e) == Some(Refusal::Replaced) => {}
                 Err(e) => return Err(at_name(e)),
             }
-            let source = file.try_clone().map_err(at_name)?;
+            let source = Arc::new(file.try_clone().map_err(at_name)?);
             let output = match self.create(leaf) {
                 Ok(output) => output,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -416,26 +470,47 @@ impl Directory {
                 leaf,
                 kept: false,
             };
-            let output = claim.file.try_clone().map_err(at_name)?;
+            let output = Arc::new(claim.file.try_clone().map_err(at_name)?);
             // Copied from the open file, not from what `partial` names now.
             if rules.mark {
                 marked = self.mark(leaf);
             }
-            let mut output = tokio::fs::File::from_std(output);
-            let mut source = tokio::fs::File::from_std(source);
+            // Each slice is read and written at its own offset, on the
+            // blocking pool: the caller checked these bytes, and a clone
+            // of `file` whose position moves meanwhile changes none.
+            let mut slice = None;
             let copying = async {
-                use tokio::io::AsyncSeekExt;
-                source.rewind().await?;
-                tokio::io::copy(&mut source, &mut output).await?;
-                output.flush().await?;
-                io::Result::Ok(())
+                let mut buffer = vec![0; COPY_SLICE];
+                let mut at = 0;
+                loop {
+                    #[cfg(test)]
+                    crate::seams::at("copy slice");
+                    let (from, to) = (source.clone(), output.clone());
+                    let copy = slice.insert(tokio::task::spawn_blocking(move || {
+                        let copied = copy_slice(&from, &to, &mut buffer, at);
+                        (buffer, copied)
+                    }));
+                    let joined = copy.await;
+                    slice = None;
+                    let (back, copied) =
+                        joined.map_err(|_| io::Error::from(io::ErrorKind::Other))?;
+                    buffer = back;
+                    match copied? {
+                        0 => break io::Result::Ok(()),
+                        n => at += n as u64,
+                    }
+                }
             };
             let copied = tokio::select! {
                 biased;
                 () = &mut cancel => Err(PublishError::Cancelled),
                 copied = copying => copied.map_err(PublishError::Io),
             };
-            let output = output.into_std().await;
+            // A slice still on the pool at a cancel ends before the copy
+            // is given its time or removed.
+            if let Some(slice) = slice {
+                let _ = slice.await;
+            }
             // A new file: the time and the bit are set on it again, after its last byte.
             let copied = copied.and_then(|()| {
                 applied = self.apply(&output, meta, meta_rules)?;
