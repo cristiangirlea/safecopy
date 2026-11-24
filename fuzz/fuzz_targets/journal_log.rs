@@ -6,7 +6,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use safecopy::journal::{Settings, read_segment};
+use safecopy::journal::{Second, Settings, read_segment};
 use safecopy::manifest::GroupLimits;
 
 fuzz_target!(|data: &[u8]| {
@@ -26,6 +26,17 @@ fuzz_target!(|data: &[u8]| {
     };
     assert!(segment.read <= data.len().min(settings.segment_bytes));
     assert!(segment.partials().len() <= settings.partials);
+    // Only the second format holds a second identity, and a time's
+    // nanoseconds stay below a second.
+    for started in segment.partials() {
+        match started.second {
+            Second::None => {}
+            Second::Born { nanos, .. } | Second::Both { nanos, .. } => {
+                assert!(segment.format() == 2 && nanos < 1_000_000_000);
+            }
+            Second::Generation(_) => assert_eq!(segment.format(), 2),
+        }
+    }
     let progress = segment.progress();
     assert!(progress.open_groups().len() <= settings.groups.open);
     for group in progress.open_groups() {
@@ -36,6 +47,7 @@ fuzz_target!(|data: &[u8]| {
         if let Some(at) = at {
             assert_eq!(at.partial, started.partial);
             assert_eq!(at.file, started.file);
+            assert_eq!(at.second, started.second);
             assert!(at.location.levels.len() <= segment.folders().count());
         }
         assert!(!progress.skips(started.place) || !segment.grouped());
@@ -45,6 +57,7 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(again.partials(), segment.partials());
     let snapshot = segment.snapshot();
     let back = read_segment(&snapshot, &settings).expect("a snapshot reads");
+    assert_eq!(back.format(), segment.format());
     assert_eq!(back.partials(), segment.partials());
     assert_eq!(back.progress(), segment.progress());
     assert_eq!(back.entries, 0);

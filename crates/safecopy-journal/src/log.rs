@@ -8,18 +8,29 @@
 //! UTF-8. A reader stops at the first frame that runs past the end, fails
 //! its checksum, does not decode, or could not follow from the ones before:
 //! a torn append loses only that entry.
+//!
+//! The header names the segment's format. In format 2 a started partial,
+//! in the snapshot or in an entry, ends with its second identity
+//! ([`Second`]): a kind byte (0 none, 1 a birth time, 2 a generation, 3
+//! both) and that kind's numbers. Format 1 has none, and is otherwise the
+//! same. A journal is written in format 2 on Unix, and in format 1 on
+//! Windows, where there is none to record. A version that knows only
+//! format 1 reads a format 2 header as damaged.
 
 use std::collections::BTreeMap;
 
 use safecopy_manifest::Progress;
 
 use crate::record::{Reader, text, varint};
-use crate::{JournalError, Settings};
+use crate::{JournalError, Second, Settings};
 
 /// The first bytes of a header frame's payload.
 const MAGIC: &[u8; 4] = b"SCJL";
-/// The log format this crate writes and reads.
-const FORMAT: u8 = 1;
+/// The log format of before, still written where no partial has a second
+/// identity to record, and read.
+pub(crate) const FORMAT: u8 = 1;
+/// The log format in which a started partial ends with its second identity.
+pub(crate) const FORMAT_SECOND: u8 = 2;
 /// A frame's length and checksum.
 pub(crate) const FRAME_HEAD: usize = 8;
 
@@ -82,6 +93,8 @@ pub struct Started {
     pub size: u64,
     /// The partial file's file ID or inode.
     pub file: u128,
+    /// What else it is known by. [`Second::None`] in a journal of format 1.
+    pub second: Second,
 }
 
 /// One entry after a segment's header.
@@ -107,6 +120,8 @@ const ENDED: u8 = 6;
 /// What a journal says of its transfer: the replay of a segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct State {
+    /// The format its segment is written in.
+    pub(crate) format: u8,
     pub(crate) seq: u64,
     pub(crate) root: Root,
     /// Whether the transfer goes by groups: a partial must be in an open
@@ -284,16 +299,82 @@ fn decode_folder(reader: &mut Reader<'_>) -> Result<Folder, JournalError> {
     })
 }
 
-fn encode_started(out: &mut Vec<u8>, started: &Started) {
+const NO_SECOND: u8 = 0;
+const BORN: u8 = 1;
+const GENERATION: u8 = 2;
+const BOTH: u8 = 3;
+
+fn encode_second(out: &mut Vec<u8>, second: Second) {
+    match second {
+        Second::None => out.push(NO_SECOND),
+        Second::Born { secs, nanos } => {
+            out.push(BORN);
+            // A signed number as postcard zigzags it.
+            varint(out, (((secs << 1) ^ (secs >> 63)) as u64).into());
+            varint(out, nanos.into());
+        }
+        Second::Generation(n) => {
+            out.push(GENERATION);
+            varint(out, n.into());
+        }
+        Second::Both {
+            secs,
+            nanos,
+            generation,
+        } => {
+            out.push(BOTH);
+            varint(out, (((secs << 1) ^ (secs >> 63)) as u64).into());
+            varint(out, nanos.into());
+            varint(out, generation.into());
+        }
+    }
+}
+
+/// A birth time: its seconds, zigzagged, and its nanoseconds, below a second.
+fn decode_born(reader: &mut Reader<'_>) -> Result<(i64, u32), JournalError> {
+    let zigzag = reader.u64()?;
+    let secs = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+    let nanos = reader.u32()?;
+    if nanos >= 1_000_000_000 {
+        return Err(JournalError::Damaged);
+    }
+    Ok((secs, nanos))
+}
+
+fn decode_second(reader: &mut Reader<'_>) -> Result<Second, JournalError> {
+    match reader.byte()? {
+        NO_SECOND => Ok(Second::None),
+        BORN => {
+            let (secs, nanos) = decode_born(reader)?;
+            Ok(Second::Born { secs, nanos })
+        }
+        GENERATION => Ok(Second::Generation(reader.u32()?)),
+        BOTH => {
+            let (secs, nanos) = decode_born(reader)?;
+            Ok(Second::Both {
+                secs,
+                nanos,
+                generation: reader.u32()?,
+            })
+        }
+        // A kind of a later version: nothing says what it compares.
+        _ => Err(JournalError::Damaged),
+    }
+}
+
+fn encode_started(out: &mut Vec<u8>, started: &Started, format: u8) {
     varint(out, started.place.into());
     varint(out, started.folder.into());
     text(out, &started.name);
     text(out, &started.partial);
     varint(out, started.size.into());
     varint(out, started.file);
+    if format >= FORMAT_SECOND {
+        encode_second(out, started.second);
+    }
 }
 
-fn decode_started(reader: &mut Reader<'_>) -> Result<Started, JournalError> {
+fn decode_started(reader: &mut Reader<'_>, format: u8) -> Result<Started, JournalError> {
     Ok(Started {
         place: reader.u32()?,
         folder: reader.u32()?,
@@ -301,15 +382,22 @@ fn decode_started(reader: &mut Reader<'_>) -> Result<Started, JournalError> {
         partial: reader.text()?,
         size: reader.u64()?,
         file: reader.u128()?,
+        second: if format >= FORMAT_SECOND {
+            decode_second(reader)?
+        } else {
+            Second::None
+        },
     })
 }
 
-/// The fewest bytes a folder and a started partial take encoded.
+/// The fewest bytes a folder and a started partial take encoded, in either
+/// format.
 const LEAST_FOLDER: usize = 5;
 const LEAST_STARTED: usize = 6;
 
 impl Entry {
-    pub(crate) fn encode(&self) -> Vec<u8> {
+    /// The entry's bytes in a segment of `format`.
+    pub(crate) fn encode(&self, format: u8) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
             Entry::Folder(folder) => {
@@ -324,13 +412,13 @@ impl Entry {
             }
             Entry::Started(started) => {
                 out.push(STARTED);
-                encode_started(&mut out, started);
+                encode_started(&mut out, started, format);
             }
             Entry::StartedMany(many) => {
                 out.push(STARTED_MANY);
                 varint(&mut out, many.len() as u128);
                 for started in many {
-                    encode_started(&mut out, started);
+                    encode_started(&mut out, started, format);
                 }
             }
             Entry::Done { place } => {
@@ -352,7 +440,12 @@ impl Entry {
         out
     }
 
-    pub(crate) fn decode(payload: &[u8], settings: &Settings) -> Result<Self, JournalError> {
+    /// An entry read from its bytes in a segment of `format`.
+    pub(crate) fn decode(
+        payload: &[u8],
+        settings: &Settings,
+        format: u8,
+    ) -> Result<Self, JournalError> {
         let mut reader = Reader(payload);
         let most = settings.partials;
         let entry = match reader.byte()? {
@@ -362,12 +455,12 @@ impl Entry {
                 first: reader.u32()?,
                 len: reader.u32()?,
             },
-            STARTED => Entry::Started(decode_started(&mut reader)?),
+            STARTED => Entry::Started(decode_started(&mut reader, format)?),
             STARTED_MANY => {
                 let count = reader.count(LEAST_STARTED, most)?;
                 let mut many = Vec::with_capacity(count);
                 for _ in 0..count {
-                    many.push(decode_started(&mut reader)?);
+                    many.push(decode_started(&mut reader, format)?);
                 }
                 Entry::StartedMany(many)
             }
@@ -393,9 +486,10 @@ impl Entry {
 }
 
 impl State {
-    /// A new transfer's state: nothing recorded.
-    pub(crate) fn new(root: Root, settings: &Settings) -> Self {
+    /// A new transfer's state, for segments of `format`: nothing recorded.
+    pub(crate) fn new(root: Root, settings: &Settings, format: u8) -> Self {
         Self {
+            format,
             seq: 1,
             root,
             grouped: false,
@@ -411,7 +505,7 @@ impl State {
     pub(crate) fn header(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
-        out.push(FORMAT);
+        out.push(self.format);
         varint(&mut out, self.seq.into());
         encode_root(&mut out, &self.root);
         out.push(u8::from(self.grouped));
@@ -432,7 +526,7 @@ impl State {
         }
         varint(&mut out, self.live.len() as u128);
         for started in &self.live {
-            encode_started(&mut out, started);
+            encode_started(&mut out, started, self.format);
         }
         out
     }
@@ -457,7 +551,12 @@ impl State {
     /// A state read from a header frame's payload.
     pub(crate) fn from_header(payload: &[u8], settings: &Settings) -> Result<Self, JournalError> {
         let mut reader = Reader(payload);
-        if reader.take(MAGIC.len())? != MAGIC || reader.byte()? != FORMAT {
+        if reader.take(MAGIC.len())? != MAGIC {
+            return Err(JournalError::Damaged);
+        }
+        let format = reader.byte()?;
+        // A later format is not guessed at: what it lists is left alone.
+        if !matches!(format, FORMAT | FORMAT_SECOND) {
             return Err(JournalError::Damaged);
         }
         let seq = reader.u64()?;
@@ -487,7 +586,7 @@ impl State {
         let live_count = reader.count(LEAST_STARTED, settings.partials)?;
         let mut live = Vec::with_capacity(live_count);
         for _ in 0..live_count {
-            live.push(decode_started(&mut reader)?);
+            live.push(decode_started(&mut reader, format)?);
         }
         reader.end()?;
         let places: Vec<u32> = if grouped {
@@ -508,6 +607,7 @@ impl State {
             return Err(JournalError::Damaged);
         }
         let mut state = Self {
+            format,
             seq,
             root,
             grouped,
@@ -658,6 +758,12 @@ impl Segment {
         &self.state.progress
     }
 
+    /// The format it is written in: 2 where a started partial ends with
+    /// its second identity, 1 where it has none.
+    pub fn format(&self) -> u8 {
+        self.state.format
+    }
+
     /// Whether the transfer goes by groups.
     pub fn grouped(&self) -> bool {
         self.state.grouped
@@ -708,7 +814,7 @@ pub fn read_segment(bytes: &[u8], settings: &Settings) -> Result<Segment, Journa
     let mut state = State::from_header(header, settings)?;
     let mut entries = 0;
     while let Some((payload, after)) = next_frame(rest) {
-        let Ok(entry) = Entry::decode(payload, settings) else {
+        let Ok(entry) = Entry::decode(payload, settings, state.format) else {
             break;
         };
         // A single entry is refused before it changes anything; a bundle's

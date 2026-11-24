@@ -397,6 +397,37 @@ The handshake and the checks are fuzzed: `fuzz/fuzz_targets/resume_handshake.rs`
 
 ## Changes
 
+- **A kept partial is known by a second identity too (Unix).** A
+  receiving record's place (`PartialAt`) now holds the partial's birth
+  time and its inode's generation, each where the system gives it
+  (`safecopy-journal`'s `Second`). `reopen`, which cuts the file it
+  opens, `held_from`, `kept_by`, `forget`, `expire` and `clean_up` find the
+  partial through it: a new file given the inode of a kept partial that
+  was removed is no longer taken for it, cut or removed. `keeps` does
+  not count a journal's entry and a record as one partial when their
+  second identities differ in what both hold
+  (`the_store_leaves_a_file_with_the_inode_and_another_second_identity`).
+  - **On disk, a newer version reading older records:** a record of
+    before reads as before, its partial known by its ID alone, and a
+    record whose partial has no second identity (Windows always, a file
+    system that gives none) is still written so, not a byte changed.
+  - **On disk, an older version reading newer records:** a record
+    whose partial has a second identity is a new kind of record (kind
+    byte 2), the second identity after the partial's place. A version
+    of before knows kinds 0 and 1 and takes a slot of any other kind
+    for one that does not read. Where that is the record file's only
+    whole slot, the file is not resumed and comes again from zero, and
+    the record goes at the next expiry (checked with the version before
+    this one, built and run against a record this one wrote). Where
+    the file's other slot still holds a record that version wrote
+    itself, for an earlier partial of the same transfer, it reads that
+    one: its checks of the kept bytes' hash then decide, as for any
+    record older than its file. The partial is removed by that
+    version's cleanup only when a journal it can read lists it; a
+    journal written on Unix by this version it cannot, so the partial
+    stays on the disk (see `safecopy-journal`'s changes).
+  - Tested with bytes built by hand
+    (`a_receiving_record_holds_a_second_identity_as_a_kind_of_its_own`).
 - **What a record planted in the store's folder can do is said.** The
   docs said a tampered receiving record could only make a file start
   from zero. It can name any file that ends in the partial ending, in

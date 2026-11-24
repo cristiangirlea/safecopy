@@ -6,13 +6,17 @@
 //! the payload. A rewrite goes to the slot not holding the newest record,
 //! so a torn write leaves the other whole; a reader takes the newest slot
 //! whose checksum holds.
+//!
+//! A receiving record whose partial has a second identity
+//! (`safecopy_journal::Second`) is a kind of its own, with the second
+//! identity after the partial's place; one without is the kind of before.
 
 use std::path::PathBuf;
 
 use ring::digest::{SHA256, digest};
 use safecopy_chunks::{DIGEST_LEN, Digest};
 use safecopy_folder::{FileId, Time};
-use safecopy_journal::{Level, Location, PartialAt, Root};
+use safecopy_journal::{Level, Location, PartialAt, Root, Second};
 
 use crate::wire::{Slice, varint};
 use crate::{PeerId, ResumeError, TransferKey};
@@ -25,6 +29,13 @@ const AROUND: usize = 4 + 8 + DIGEST_LEN;
 const VERSION: u8 = 1;
 const RECEIVING: u8 = 0;
 const SENDING: u8 = 1;
+/// A receiving record whose partial has a second identity, which follows
+/// its place. One without is written as [`RECEIVING`], as before; a
+/// version of before reads this kind as damaged.
+const RECEIVING_SECOND: u8 = 2;
+const BORN: u8 = 1;
+const GENERATION: u8 = 2;
+const BOTH: u8 = 3;
 
 /// What a receiver keeps of one file it was receiving.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,12 +121,37 @@ impl Record {
         let mut out = vec![VERSION];
         match self {
             Record::Receiving(r) => {
-                out.push(RECEIVING);
+                out.push(match r.at.second {
+                    Second::None => RECEIVING,
+                    _ => RECEIVING_SECOND,
+                });
                 out.extend_from_slice(&r.peer.0);
                 out.extend_from_slice(&r.key.0);
                 bytes(&mut out, &r.same);
                 varint(&mut out, r.size);
                 partial_at(&mut out, &r.at);
+                match r.at.second {
+                    Second::None => {}
+                    Second::Born { secs, nanos } => {
+                        out.push(BORN);
+                        varint(&mut out, zigzag(secs));
+                        varint(&mut out, u64::from(nanos));
+                    }
+                    Second::Generation(n) => {
+                        out.push(GENERATION);
+                        varint(&mut out, u64::from(n));
+                    }
+                    Second::Both {
+                        secs,
+                        nanos,
+                        generation,
+                    } => {
+                        out.push(BOTH);
+                        varint(&mut out, zigzag(secs));
+                        varint(&mut out, u64::from(nanos));
+                        varint(&mut out, u64::from(generation));
+                    }
+                }
                 varint(&mut out, r.have);
                 out.extend_from_slice(&r.prefix.0);
                 varint(&mut out, r.created);
@@ -133,8 +169,7 @@ impl Record {
                     None => out.push(0),
                     Some(time) => {
                         out.push(1);
-                        // A signed number as postcard zigzags it.
-                        varint(&mut out, ((time.secs << 1) ^ (time.secs >> 63)) as u64);
+                        varint(&mut out, zigzag(time.secs));
                         varint(&mut out, u64::from(time.nanos));
                     }
                 }
@@ -151,12 +186,18 @@ impl Record {
             return Err(ResumeError::Damaged);
         }
         let record = match s.byte()? {
-            RECEIVING => Record::Receiving(Receiving {
+            kind @ (RECEIVING | RECEIVING_SECOND) => Record::Receiving(Receiving {
                 peer: PeerId(s.array()?),
                 key: TransferKey(s.array()?),
                 same: s.bytes()?,
                 size: s.u64()?,
-                at: read_partial_at(&mut s)?,
+                at: {
+                    let mut at = read_partial_at(&mut s)?;
+                    if kind == RECEIVING_SECOND {
+                        at.second = read_second(&mut s)?;
+                    }
+                    at
+                },
                 have: s.u64()?,
                 prefix: Digest(s.array()?),
                 created: s.u64()?,
@@ -174,12 +215,7 @@ impl Record {
                 modified: match s.byte()? {
                     0 => None,
                     1 => {
-                        let zigzag = s.u64()?;
-                        let secs = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-                        let nanos = u32::try_from(s.u64()?).map_err(|_| ResumeError::Damaged)?;
-                        if nanos >= 1_000_000_000 {
-                            return Err(ResumeError::Damaged);
-                        }
+                        let (secs, nanos) = read_time(&mut s)?;
                         Some(Time { secs, nanos })
                     }
                     _ => return Err(ResumeError::Damaged),
@@ -204,6 +240,47 @@ impl Record {
 fn bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     varint(out, bytes.len() as u64);
     out.extend_from_slice(bytes);
+}
+
+/// A signed number as postcard zigzags it.
+fn zigzag(n: i64) -> u64 {
+    ((n << 1) ^ (n >> 63)) as u64
+}
+
+/// A time's seconds, zigzagged, and its nanoseconds, below a second.
+fn read_time(s: &mut Slice<'_>) -> Result<(i64, u32), ResumeError> {
+    let zigzag = s.u64()?;
+    let secs = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+    let nanos = u32::try_from(s.u64()?).map_err(|_| ResumeError::Damaged)?;
+    if nanos >= 1_000_000_000 {
+        return Err(ResumeError::Damaged);
+    }
+    Ok((secs, nanos))
+}
+
+/// The second identity a record of [`RECEIVING_SECOND`] holds: never none,
+/// which is written as the kind of before.
+fn read_second(s: &mut Slice<'_>) -> Result<Second, ResumeError> {
+    match s.byte()? {
+        BORN => {
+            let (secs, nanos) = read_time(s)?;
+            Ok(Second::Born { secs, nanos })
+        }
+        GENERATION => Ok(Second::Generation(read_generation(s)?)),
+        BOTH => {
+            let (secs, nanos) = read_time(s)?;
+            Ok(Second::Both {
+                secs,
+                nanos,
+                generation: read_generation(s)?,
+            })
+        }
+        _ => Err(ResumeError::Damaged),
+    }
+}
+
+fn read_generation(s: &mut Slice<'_>) -> Result<u32, ResumeError> {
+    u32::try_from(s.u64()?).map_err(|_| ResumeError::Damaged)
 }
 
 fn u128_field(out: &mut Vec<u8>, n: u128) {
@@ -330,6 +407,8 @@ fn read_partial_at(s: &mut Slice<'_>) -> Result<PartialAt, ResumeError> {
         location: Location { root, levels },
         partial: text(s)?,
         file: read_u128(s)?,
+        // A record of before has none; a newer kind's follows.
+        second: Second::None,
     })
 }
 

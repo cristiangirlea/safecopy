@@ -45,7 +45,10 @@ all three. On Windows the tests run with
 `SAFECOPY_REQUIRE_JUNCTIONS=1` and `SAFECOPY_REQUIRE_SYMLINKS=1`, so a
 link test that cannot make its link fails instead of skipping. Set the
 first locally too; set the second only where file symbolic links can be
-made (Developer Mode or an administrator).
+made (Developer Mode or an administrator). On Linux they run with
+`SAFECOPY_REQUIRE_SECOND=1`: a test fails when a file's birth time and
+inode generation are not both read. Set it only where the build folder
+is on ext4, xfs, btrfs or f2fs.
 The Android check compiles `ring`'s C with the NDK: point
 `CC_aarch64_linux_android` and `AR_aarch64_linux_android` at the NDK's
 `aarch64-linux-android24-clang` and `llvm-ar` (CI uses the runner's NDK).

@@ -46,6 +46,9 @@ jobs:
           SAFECOPY_REQUIRE_JUNCTIONS: ${{ runner.os == 'Windows' && '1' || '' }}
           # They run as administrators, so file symbolic links can be made there too.
           SAFECOPY_REQUIRE_SYMLINKS: ${{ runner.os == 'Windows' && '1' || '' }}
+          # Linux' runners build on ext4, which gives a file a birth time and a
+          # generation: a reading that gives less fails instead of passing unseen.
+          SAFECOPY_REQUIRE_SECOND: ${{ runner.os == 'Linux' && '1' || '' }}
       # The optional QUIC helpers and their tests over a local QUIC pair, once.
       - if: runner.os == 'Linux'
         run: cargo clippy --locked --workspace --all-targets --features quic -- -D warnings
