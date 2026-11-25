@@ -1457,7 +1457,7 @@ fn files_in(dir: &std::path::Path) -> Vec<String> {
 #[tokio::test]
 async fn a_cut_save_keeps_its_partial_and_a_later_one_continues_and_publishes() {
     use safecopy_chunks::{SaveOptions, Start, Target, save_resumable};
-    use safecopy_folder::{Meta, MetaRules, PublishRules};
+    use safecopy_folder::{Meta, MetaRules};
     let receiver = side("save-receiver", Limits::default());
     let sender = side("save-sender", Limits::default());
     let bytes = data(3 * C + 1000);
@@ -1595,16 +1595,16 @@ async fn a_cut_save_keeps_its_partial_and_a_later_one_continues_and_publishes() 
         size,
         partial: std::sync::Mutex::new(Some(partial.clone())),
     };
-    let rules = PublishRules {
+    let rules = safecopy_chunks::Publish {
         mark: true,
-        ..PublishRules::default()
+        ..Default::default()
     };
     let at = Time {
         secs: 1_000_000_000,
         nanos: 0,
     };
     let options = SaveOptions {
-        publish: &rules,
+        publish: rules,
         meta: Meta {
             modified: Some(at),
             executable: true,

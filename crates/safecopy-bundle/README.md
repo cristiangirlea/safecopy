@@ -22,6 +22,10 @@ key and hash, so one bad file never spoils the others.
   file. `SaveUnlessSame` gives a candidate's hash (a file already at the
   destination): an equal file's partial is removed and it is
   `AlreadyThere`.
+- `ReadOptions::publish` is a `Publish`: the downloaded-file mark, the
+  publish's retries and the names it tries. No published file is held
+  open: there is no `hold` to set, and `Outcome::Saved` says where each
+  file is.
 - `BundleHooks::admitted` and `before_publish` get the read's own handle
   of a partial file: reading or seeking it, there or later through a
   clone kept, on any thread, moves no byte, since every byte is written
@@ -92,6 +96,52 @@ The table and a whole bundle read are fuzzed:
 
 ## Changes
 
+- **A bundle takes publish rules with nothing to hold.**
+  `ReadOptions::publish` took the folder crate's `&PublishRules`, whose
+  `hold` asks for each published file back held open
+  (`Directory::take_back`). The read passed it on, every entry's publish
+  opened the second handle, and `Outcome::Saved` had no place for it: it
+  was closed at once, and a caller that set `hold` got nothing to take
+  back, with no error.
+  - `ReadOptions::publish` is now a `Publish` (of `safecopy-chunks`,
+    exported here too): `mark`, `retries`, `retry_wait` and
+    `name_tries`, with the folder crate's defaults. It has no `hold`, so
+    the option cannot be set and then not given.
+  - Why not hand the files back: a held file is a handle kept open, and
+    on Unix a second one of its folder. The sender decides how many
+    files a bundle has, up to `BundleLimits::files`: 64 by default, so
+    128 descriptors held for a bundle and 256 for two, for as long as
+    their reports are kept. 256 is the usual limit on open files of a
+    macOS process, and a receiver that raised `files` would need a
+    second limit, on what is held. On Windows every one of those files could be renamed, deleted
+    or opened without delete sharing by no one else, and no folder above
+    them renamed, for as long as the report lived. And `Report`,
+    `Outcome` and `Saved` are values to keep, copy and compare (`Clone`,
+    `PartialEq`, `Eq`), given by reference to `BundleHooks::ended`: with
+    open files in them they could be none of those.
+  - What the read does with each option, for every entry it saves:
+    `publish.mark` marks the file as downloaded before its name;
+    `publish.retries` and `publish.retry_wait` try again a publish that
+    something else holds a moment; `publish.name_tries` bounds the names
+    tried (`NoNameLeft`); `meta_rules` say which of `Target::meta`'s
+    time and execute bit are set; `progress` hears of every slice
+    written and `pace` is awaited before each; `sync` flushes the file
+    before its name, and a copy into the name too; `partial_tries`
+    bounds the partial names tried (`NoPartialName`). None is taken and
+    left unused.
+  - **Breaking:** `ReadOptions::publish` is a `Publish`, by value, where
+    it was a `&PublishRules`. A caller that passed rules builds a
+    `Publish` from the same four fields; one that set `hold` drops it
+    (it never held anything). One that left the field to
+    `..ReadOptions::default()` changes nothing. `ReadOptions` keeps its
+    lifetime, for `progress` and `pace`.
+
+  Tests: `a_bundle_s_publish_rules_are_a_save_s_and_hold_nothing`,
+  `every_entry_is_marked_as_the_publish_rules_ask`,
+  `no_published_entry_is_held_open_when_the_read_returns`, and the
+  examples in `ReadOptions::publish`'s docs, two of which must not
+  build: a `hold` field, and the folder crate's rules passed as the
+  option.
 - **A refusal of `safecopy-folder` keeps its kind.** The folder crate
   refuses some names and opens itself, with a `Refusal`. An entry so
   refused was `Outcome::Failed(ErrorKind::Other)`, whatever the refusal.

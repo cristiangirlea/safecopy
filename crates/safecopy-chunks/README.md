@@ -101,6 +101,42 @@ The framing is fuzzed: `fuzz/fuzz_targets/framing.rs`.
 
 ## Changes
 
+- **A save takes its own publish rules, with nothing to hold.**
+  `SaveOptions::publish` took the folder crate's `&PublishRules`, whose
+  `hold` asks for the published file back held open
+  (`Directory::take_back`). A save passed it on, the publish opened the
+  second handle, and `Saved` had no place for it: it was closed at once,
+  and a caller that set `hold` got nothing to take back, with no error.
+  - `Publish` is new: `mark`, `retries`, `retry_wait` and `name_tries`,
+    each passed to the publish as it is, with the folder crate's
+    defaults. It has no `hold`, so the option cannot be set and then not
+    given. `Publish::rules()` gives the folder crate's rules for it,
+    `hold` off.
+  - Why not hand the file back: `Saved` is a value to keep, copy and
+    compare (`Clone`, `PartialEq`, `Eq`, and `Hooks::ended` is given a
+    reference to it). With an open file in it, it could be none of
+    those, and keeping it would keep the file open: on Windows no one
+    else renames or deletes that file and no folder above it is renamed
+    meanwhile. A caller that must take a file back with proof publishes
+    it itself with `Directory::publish_with`.
+  - What a save does with each option: `publish` as above; `meta` and
+    `meta_rules` set the time and the execute bit before the name;
+    `progress` hears of every slice written and `pace` is awaited
+    before each; `sync` flushes the file before its name, and a copy
+    into the name too; `settings` and `partial_tries` are for a new
+    save, and a save from `Start::Resume`, which is handed its hasher
+    and its partial file, has no use for either.
+  - **Breaking:** `SaveOptions::publish` is a `Publish`, by value, where
+    it was a `&PublishRules`. A caller that passed rules builds a
+    `Publish` from the same four fields; one that set `hold` drops it
+    (it never held anything). One that left the field to
+    `..SaveOptions::default()` changes nothing. `SaveOptions` keeps its
+    lifetime, for `progress` and `pace`.
+
+  Tests: `a_save_s_publish_rules_are_the_folder_s_and_hold_nothing`,
+  `a_saved_file_is_held_open_by_nothing_when_the_save_returns`, and the
+  examples in `Publish`'s docs, two of which must not build: a `hold`
+  field, and the folder crate's rules passed as the option.
 - **A refusal of `safecopy-folder` keeps its kind.** The folder crate
   refuses some names and opens itself, with a `Refusal` (a name that is
   not one part of a path or names a stream, a link in the way, and the

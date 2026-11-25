@@ -2217,12 +2217,12 @@ async fn an_entry_whose_names_are_all_taken_says_how_many_it_tried() {
     std::fs::write(path.join("a"), b"theirs").unwrap();
     std::fs::write(path.join("a (2)"), b"theirs").unwrap();
     let dir = Directory::open(&path).unwrap();
-    let rules = safecopy_folder::PublishRules {
+    let rules = Publish {
         name_tries: 2,
         ..Default::default()
     };
     let options = ReadOptions {
-        publish: &rules,
+        publish: rules,
         ..quick()
     };
     let report = read_two(&dir, ["a", "b"], &options, &(), std::future::pending()).await;
@@ -2231,5 +2231,102 @@ async fn an_entry_whose_names_are_all_taken_says_how_many_it_tried() {
     assert!(matches!(report.outcomes[1], Outcome::Saved(_)));
     assert_eq!(files_in(&path), ["a", "a (2)", "b"]);
     drop(dir);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+/// The handles this process has open of the file at `path`, where the
+/// system lists them (Linux and Android): by the file itself, since a
+/// handle opened under the partial name still says that name.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn handles_of(path: &Path) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let file = std::fs::metadata(path).unwrap();
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        // One of another test, closed since, is not this file's.
+        .filter_map(|fd| std::fs::metadata(fd.ok()?.path()).ok())
+        .filter(|open| open.dev() == file.dev() && open.ino() == file.ino())
+        .count()
+}
+
+/// A bundle is published by a save's rules, the folder crate's without
+/// the hold, and by their defaults when none are given.
+#[test]
+fn a_bundle_s_publish_rules_are_a_save_s_and_hold_nothing() {
+    let publish: Publish = ReadOptions::default().publish;
+    assert_eq!(publish, safecopy_chunks::SaveOptions::default().publish);
+    assert_eq!(publish.rules(), safecopy_folder::PublishRules::default());
+    assert!(!publish.rules().hold);
+}
+
+/// The mark asked for reaches every entry's publish, and none is marked
+/// unasked.
+#[tokio::test]
+async fn every_entry_is_marked_as_the_publish_rules_ask() {
+    use safecopy_folder::Marked;
+    let path = temp("marked");
+    let dir = Directory::open(&path).unwrap();
+    let asked = if cfg!(windows) {
+        Marked::Marked
+    } else {
+        Marked::NotOnThisSystem
+    };
+    for (mark, marked, names) in [
+        (false, Marked::NotAsked, ["a", "b"]),
+        (true, asked, ["c", "d"]),
+    ] {
+        let options = ReadOptions {
+            publish: Publish {
+                mark,
+                ..Default::default()
+            },
+            ..quick()
+        };
+        let report = read_two(&dir, names, &options, &(), std::future::pending()).await;
+        assert_eq!(report.error, None);
+        for outcome in &report.outcomes {
+            let Outcome::Saved(saved) = outcome else {
+                panic!("{outcome:?}");
+            };
+            assert_eq!(saved.marked, marked);
+        }
+    }
+    drop(dir);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+/// When a bundle's read returns, its published files are open through
+/// nothing of the read, with the report still held: they and their
+/// folder can be renamed and removed at once.
+#[tokio::test]
+async fn no_published_entry_is_held_open_when_the_read_returns() {
+    let path = temp("nothing-held");
+    std::fs::create_dir(path.join("in")).unwrap();
+    let dir = Directory::open(&path.join("in")).unwrap();
+    let options = ReadOptions {
+        publish: Publish::default(),
+        ..ReadOptions::default()
+    };
+    let report = read_two(&dir, ["a", "b"], &options, &(), std::future::pending()).await;
+    assert_eq!(report.error, None);
+    for (outcome, name) in report.outcomes.iter().zip(["a", "b"]) {
+        let Outcome::Saved(saved) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(saved.path, path.join("in").join(name));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(handles_of(&saved.path), 0);
+    }
+    // Windows renames no folder with a file open below it, and removes
+    // no file open without delete sharing, as an entry's partial is.
+    std::fs::rename(path.join("in"), path.join("moved")).unwrap();
+    assert_eq!(files_in(&path.join("moved")), ["a", "b"]);
+    assert_eq!(std::fs::read(path.join("moved/a")).unwrap(), data(10, 1));
+    assert_eq!(std::fs::read(path.join("moved/b")).unwrap(), data(20, 2));
+    for name in ["a", "b"] {
+        std::fs::remove_file(path.join("moved").join(name)).unwrap();
+    }
+    assert!(files_in(&path.join("moved")).is_empty());
+    drop((report, dir));
     std::fs::remove_dir_all(path).unwrap();
 }

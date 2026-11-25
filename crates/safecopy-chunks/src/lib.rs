@@ -16,7 +16,8 @@
 //! - [`save_verified`]: a whole file into a held folder: write, hash,
 //!   compare, mark, time and execute bit, publish; the partial file is
 //!   removed after any failure, and [`Hooks::ended`] hears what became of
-//!   it ([`PartialFate`]).
+//!   it ([`PartialFate`]). How it is published is a [`Publish`]: the
+//!   mark, the retries and the names tried, and no file held open.
 //! - [`save_resumable`]: the same save from a new partial file or from one
 //!   kept before ([`Start`]), which keeps the partial file, cut to its last
 //!   whole chunk, when it stops on an error the caller's rule names
@@ -69,7 +70,7 @@ pub use copy::{
     write_trailer, write_version,
 };
 pub use save::{
-    Hooks, Kept, PartialFate, SaveOptions, Saved, Start, Stopped, Target, save_resumable,
+    Hooks, Kept, PartialFate, Publish, SaveOptions, Saved, Start, Stopped, Target, save_resumable,
     save_verified,
 };
 
@@ -339,7 +340,7 @@ pub enum ChunkError {
         tried: usize,
     },
     /// Every name tried for the finished file was taken
-    /// (`safecopy_folder::PublishRules::name_tries`): it got none, and
+    /// ([`Publish::name_tries`]): it got none, and
     /// its partial file was removed.
     NoNameLeft {
         /// The names tried.
