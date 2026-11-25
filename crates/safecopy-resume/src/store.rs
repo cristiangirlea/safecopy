@@ -398,6 +398,10 @@ impl Store {
     ) -> Result<(String, u64, usize, bool), ResumeError> {
         let receiving = matches!(record, Record::Receiving(_));
         let name = file_name(receiving, record.peer(), record.key());
+        #[cfg(test)]
+        if let Some(why) = crate::tests::seams::REFUSED_RECORD.take() {
+            return Err(std::io::Error::other(why).into());
+        }
         let exists = match files::create(&self.dir.join(&name)) {
             Ok(file) => {
                 state.held.insert(name.clone(), file);
@@ -1431,22 +1435,41 @@ fn lost(error: &ResumeError) -> bool {
     )
 }
 
+/// What a kept partial that was not found again says of its record: the
+/// one place a [`Left`] becomes this crate's error. [`ResumeError::Gone`]
+/// removes the record, and the partial by its identity, so only what says
+/// the file is not there or is another gives it. The rest say nothing of
+/// the file, a refusal of `safecopy-folder` that looked at nothing among
+/// them: the record stays.
+fn not_reopened(left: Left) -> ResumeError {
+    match left {
+        Left::Gone | Left::Replaced | Left::Name => ResumeError::Gone,
+        Left::Busy => ResumeError::Busy,
+        Left::Volume | Left::Unreachable | Left::Io => ResumeError::Unreachable,
+        // A reason added since: nothing is removed until it has a line here.
+        _ => ResumeError::Unreachable,
+    }
+}
+
 /// A kept partial opened by identity, with its folder:
 /// [`ResumeError::Gone`] when it is not there, another file has its
 /// name, or the record names a file that is no partial under `journal`
 /// (nothing is opened for that one: the caller cuts what this opens),
 /// [`ResumeError::Busy`] when it is open elsewhere,
 /// [`ResumeError::Unreachable`] when its disk or folder cannot be read
-/// now, [`ResumeError::WrongSize`] when it is shorter than `have`.
+/// now or `safecopy-folder` refused without looking at the file,
+/// [`ResumeError::WrongSize`] when it is shorter than `have`.
 fn open_partial(
     record: &Receiving,
     journal: &safecopy_journal::Settings,
 ) -> Result<(Directory, File), ResumeError> {
-    let (dir, file) = record.at.try_reopen(journal).map_err(|left| match left {
-        Left::Gone | Left::Replaced | Left::Name => ResumeError::Gone,
-        Left::Busy => ResumeError::Busy,
-        _ => ResumeError::Unreachable,
-    })?;
+    // As the folder crate would refuse the partial's name, read as the
+    // journal crate reads any error of that open.
+    #[cfg(test)]
+    if let Some(why) = crate::tests::seams::REFUSED_REOPEN.get() {
+        return Err(not_reopened(Left::of(&std::io::Error::other(why))));
+    }
+    let (dir, file) = record.at.try_reopen(journal).map_err(not_reopened)?;
     if file.metadata()?.len() < record.have {
         return Err(ResumeError::WrongSize);
     }

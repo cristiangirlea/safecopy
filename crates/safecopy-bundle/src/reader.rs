@@ -180,7 +180,8 @@ pub struct Report {
     /// Why the bundle ended early, when it did: every taken entry not
     /// settled before it is [`Outcome::NotReceived`]; a skipped one stays
     /// [`Outcome::Refused`], and one whose partial file could not be
-    /// created [`Outcome::Failed`] or [`Outcome::NoPartialName`].
+    /// created [`Outcome::Failed`], [`Outcome::Folder`] or
+    /// [`Outcome::NoPartialName`].
     pub error: Option<BundleError>,
 }
 
@@ -581,7 +582,7 @@ async fn admit<'a>(
             }
             // The system's word that the name is taken, and nothing else.
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Ok(Slot::Failed(Outcome::Failed(e.kind()))),
+            Err(e) => return Ok(Slot::Failed(Outcome::failed(&e))),
         }
     }
     Ok(Slot::Failed(Outcome::NoPartialName { tried: tries }))
@@ -674,6 +675,16 @@ async fn publish(
         meta_rules: options.meta_rules,
         sync: options.sync,
     };
+    #[cfg(test)]
+    if let Some((_, why)) = crate::seams::PUBLISH_REFUSAL
+        .get()
+        .filter(|(refused, _)| *refused == entry)
+    {
+        return Err(unpublished(PublishError::Name {
+            path: target.dir.path().join(&target.name),
+            error: io::Error::other(why),
+        }));
+    }
     let published = target
         .dir
         .publish_with(
@@ -692,10 +703,19 @@ async fn publish(
             applied,
             digest,
         }),
-        Err(PublishError::Cancelled) => Err(Err(BundleError::Cancelled)),
-        Err(PublishError::Io(e) | PublishError::Name { error: e, .. }) => failed(e.kind()),
-        Err(PublishError::NoNameLeft { tried }) => Err(Ok(Outcome::NoNameLeft { tried })),
-        Err(_) => failed(io::ErrorKind::Other),
+        Err(e) => Err(unpublished(e)),
+    }
+}
+
+/// Why a checked entry got no name: `Ok` fails this entry, `Err` ends the
+/// bundle.
+fn unpublished(e: PublishError) -> Result<Outcome, BundleError> {
+    match e {
+        PublishError::Cancelled => Err(BundleError::Cancelled),
+        PublishError::Io(e) | PublishError::Name { error: e, .. } => Ok(Outcome::failed(&e)),
+        PublishError::NoNameLeft { tried } => Ok(Outcome::NoNameLeft { tried }),
+        // A way to fail added since: it carries no error to read.
+        _ => Ok(Outcome::Failed(io::ErrorKind::Other)),
     }
 }
 

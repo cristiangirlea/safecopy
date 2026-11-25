@@ -404,8 +404,78 @@ Finding a partial again goes by the same rule (`Location::open`,
   only: one recorded with another volume's serial number is
   `Left::Volume`.
 
+## What a refusal says of a recorded file
+
+`safecopy-folder` refuses some opens itself, with a `Refusal`. Where a
+recorded folder or partial is found again, `Left::of` reads each one, and
+only a refusal that looked at what is under the recorded name says the
+file is another:
+
+| `Refusal` | `Left` | what it says |
+|---|---|---|
+| `Link` | `Replaced` | a link or junction is under the name |
+| `NotFileOrFolder` | `Replaced` | a device, a pipe or a socket is |
+| `NotFolder` | `Replaced` | a file is where the folder was |
+| `Replaced` | `Replaced` | another file took the name |
+| `LeavesFolder`, `Stream`, `Nul`, `TooLong` | `Io` | the recorded name is not one the folder crate opens: nothing was looked at |
+| `BadListing`, `NoVolume`, `Unproven`, `OtherFolder` | `Io` | the system could not say |
+| `NoNameLeft` | `Io` | a search for a free name ended: nothing of this file |
+| any added later | `Io` | not known here |
+
+`Left::Replaced` is acted on as "the file is another one": a cleanup
+leaves what is there and lets the journal go, since no later cleanup
+would find the partial either, and `safecopy-resume` removes the record.
+`Left::Io` is "nothing is known of it now": a cleanup removes nothing and
+keeps the journal for another try, as long as any journal is kept
+(`keep_for`, `keep_most`); `PartialAt::remove` removes nothing, `reopen`
+and `present` find nothing, and `try_reopen` says `Io`. `recover` opens a
+partial's folder and never its name: where the folder is refused, either
+way, it reports no published file for the partial. A refusal never
+removes a partial: nothing is removed but through a handle checked to be
+the recorded file.
+
+`NoVolume` is `Io` and not `Left::Volume`: `Volume` says the record
+itself is of another volume and lets the journal go, and a folder the
+system gives no volume for says nothing of the record.
+
 ## Changes
 
+- **A refusal of `safecopy-folder` says the file is another only when
+  it looked.** Finding a recorded folder or partial again took every
+  `Refusal` for `Left::Replaced`, which a cleanup acts on by letting the
+  journal go and `safecopy-resume` by removing the record. That is right
+  for a link, a thing that is no file or folder, a file where the folder
+  was, and another file under the name, and it was the answer for the
+  rest too: a name the folder crate does not open (`LeavesFolder`,
+  `Stream`, `Nul`, `TooLong`) and what the system could not say
+  (`BadListing`, `NoVolume`, `Unproven`, `OtherFolder`, `NoNameLeft`).
+  Those are now `Left::Io`, as is any refusal added later (see "What a
+  refusal says of a recorded file"). A caller sees:
+  - `PartialAt::try_reopen` gives `Left::Io` where it gave
+    `Left::Replaced` for these; `reopen`, `present` and `remove` give
+    `None`, `None` and `false` as before.
+  - `clean_up` and `clean_up_keeping` keep the journal of such a partial
+    for another try (`Cleaned::kept` counts it), within `keep_for` and
+    `keep_most`; they removed the journal before and left the partial
+    with nothing that knew it. No partial is removed that was not before.
+  - `Left::of(&error)` is new and public: what an error of an open of a
+    recorded folder or file says of it, the one place such an error is
+    read. A caller that opens a file itself in a folder from
+    `Location::open` reads its errors the same way.
+  - Nothing breaks: `Left` has no new kind, and was `#[non_exhaustive]`
+    already. `JournalError` is unchanged: it had `Folder(Refusal)`.
+  - Met in practice only through a record read from a disk that names
+    something the folder crate does not open, such as a partial's name
+    with a NUL in it. The other refusals are not given by the opens this
+    crate makes today.
+
+  Tests: `every_refusal_reads_as_the_left_its_table_says`,
+  `a_refusal_that_says_nothing_of_the_file_removes_nothing_and_keeps_the_journal`,
+  `a_refusal_that_says_the_file_is_another_lets_the_journal_go` (the
+  last two through a test-only switch that refuses the open of a
+  recorded partial, and with names the folder crate really refuses),
+  `a_recorded_name_the_folder_crate_refuses_keeps_its_journal`
+  (Windows, a journal of the format of before).
 - **The tests' child processes close their copies themselves (Unix).**
   Nothing in the crate changed. A test kept children from starting
   while it ran, and a start is back before the system has closed the

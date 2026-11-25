@@ -133,6 +133,37 @@
 //!   only: one recorded with another volume's serial number is
 //!   [`Left::Volume`].
 //!
+//! # What a refusal says of a recorded file
+//!
+//! `safecopy-folder` refuses some opens itself, with a `Refusal`. Where a
+//! recorded folder or partial is found again, [`Left::of`] reads each
+//! one, and only a refusal that looked at what is under the recorded name
+//! says the file is another:
+//!
+//! | `Refusal` | [`Left`] | what it says |
+//! |---|---|---|
+//! | `Link` | `Replaced` | a link or junction is under the name |
+//! | `NotFileOrFolder` | `Replaced` | a device, a pipe or a socket is |
+//! | `NotFolder` | `Replaced` | a file is where the folder was |
+//! | `Replaced` | `Replaced` | another file took the name |
+//! | `LeavesFolder`, `Stream`, `Nul`, `TooLong` | `Io` | the recorded name is not one the folder crate opens: nothing was looked at |
+//! | `BadListing`, `NoVolume`, `Unproven`, `OtherFolder` | `Io` | the system could not say |
+//! | `NoNameLeft` | `Io` | a search for a free name ended: nothing of this file |
+//! | any added later | `Io` | not known here |
+//!
+//! [`Left::Replaced`] is acted on as "the file is another one": a cleanup
+//! leaves what is there and lets the journal go, since no later cleanup
+//! would find the partial either, and `safecopy-resume` removes the
+//! record. [`Left::Io`] is "nothing is known of it now": a cleanup
+//! removes nothing and keeps the journal for another try, as long as any
+//! journal is kept ([`Settings::keep_for`], [`Settings::keep_most`]);
+//! [`PartialAt::remove`] removes nothing, [`PartialAt::reopen`] and
+//! [`PartialAt::present`] find nothing, and [`PartialAt::try_reopen`]
+//! says `Io`. [`recover`] opens a partial's folder and never its name:
+//! where the folder is refused, either way, it reports no published file
+//! for the partial. A refusal never removes a partial: nothing is
+//! removed but through a handle checked to be the recorded file.
+//!
 //! # A second identity
 //!
 //! Unix may give a removed file's inode to the next file made (ext4 does
@@ -1563,6 +1594,9 @@ pub(crate) mod seams {
         /// This thread's system moves a file's birth time back with its
         /// modified time, as macOS does.
         pub static BIRTH_MOVES_BACK: Cell<bool> = unset();
+        /// Opening a recorded partial under its name is refused so on
+        /// this thread, with nothing opened.
+        pub static REFUSED: Cell<Option<safecopy_folder::Refusal>> = unset();
     }
 
     thread_local! {

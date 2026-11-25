@@ -26,6 +26,13 @@ pub(crate) mod seams {
         /// Runs once, in this thread's next `forget`, after it claimed the
         /// file and before it removes anything.
         pub static FORGETTING: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+        /// Every reopening of a kept partial on this thread is refused
+        /// so by the folder crate, with nothing opened.
+        pub static REFUSED_REOPEN: Cell<Option<safecopy_folder::Refusal>> =
+            const { Cell::new(None) };
+        /// This thread's next making of a record file is refused so.
+        pub static REFUSED_RECORD: Cell<Option<safecopy_folder::Refusal>> =
+            const { Cell::new(None) };
     }
 
     pub async fn stall() {
@@ -42,7 +49,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use safecopy_chunks::{Hasher, copy_exact, read_trailer, write_trailer};
-use safecopy_folder::{Directory, Time};
+use safecopy_folder::{Directory, Refusal, Time};
 use safecopy_journal::{Journal, PartialAt};
 use tokio::io::AsyncSeekExt;
 
@@ -2243,6 +2250,142 @@ async fn a_reopening_that_fails_leaves_no_record_held() {
         }
         assert!(files_in(&records).is_empty(), "{:?}", files_in(&records));
         assert!(!side.place.join("short.part").exists(), "from zero");
+    }
+}
+
+/// Every refusal the folder crate has: those that say what is under a
+/// name, and those that say nothing of it.
+fn refusals() -> ([Refusal; 4], [Refusal; 9]) {
+    (
+        [
+            Refusal::Link,
+            Refusal::NotFileOrFolder,
+            Refusal::NotFolder,
+            Refusal::Replaced,
+        ],
+        [
+            Refusal::LeavesFolder,
+            Refusal::Stream,
+            Refusal::Nul,
+            Refusal::TooLong,
+            Refusal::BadListing,
+            Refusal::NoVolume,
+            Refusal::NoNameLeft { tried: 3 },
+            Refusal::Unproven,
+            Refusal::OtherFolder,
+        ],
+    )
+}
+
+#[tokio::test]
+async fn a_refusal_that_says_nothing_of_the_file_leaves_its_record_to_be_tried_again() {
+    let side = side("refused-unknown", Limits::default());
+    let records = side.base.join("records");
+    kept_zeros(&side, PEER, key(174), "kept", 2, 5);
+    later(&side);
+    for why in refusals().1 {
+        seams::REFUSED_REOPEN.set(Some(why));
+        for hashed in [true, false] {
+            let failed = if hashed {
+                side.store.reopen_hashed(PEER, key(174)).await.err()
+            } else {
+                side.store.reopen(PEER, key(174)).err()
+            };
+            assert_eq!(failed, Some(ResumeError::Unreachable), "{why:?}");
+            // A check of what is kept passes it by, and removes nothing.
+            assert!(side.store.held_from(PEER).await.unwrap().is_empty());
+            assert!(side.store.received(PEER, key(174)).is_some(), "{why:?}");
+            assert_eq!(files_in(&records).len(), 1, "{why:?}");
+            assert_eq!(
+                side.place.join("kept.part").metadata().unwrap().len(),
+                2 * C,
+                "{why:?}: not cut, not removed"
+            );
+        }
+    }
+    // The refusal gone, the same record continues its file, not held
+    // by the reopenings that failed.
+    seams::REFUSED_REOPEN.set(None);
+    let (_, kept) = side.store.reopen_hashed(PEER, key(174)).await.unwrap();
+    assert_eq!(kept.have(), 2 * C);
+    assert_eq!(kept.partial, "kept.part");
+}
+
+#[tokio::test]
+async fn a_refusal_that_says_the_file_is_another_removes_its_record() {
+    let side = side("refused-another", Limits::default());
+    let records = side.base.join("records");
+    for (n, why) in refusals().0.into_iter().enumerate() {
+        kept_zeros(&side, PEER, key(175), "kept", 2, 5);
+        later(&side);
+        seams::REFUSED_REOPEN.set(Some(why));
+        // A reopening, hashed or not, and a check of what is kept.
+        match n % 3 {
+            0 => assert_eq!(
+                side.store.reopen_hashed(PEER, key(175)).await.err(),
+                Some(ResumeError::Gone),
+                "{why:?}"
+            ),
+            1 => assert_eq!(
+                side.store.reopen(PEER, key(175)).err(),
+                Some(ResumeError::Gone),
+                "{why:?}"
+            ),
+            _ => assert!(side.store.held_from(PEER).await.unwrap().is_empty()),
+        }
+        seams::REFUSED_REOPEN.set(None);
+        assert!(side.store.received(PEER, key(175)).is_none(), "{why:?}");
+        assert!(files_in(&records).is_empty(), "{why:?}");
+        // The record's partial goes with it, by its identity.
+        assert!(!side.place.join("kept.part").exists(), "{why:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_error_that_carries_a_refusal_keeps_its_kind_through_the_store() {
+    let side = side("refused-record", Limits::default());
+    let records = side.base.join("records");
+    let partial = side.root.create(OsStr::new("f.part")).unwrap();
+    partial.set_len(C).unwrap();
+    let record = Receiving {
+        peer: PEER,
+        key: key(176),
+        same: Vec::new(),
+        size: C,
+        at: PartialAt::of(&side.root, &side.root, &partial, OsStr::new("f.part")).unwrap(),
+        have: C,
+        prefix: hash(&vec![0; C as usize]),
+        created: 5,
+        last: 5,
+    };
+    seams::REFUSED_RECORD.set(Some(Refusal::TooLong));
+    assert_eq!(
+        side.store.receiving(&record, &partial),
+        Err(ResumeError::Folder(Refusal::TooLong))
+    );
+    assert_eq!(
+        seams::REFUSED_RECORD.take(),
+        None,
+        "the record was being made"
+    );
+    assert!(files_in(&records).is_empty());
+    // An error of the system is still its kind, and one of a save too.
+    let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        ResumeError::from(denied),
+        ResumeError::Io(std::io::ErrorKind::PermissionDenied)
+    );
+    assert_eq!(
+        ResumeError::from(std::io::Error::other("not a refusal")),
+        ResumeError::Io(std::io::ErrorKind::Other)
+    );
+    for why in refusals().0.into_iter().chain(refusals().1) {
+        let refused = || std::io::Error::other(why);
+        assert_eq!(ResumeError::from(refused()), ResumeError::Folder(why));
+        assert_eq!(
+            ResumeError::from(safecopy_chunks::ChunkError::from(refused())),
+            ResumeError::Folder(why)
+        );
     }
 }
 

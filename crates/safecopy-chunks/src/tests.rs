@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 
 use safecopy_folder::{
-    BitApplied, Directory, Marked, Meta, MetaRules, PublishRules, Time, TimeApplied,
+    BitApplied, Directory, Marked, Meta, MetaRules, PublishRules, Refusal, Time, TimeApplied,
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::Semaphore;
@@ -751,11 +751,194 @@ async fn a_save_that_cannot_create_its_partial_says_none_was_created() {
         std::future::pending(),
     )
     .await;
-    assert!(matches!(saved, Err(ChunkError::Io(_))), "{saved:?}");
+    // The folder crate's refusal, as the refusal it was.
+    assert_eq!(saved, Err(ChunkError::Folder(Refusal::LeavesFolder)));
     assert_eq!(*hooks.0.lock().unwrap(), [PartialFate::NotCreated]);
     assert!(files_in(&to).is_empty());
+
+    // A save that may keep its partial is refused the same way.
+    let hooks = Fates::default();
+    let stopped = save_resumable(
+        &mut &stream[..],
+        Target {
+            dir: &dir,
+            name: "c/d",
+            size: 1,
+        },
+        Start::New,
+        &|_| true,
+        &SaveOptions::default(),
+        &hooks,
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stopped.error, ChunkError::Folder(Refusal::LeavesFolder));
+    assert!(stopped.kept.is_none());
+    assert_eq!(*hooks.0.lock().unwrap(), [PartialFate::NotCreated]);
+    assert!(files_in(&to).is_empty());
+
+    // The system's own refusal of a name is still its kind.
+    let hooks = Fates::default();
+    let long = "x".repeat(5000);
+    let saved = save_verified(
+        &mut &stream[..],
+        &dir,
+        &long,
+        1,
+        &SaveOptions::default(),
+        &hooks,
+        std::future::pending(),
+    )
+    .await;
+    assert!(matches!(saved, Err(ChunkError::Io(_))), "{saved:?}");
+    assert_eq!(*hooks.0.lock().unwrap(), [PartialFate::NotCreated]);
     drop(dir);
     std::fs::remove_dir_all(&to).unwrap();
+}
+
+#[test]
+fn an_error_of_the_system_keeps_its_kind_and_a_refusal_its_own() {
+    let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        ChunkError::from(denied),
+        ChunkError::Io(io::ErrorKind::PermissionDenied)
+    );
+    // An error that is `Other` with no refusal in it stays the system's.
+    assert_eq!(
+        ChunkError::from(io::Error::other("not a refusal")),
+        ChunkError::Io(io::ErrorKind::Other)
+    );
+    for why in [
+        Refusal::Link,
+        Refusal::NotFileOrFolder,
+        Refusal::NotFolder,
+        Refusal::LeavesFolder,
+        Refusal::Stream,
+        Refusal::Nul,
+        Refusal::TooLong,
+        Refusal::BadListing,
+        Refusal::NoVolume,
+        Refusal::Replaced,
+        Refusal::NoNameLeft { tried: 3 },
+        Refusal::Unproven,
+        Refusal::OtherFolder,
+    ] {
+        assert_eq!(
+            ChunkError::from(io::Error::other(why)),
+            ChunkError::Folder(why)
+        );
+    }
+}
+
+/// A checked file whose publish the folder crate refuses, and whose
+/// removal it refuses then: both reach the caller as what they were.
+#[tokio::test]
+async fn a_refused_publish_and_a_refused_removal_say_the_refusal() {
+    let to = temp("refused-publish");
+    let dir = Directory::open(&to).unwrap();
+    let bytes = data(1000);
+    let stream = framed(&bytes).await;
+    let left = |refused| PartialFate::Left {
+        kind: io::ErrorKind::Other,
+        raw: None,
+        refused: Some(refused),
+    };
+
+    let hooks = Fates::default();
+    crate::seams::PUBLISH_REFUSAL.set(Some(Refusal::Unproven));
+    crate::seams::DISCARD_REFUSAL.set(Some(Refusal::TooLong));
+    let saved = save_verified(
+        &mut &stream[..],
+        &dir,
+        "a.bin",
+        1000,
+        &SaveOptions::default(),
+        &hooks,
+        std::future::pending(),
+    )
+    .await;
+    assert_eq!(crate::seams::PUBLISH_REFUSAL.get(), None, "the publish ran");
+    assert_eq!(crate::seams::DISCARD_REFUSAL.get(), None, "the removal ran");
+    assert_eq!(saved, Err(ChunkError::Folder(Refusal::Unproven)));
+    assert_eq!(*hooks.0.lock().unwrap(), [left(Refusal::TooLong)]);
+    assert_eq!(files_in(&to), ["a.bin.part"]);
+
+    // Another file under the name is still its own fate.
+    let hooks = Fates::default();
+    crate::seams::PUBLISH_REFUSAL.set(Some(Refusal::Link));
+    crate::seams::DISCARD_REFUSAL.set(Some(Refusal::Replaced));
+    let saved = save_verified(
+        &mut &stream[..],
+        &dir,
+        "b.bin",
+        1000,
+        &SaveOptions::default(),
+        &hooks,
+        std::future::pending(),
+    )
+    .await;
+    assert_eq!(saved, Err(ChunkError::Folder(Refusal::Link)));
+    assert_eq!(*hooks.0.lock().unwrap(), [PartialFate::Replaced]);
+
+    // With no seam: a kept partial handed in under a name that is not one
+    // part of a path. The folder crate refuses to give the file its name,
+    // and then to remove it under that one.
+    let file = dir.create(OsStr::new("c.bin.part")).unwrap();
+    let kept = Start::Resume(Box::new(Kept {
+        file,
+        partial: "no/c.bin.part".into(),
+        hasher: Settings::default().receiving(),
+    }));
+    let hooks = Fates::default();
+    let stopped = save_resumable(
+        &mut &stream[..],
+        Target {
+            dir: &dir,
+            name: "c.bin",
+            size: 1000,
+        },
+        kept,
+        &|_| true,
+        &SaveOptions::default(),
+        &hooks,
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stopped.error, ChunkError::Folder(Refusal::LeavesFolder));
+    assert!(stopped.kept.is_none(), "a checked file is never kept");
+    assert_eq!(*hooks.0.lock().unwrap(), [left(Refusal::LeavesFolder)]);
+    assert_eq!(std::fs::read(to.join("c.bin.part")).unwrap(), bytes);
+    assert!(!to.join("c.bin").exists());
+
+    // Refused at its publish through the seam too, and removed then.
+    let file = dir.create(OsStr::new("d.bin.part")).unwrap();
+    let kept = Start::Resume(Box::new(Kept {
+        file,
+        partial: "d.bin.part".into(),
+        hasher: Settings::default().receiving(),
+    }));
+    let hooks = Fates::default();
+    crate::seams::PUBLISH_REFUSAL.set(Some(Refusal::NoVolume));
+    let stopped = save_resumable(
+        &mut &stream[..],
+        Target {
+            dir: &dir,
+            name: "d.bin",
+            size: 1000,
+        },
+        kept,
+        &|_| true,
+        &SaveOptions::default(),
+        &hooks,
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stopped.error, ChunkError::Folder(Refusal::NoVolume));
+    assert_eq!(*hooks.0.lock().unwrap(), [PartialFate::Removed]);
+    assert!(!to.join("d.bin.part").exists());
 }
 
 // The search for a free partial name.
@@ -1143,6 +1326,7 @@ async fn a_partial_that_cannot_be_removed_is_reported_left_and_is_still_there() 
         [PartialFate::Left {
             kind: io::ErrorKind::PermissionDenied,
             raw: Some(denied),
+            refused: None,
         }]
     );
     assert_eq!(files_in(&to), ["a.bin.part"]);

@@ -329,7 +329,11 @@ pub enum ResumeError {
     /// (never opened).
     Gone,
     /// The partial file's disk or folder cannot be read now: a disk away,
-    /// a place the system would not show. Nothing is removed for it.
+    /// a place the system would not show, or a refusal of
+    /// `safecopy-folder` that says nothing of the file (a name it does
+    /// not open, something the system could not say: see
+    /// `safecopy_journal::Left::of`). Nothing is removed for it, and the
+    /// record stays to be tried again.
     Unreachable,
     /// The partial file's first `have` bytes do not hash to the record's
     /// `prefix`: changed on the disk since they were recorded.
@@ -359,6 +363,13 @@ pub enum ResumeError {
     NotPartial,
     /// The journal crate refused.
     Journal(safecopy_journal::JournalError),
+    /// `safecopy-folder` refused, itself and not the system: a save's
+    /// error brings one, and any error that carries a refusal reads so,
+    /// never as [`ResumeError::Io`]. The store's own record files are
+    /// opened by the system alone, so no call of the store gives one
+    /// today. A kept partial that is not found again is not this: it is
+    /// [`ResumeError::Gone`] or [`ResumeError::Unreachable`].
+    Folder(safecopy_folder::Refusal),
     /// The system's error.
     Io(io::ErrorKind),
 }
@@ -372,9 +383,14 @@ impl fmt::Display for ResumeError {
 
 impl std::error::Error for ResumeError {}
 
+/// The one place an error of a file or a folder becomes this crate's: a
+/// refusal of `safecopy-folder` keeps its kind.
 impl From<io::Error> for ResumeError {
     fn from(error: io::Error) -> Self {
-        Self::Io(error.kind())
+        match safecopy_folder::refusal(&error) {
+            Some(why) => Self::Folder(why),
+            None => Self::Io(error.kind()),
+        }
     }
 }
 
@@ -383,6 +399,7 @@ impl From<safecopy_chunks::ChunkError> for ResumeError {
         match error {
             safecopy_chunks::ChunkError::CutShort { .. } => Self::WrongSize,
             safecopy_chunks::ChunkError::Io(kind) => Self::Io(kind),
+            safecopy_chunks::ChunkError::Folder(why) => Self::Folder(why),
             _ => Self::Damaged,
         }
     }

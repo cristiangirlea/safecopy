@@ -84,7 +84,9 @@ pub enum Left {
     /// The file is there, open elsewhere in a way that shuts this open
     /// out: a transfer is writing it. Only Windows says so.
     Busy,
-    /// Any other error of the system's: worth another try.
+    /// Any other error of the system's, or a refusal of `safecopy-folder`
+    /// that says nothing of what is under the recorded name
+    /// ([`Left::of`]): worth another try.
     Io,
 }
 
@@ -94,24 +96,69 @@ impl Left {
     pub(crate) fn may_change(self) -> bool {
         matches!(self, Self::Unreachable | Self::Busy | Self::Io)
     }
+
+    /// What an error opening a recorded folder or file says of it: the one
+    /// place such an error becomes a `Left`.
+    ///
+    /// A refusal of `safecopy-folder` is [`Left::Replaced`] only when it
+    /// says what is under the recorded name: a link, a thing that is
+    /// neither file nor folder, a file where the folder was, another file
+    /// (`Link`, `NotFileOrFolder`, `NotFolder`, `Replaced`). Every other
+    /// refusal is about the name's shape or about something the system
+    /// could not say, and one this crate does not know is taken the same
+    /// way: [`Left::Io`], which removes nothing and keeps the journal. The
+    /// [crate] docs have the table.
+    ///
+    /// Of the system's own errors, a sharing or lock violation is
+    /// [`Left::Busy`] (Windows), a name or a folder ID not there
+    /// [`Left::Gone`], a folder under a file's name [`Left::Replaced`],
+    /// and the rest [`Left::Io`].
+    pub fn of(error: &io::Error) -> Self {
+        if let Some(why) = safecopy_folder::refusal(error) {
+            return Self::refused(why);
+        }
+        if crate::files::busy(error) {
+            return Self::Busy;
+        }
+        match error.kind() {
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => Self::Gone,
+            // A folder ID no longer in use reads as a bad parameter.
+            io::ErrorKind::InvalidInput => Self::Gone,
+            io::ErrorKind::IsADirectory => Self::Replaced,
+            _ => Self::Io,
+        }
+    }
+
+    /// What a refusal says of the recorded folder or file. `Replaced` lets
+    /// a journal go and removes a resume record, so only a refusal that
+    /// looked at what is under the name gives it.
+    fn refused(why: Refusal) -> Self {
+        match why {
+            Refusal::Link | Refusal::NotFileOrFolder | Refusal::NotFolder | Refusal::Replaced => {
+                Self::Replaced
+            }
+            // The name's shape: nothing was opened to look at.
+            Refusal::LeavesFolder | Refusal::Stream | Refusal::Nul | Refusal::TooLong => Self::Io,
+            // What the system could not say, and searches for a name.
+            Refusal::BadListing
+            | Refusal::NoVolume
+            | Refusal::NoNameLeft { .. }
+            | Refusal::Unproven
+            | Refusal::OtherFolder => Self::Io,
+            // One added since: it removes nothing until it has a line here.
+            _ => Self::Io,
+        }
+    }
 }
 
-/// An error opening the recorded folder or file: what it says of it.
-pub(crate) fn left(error: &io::Error) -> Left {
-    if safecopy_folder::refusal(error).is_some() {
-        // A link or a folder under the name, a file under the folder's ID.
-        return Left::Replaced;
+/// Tests refuse the open of a recorded partial here as the folder crate
+/// would, for the refusals no system gives for a name it recorded itself.
+fn refused_now() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(why) = crate::seams::REFUSED.get() {
+        return Err(io::Error::other(why));
     }
-    if crate::files::busy(error) {
-        return Left::Busy;
-    }
-    match error.kind() {
-        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => Left::Gone,
-        // A folder ID no longer in use reads as a bad parameter.
-        io::ErrorKind::InvalidInput => Left::Gone,
-        io::ErrorKind::IsADirectory => Left::Replaced,
-        _ => Left::Io,
-    }
+    Ok(())
 }
 
 /// The root a journal records for `root`.
@@ -393,7 +440,7 @@ impl Location {
                 return Err(Left::Volume);
             }
             let open = |id: u128| {
-                let dir = crate::win::open_folder(&volume, id).map_err(|e| left(&e))?;
+                let dir = crate::win::open_folder(&volume, id).map_err(|e| Left::of(&e))?;
                 let got = dir.identity().map_err(|_| Left::Io)?;
                 if got.volume != *serial || got.file != id {
                     return Err(Left::Replaced);
@@ -410,7 +457,7 @@ impl Location {
             match still_below(&root, &dir, &self.levels) {
                 Ok(true) => Ok(dir),
                 Ok(false) => Err(Left::Gone),
-                Err(e) => Err(left(&e)),
+                Err(e) => Err(Left::of(&e)),
             }
         }
         #[cfg(unix)]
@@ -425,7 +472,7 @@ impl Location {
                 return Err(Left::Volume);
             };
             let path = Path::new(OsStr::from_bytes(path));
-            let mut dir = Directory::open(path).map_err(|e| match left(&e) {
+            let mut dir = Directory::open(path).map_err(|e| match Left::of(&e) {
                 // A disk not mounted: the path missing, or another folder there.
                 Left::Gone => Left::Unreachable,
                 other => other,
@@ -446,7 +493,7 @@ impl Location {
                 }
                 dir = dir
                     .directory(OsStr::new(&level.name))
-                    .map_err(|e| left(&e))?;
+                    .map_err(|e| Left::of(&e))?;
                 let id = seen(&dir).map_err(|_| Left::Io)?;
                 // Another device here now is a file system mounted since.
                 if id.volume != level.device || id.file != level.id {
@@ -518,7 +565,9 @@ impl PartialAt {
         let name = OsStr::new(&self.partial);
         #[cfg(windows)]
         {
-            let file = dir.open_for_delete(name).map_err(|e| left(&e))?;
+            let file = refused_now()
+                .and_then(|()| dir.open_for_delete(name))
+                .map_err(|e| Left::of(&e))?;
             let id = identity(&file).map_err(|_| Left::Io)?;
             if id.file != self.file || dir.identity().ok().map(|d| d.volume) != Some(id.volume) {
                 return Err(Left::Replaced);
@@ -528,7 +577,9 @@ impl PartialAt {
         }
         #[cfg(unix)]
         {
-            let file = dir.entry(name).map_err(|e| left(&e))?;
+            let file = refused_now()
+                .and_then(|()| dir.entry(name))
+                .map_err(|e| Left::of(&e))?;
             let meta = file.metadata().map_err(|_| Left::Io)?;
             let id = identity(&file).map_err(|_| Left::Io)?;
             let volume = dir.identity().map_err(|_| Left::Io)?.volume;
@@ -538,7 +589,7 @@ impl PartialAt {
             }
             // The inode may be a new file's: the one recorded was removed.
             self.second.check(&file)?;
-            dir.discard(&file, name).map_err(|e| left(&e))
+            dir.discard(&file, name).map_err(|e| Left::of(&e))
         }
     }
 
@@ -557,18 +608,19 @@ impl PartialAt {
     /// the file now is [`Left::Io`]);
     /// [`Left::Busy`] that it is there and open elsewhere (Windows,
     /// where a file being written is not shared for this open); the rest
-    /// that nothing is known of it now. [`Left::Name`] is a recorded name
-    /// that is not a partial's under `settings`: nothing is opened for it,
-    /// not its folder either.
+    /// that nothing is known of it now, a refusal of `safecopy-folder`
+    /// that says nothing of the file among them ([`Left::of`]).
+    /// [`Left::Name`] is a recorded name that is not a partial's under
+    /// `settings`: nothing is opened for it, not its folder either.
     pub fn try_reopen(&self, settings: &Settings) -> Result<(Directory, std::fs::File), Left> {
         // The caller may cut and write what this opens.
         if !self.is_partial(settings) {
             return Err(Left::Name);
         }
         let dir = self.location.find()?;
-        let file = dir
-            .reopen(OsStr::new(&self.partial))
-            .map_err(|e| left(&e))?;
+        let file = refused_now()
+            .and_then(|()| dir.reopen(OsStr::new(&self.partial)))
+            .map_err(|e| Left::of(&e))?;
         let id = identity(&file).map_err(|_| Left::Io)?;
         let volume = dir.identity().map_err(|_| Left::Io)?.volume;
         if id.file != self.file || volume != id.volume {
@@ -600,7 +652,7 @@ impl PartialAt {
         }
         let dir = self.location.find().ok()?;
         let name = OsStr::new(&self.partial);
-        let file = dir.inspect(name).ok()?;
+        let file = refused_now().and_then(|()| dir.inspect(name)).ok()?;
         let meta = file.metadata().ok()?;
         let id = identity(&file).ok()?;
         let same = id.file == self.file
