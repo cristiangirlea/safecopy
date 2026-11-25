@@ -207,6 +207,20 @@ fn a_file_removed_while_it_is_being_taken_is_not_taken() {
     assert_eq!(files::take(&path, 16).unwrap().1, b"two");
 }
 
+#[cfg(unix)]
+#[test]
+fn a_record_filled_before_its_creators_lock_is_left_alone() {
+    use std::io::Write;
+    let (_scratch, place, _) = scratch("create-filled");
+    let path = place.join("record.resume");
+    let other = path.clone();
+    when(Point::Made, move || {
+        files::hold(&other).unwrap().write_all(b"record").unwrap();
+    });
+    assert!(files::busy(&files::create(&path).unwrap_err()));
+    assert_eq!(std::fs::read(path).unwrap(), b"record");
+}
+
 // The cleanup that locks a segment before its journal does: in a folder
 // that gives a file no second name, a segment is still made under its own
 // name and then locked.

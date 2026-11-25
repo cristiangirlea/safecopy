@@ -557,7 +557,8 @@ impl PartialAt {
         self.remove_checked(settings).is_ok()
     }
 
-    pub(crate) fn remove_checked(&self, settings: &Settings) -> Result<(), Left> {
+    /// Removes the same checked file as [`Self::remove`], returning why it was left.
+    pub fn remove_checked(&self, settings: &Settings) -> Result<(), Left> {
         if !self.is_partial(settings) {
             return Err(Left::Name);
         }
@@ -569,7 +570,7 @@ impl PartialAt {
                 .and_then(|()| dir.open_for_delete(name))
                 .map_err(|e| Left::of(&e))?;
             let id = identity(&file).map_err(|_| Left::Io)?;
-            if id.file != self.file || dir.identity().ok().map(|d| d.volume) != Some(id.volume) {
+            if id.file != self.file || dir.identity().map_err(|_| Left::Io)?.volume != id.volume {
                 return Err(Left::Replaced);
             }
             self.second.check(&file)?;
