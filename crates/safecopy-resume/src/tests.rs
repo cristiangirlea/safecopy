@@ -3783,6 +3783,36 @@ mod reopening {
         assert_eq!(other.sent(PEER, key(1)), Some(sent));
     }
 
+    #[test]
+    fn saving_forgets_nothing_another_store_holds() {
+        let side = side("saving-forget-held", Limits::default());
+        let other = Store::open(&side.base.join("records"), Limits::default()).unwrap();
+        let kept = kept_in(&other, &side, PEER, key(1), "kept", 1, 1);
+        let guard = side.store.saving(PEER, key(1)).unwrap();
+        assert_eq!(guard.forget_received(), Err(ResumeError::Busy));
+        assert_eq!(other.received(PEER, key(1)), Some(kept));
+        assert_eq!(
+            std::fs::metadata(side.place.join("kept.part"))
+                .unwrap()
+                .len(),
+            C
+        );
+    }
+
+    #[test]
+    fn saving_forgets_nothing_when_two_receiving_records_name_the_key() {
+        let side = side("saving-forget-ambiguous", Limits::default());
+        kept_zeros(&side, PEER, key(1), "old", 1, 1);
+        later(&side);
+        let records = side.base.join("records");
+        let name = records.join(crate::store::file_name(true, PEER, key(1)));
+        std::fs::copy(name, records.join("earlier.resume")).unwrap();
+        let guard = side.store.saving(PEER, key(1)).unwrap();
+        assert_eq!(guard.forget_received(), Err(ResumeError::Busy));
+        assert_eq!(files_in(&records).len(), 2);
+        assert!(side.place.join("old.part").try_exists().unwrap());
+    }
+
     #[tokio::test]
     async fn inspect_refuses_an_active_save() {
         let side = side("inspect-active-save", Limits::default());
