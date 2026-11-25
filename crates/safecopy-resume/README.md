@@ -140,7 +140,7 @@ the caps with the `have` it claims. The hash at the reopening and the
 whole file's hash at the end still decide what is published: no byte
 the sender did not send gets a name.
 
-**For every stream that brings a file, first:** `let saving =
+**For a stream that uses automatic reopening, first:** `let saving =
 store.saving(peer, key)?`, before a check's answer is acted on.
 `ResumeError::Busy` says a save of this store is on that file already
 (the same key on a second connection): refuse the stream and touch
@@ -223,6 +223,41 @@ When the peer is back:
    `saving.forget()` on the receiver, `Store::forget(peer, key)` on the
    sender.
 
+**When the receiver decides whether to restart**, use this flow in place
+of taking `saving` and calling `reopen_hashed` in step 6:
+
+1. Call `store.inspect(peer, key).await`. A missing record gives
+   `NotHeld`; a record already in use gives `Busy`. Compare
+   `claim.record()` with the record or offer the decision concerns. To
+   present one exact write for a decision, take the claim before showing
+   it and hold it until the answer comes.
+2. Read `claim.status()`. `Ok(())` means its first `have` bytes match.
+   `PrefixChanged`, `WrongSize` and `Gone` distinguish a changed prefix,
+   a short partial and a missing or replaced one. `Busy`, `Unreachable`
+   or an I/O error means the check could not finish. Checking leaves the
+   slots, the partial and any bytes beyond `have` in place.
+3. Choose one end:
+   - Continue a match with `let (saving, dir, kept) = claim.resume()?`.
+     This cuts the checked handle to `have`. List it in the journal and
+     pass `kept` to `Start::Resume` with the continued save's hooks.
+   - Restart with `let saving = claim.discard()?`. This removes the
+     receiving record and its partial by identity. Keep `saving` around
+     the restart exchange. For a stream already at a nonzero offset,
+     stop it, mark the resend with `Resent::mark` and send
+     `Verdict::Restart`. Wait for a fresh stream from zero that passes
+     `Resent::check` with the original `same`. Use `Start::New` and the
+     first save's hooks, including `Store::receiving` at the first whole
+     chunk. The record file stays locked across that handover. If the
+     journal cannot check or remove a reachable partial, discard returns
+     its error before clearing the record.
+   - Refuse or defer by dropping the claim. Everything stays as found.
+
+For either save, finish with `saving.kept(..)` for a kept partial or
+`saving.forget_received()` on publication or cancellation. The sending
+record under the same key stays. Dropping the guard on an early return
+or panic releases the key. A claim explicitly released or rewritten
+since inspection gives `Busy` at either act.
+
 The prefix is hashed at step 6 and not at step 4 for two reasons. A list
 that hashed would read every kept file each time the other side
 connects. And a hash taken at the listing says nothing of the partial
@@ -237,7 +272,7 @@ the rest as they are written. Nothing is read back after that, before
 or after the file gets its name: a byte changed on the disk later, by a
 failing disk or by another program writing the partial, is not seen.
 
-Any other answer of a check (`Restart`, `Resend`, `Refuse`, `Dropped`,
+In the automatic flow, any other answer of a check (`Restart`, `Resend`, `Refuse`, `Dropped`,
 `Changed`, `ResumeError::PrefixChanged`), and a save that ends with
 `ChunkError::Damaged`, is the file from zero or not at all:
 `saving.forget()`, and `Journal::ended` if the partial was listed. The
@@ -280,7 +315,7 @@ polls the save: the `Store::keep` in it lists the folder each time, and
 when a rewrite is due holds that thread for two flushes; on a
 multi-threaded runtime wrap it in `tokio::task::block_in_place`, or give
 the save a thread of its own. The crate's async functions
-(`reopen_hashed`, `held_hashed`, `held_from`) do the same file work on
+(`inspect`, `reopen_hashed`, `held_hashed`, `held_from`) do the same file work on
 the thread that polls them, before, between and after their waits (the
 folder listed, a record taken, each partial opened, cut or removed with
 its record), and read only a partial's bytes on the blocking pool; they
@@ -397,6 +432,25 @@ send.
 The handshake and the checks are fuzzed: `fuzz/fuzz_targets/resume_handshake.rs`.
 
 ## Changes
+
+- Dropping a `Saving` guard releases its current receiving record lock, including one the store released and took again during that save.
+- Before its first write or reopen, `Saving::forget_received` takes the kept receiving record and removes it and its partial by identity, preserving the sending record. A missing receiver gives `NotHeld` and a competing holder or ambiguous receiver gives `Busy`.
+- When a forget or expiry claims a record this store holds, its current slot's sequence and contents must still match the listing before the record can be removed.
+
+- Added `Store::inspect`, `Reopening` and `Saving::forget_received` for
+  callers that decide whether a kept file continues, starts again or
+  stays as it is. The claim identifies the newest checksummed slot's
+  sequence under one uninterrupted lock on the record file. Releasing
+  and retaking even the same file and sequence invalidates the claim.
+  No public signature or on-disk format changed. Older readers see the
+  same slots as before. During replacement the deterministic record
+  name holds a locked empty file until the first slot is written. A
+  version that creates new records under random names cannot reserve a
+  key across processes in a shared folder. An ambiguous pair of
+  receiving records from such a folder gives `Busy` at inspection.
+  A save guard used after its record lock was released can now return
+  `Busy` from `kept`; passing another key's `Held` gives `NotHeld`.
+  A superseded automatic reopening also returns `Busy`.
 
 - **A refusal of `safecopy-folder` keeps its kind, and removes a record
   only when it says the file is another.**

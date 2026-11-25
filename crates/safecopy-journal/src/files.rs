@@ -26,31 +26,30 @@ pub(crate) const NAME_TRIES: u32 = 64;
 
 /// A new journal file, held so no other cleanup takes it while its
 /// transfer runs: on Windows open without write or delete sharing, on Unix
-/// under an exclusive lock. On Unix the file is made and then locked:
-/// another process may hold it in between, and then this fails with the
-/// error [`busy`] tells, the empty file left under its name.
+/// under an exclusive lock. On Unix another holder, a file filled before
+/// the lock, or a file no longer under its name once locked gives an error
+/// recognised by [`busy`].
 pub fn create(path: &Path) -> io::Result<File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).read(true).write(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows::Win32::Storage::FileSystem::{
-            DELETE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
-        };
-        options
-            .access_mode((FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE).0)
-            .share_mode(FILE_SHARE_READ.0);
-    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        create_in_place(path)
     }
-    let file = options.open(path)?;
-    #[cfg(unix)]
-    file.try_lock().map_err(io::Error::from)?;
-    Ok(file)
+    #[cfg(not(unix))]
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).read(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows::Win32::Storage::FileSystem::{
+                DELETE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+            };
+            options
+                .access_mode((FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE).0)
+                .share_mode(FILE_SHARE_READ.0);
+        }
+        options.open(path)
+    }
 }
 
 /// A new segment of a journal at `path`, held from before its name is
@@ -198,7 +197,7 @@ fn create_in_place(path: &Path) -> io::Result<File> {
     #[cfg(test)]
     crate::seams::at(crate::seams::Point::Made);
     file.try_lock().map_err(io::Error::from)?;
-    if !named(&file, path)? {
+    if file.metadata()?.len() != 0 || !named(&file, path)? {
         return Err(io::ErrorKind::WouldBlock.into());
     }
     Ok(file)

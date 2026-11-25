@@ -26,6 +26,8 @@ pub(crate) mod seams {
         /// Runs once, in this thread's next `forget`, after it claimed the
         /// file and before it removes anything.
         pub static FORGETTING: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+        /// Pauses one removal after its listing, before it takes the record.
+        pub static REMOVING: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
         /// Every reopening of a kept partial on this thread is refused
         /// so by the folder crate, with nothing opened.
         pub static REFUSED_REOPEN: Cell<Option<safecopy_folder::Refusal>> =
@@ -2285,6 +2287,9 @@ async fn a_refusal_that_says_nothing_of_the_file_leaves_its_record_to_be_tried_a
     later(&side);
     for why in refusals().1 {
         seams::REFUSED_REOPEN.set(Some(why));
+        let inspected = side.store.inspect(PEER, key(174)).await.unwrap();
+        assert_eq!(inspected.status(), Err(ResumeError::Unreachable));
+        drop(inspected);
         for hashed in [true, false] {
             let failed = if hashed {
                 side.store.reopen_hashed(PEER, key(174)).await.err()
@@ -2954,6 +2959,7 @@ async fn a_link_under_a_kept_partials_name_is_not_listed() {
 async fn the_stores_futures_can_run_on_another_thread() {
     fn sendable<T: Send>(_: &T) {}
     let side = side("send", Limits::default());
+    sendable(&side.store.inspect(PEER, key(206)));
     sendable(&side.store.reopen_hashed(PEER, key(206)));
     sendable(&side.store.held_hashed(PEER));
     sendable(&side.store.held_from(PEER));
@@ -3747,4 +3753,507 @@ fn the_store_leaves_a_file_with_the_inode_and_another_second_identity() {
         C,
         "not cut, not removed"
     );
+}
+mod reopening {
+    use super::*;
+
+    #[test]
+    fn saving_releases_a_receiving_record_it_took_again() {
+        let side = side("saving-retaken", Limits::default());
+        let guard = side.store.saving(PEER, key(1)).unwrap();
+        let (record, file) = unwritten(&side, key(1), "kept");
+        side.store.receiving(&record, &file).unwrap();
+        assert!(side.store.release(PEER, key(1)));
+        side.store.receiving(&record, &file).unwrap();
+        drop(guard);
+        assert!(side.store.saving(PEER, key(1)).is_ok());
+    }
+
+    #[test]
+    fn saving_forgets_only_the_receiver_before_its_first_write() {
+        let side = side("saving-forget-kept", Limits::default());
+        let sent = source(&side, key(1), b"source");
+        let other = Store::open(&side.base.join("records"), Limits::default()).unwrap();
+        kept_in(&other, &side, PEER, key(1), "kept", 1, 1);
+        assert!(other.release(PEER, key(1)));
+        let guard = side.store.saving(PEER, key(1)).unwrap();
+        guard.forget_received().unwrap();
+        assert!(other.received(PEER, key(1)).is_none());
+        assert!(!side.place.join("kept.part").try_exists().unwrap());
+        assert_eq!(other.sent(PEER, key(1)), Some(sent));
+    }
+
+    #[test]
+    fn saving_forgets_nothing_another_store_holds() {
+        let side = side("saving-forget-held", Limits::default());
+        let other = Store::open(&side.base.join("records"), Limits::default()).unwrap();
+        let kept = kept_in(&other, &side, PEER, key(1), "kept", 1, 1);
+        let guard = side.store.saving(PEER, key(1)).unwrap();
+        assert_eq!(guard.forget_received(), Err(ResumeError::Busy));
+        assert_eq!(other.received(PEER, key(1)), Some(kept));
+        assert_eq!(
+            std::fs::metadata(side.place.join("kept.part"))
+                .unwrap()
+                .len(),
+            C
+        );
+    }
+
+    #[test]
+    fn saving_forgets_nothing_when_two_receiving_records_name_the_key() {
+        let side = side("saving-forget-ambiguous", Limits::default());
+        kept_zeros(&side, PEER, key(1), "old", 1, 1);
+        later(&side);
+        let records = side.base.join("records");
+        let name = records.join(crate::store::file_name(true, PEER, key(1)));
+        std::fs::copy(name, records.join("earlier.resume")).unwrap();
+        let guard = side.store.saving(PEER, key(1)).unwrap();
+        assert_eq!(guard.forget_received(), Err(ResumeError::Busy));
+        assert_eq!(files_in(&records).len(), 2);
+        assert!(side.place.join("old.part").try_exists().unwrap());
+    }
+
+    #[tokio::test]
+    async fn inspect_refuses_an_active_save() {
+        let side = side("inspect-active-save", Limits::default());
+        let _guard = side.store.saving(PEER, key(1)).unwrap();
+        kept_zeros(&side, PEER, key(1), "kept", 1, 1);
+        assert_eq!(
+            side.store.inspect(PEER, key(1)).await.unwrap_err(),
+            ResumeError::Busy
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_a_missing_receiving_record() {
+        let side = side("inspect-no-record", Limits::default());
+        assert_eq!(
+            side.store.inspect(PEER, key(1)).await.unwrap_err(),
+            ResumeError::NotHeld
+        );
+    }
+
+    #[tokio::test]
+    async fn discard_keeps_an_unreachable_partial_for_inspection() {
+        use safecopy_journal::Root;
+
+        let side = side("discard-unreachable", Limits::default());
+        let (mut record, file) = unwritten(&side, key(1), "kept");
+        // The recorded disk is no longer the one mounted here.
+        match &mut record.at.location.root {
+            Root::Windows { serial, .. } => *serial ^= 1,
+            Root::Unix { device, .. } => *device ^= 1,
+        }
+        side.store.receiving(&record, &file).unwrap();
+        drop(file);
+        later(&side);
+        let claim = side.store.inspect(PEER, key(1)).await.unwrap();
+        assert_eq!(claim.discard().unwrap_err(), ResumeError::Unreachable);
+        let again = side.store.inspect(PEER, key(1)).await.unwrap();
+        assert_eq!(again.record(), &record);
+        assert_eq!(again.status(), Err(ResumeError::Unreachable));
+        assert_eq!(side.place.join("kept.part").metadata().unwrap().len(), C);
+    }
+
+    #[tokio::test]
+    async fn discard_leaves_a_file_replaced_after_inspection() {
+        let side = side("discard-replaced", Limits::default());
+        let (record, file) = unwritten(&side, key(1), "old");
+        side.store.receiving(&record, &file).unwrap();
+        file.set_len(C - 1).unwrap();
+        drop(file);
+        later(&side);
+        let claim = side.store.inspect(PEER, key(1)).await.unwrap();
+        assert_eq!(claim.status(), Err(ResumeError::WrongSize));
+        let path = side.place.join("old.part");
+        let moved = side.place.join("moved.part");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        drop(claim.discard().unwrap());
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+        assert_eq!(moved.metadata().unwrap().len(), C - 1);
+        assert!(side.store.received(PEER, key(1)).is_none());
+    }
+
+    async fn mismatch(why: ResumeError, label: &str) {
+        let side = side(label, Limits::default());
+        let (record, mut file) = unwritten(&side, key(1), "old");
+        side.store.receiving(&record, &file).unwrap();
+        later(&side);
+        let path = side.place.join("old.part");
+        match why {
+            ResumeError::PrefixChanged => {
+                file.set_len(C + 17).unwrap();
+                file.write_all(b"x").unwrap();
+            }
+            ResumeError::WrongSize => file.set_len(C - 1).unwrap(),
+            ResumeError::Gone => {}
+            _ => unreachable!(),
+        }
+        drop(file);
+        if why == ResumeError::Gone {
+            std::fs::remove_file(&path).unwrap();
+        }
+        let before = std::fs::read(&path).ok();
+        let record_path =
+            side.base
+                .join("records")
+                .join(crate::store::file_name(true, PEER, key(1)));
+        let slots = std::fs::read(&record_path).unwrap();
+        let claim = side.store.inspect(PEER, key(1)).await.unwrap();
+        assert_eq!(claim.status(), Err(why));
+        assert_eq!(claim.record(), &record);
+        assert_eq!(std::fs::read(&record_path).unwrap(), slots);
+        drop(claim);
+        assert_eq!(side.store.received(PEER, key(1)), Some(record.clone()));
+        assert_eq!(std::fs::read(&path).ok(), before);
+        let claim = side.store.inspect(PEER, key(1)).await.unwrap();
+        assert_eq!(claim.resume().unwrap_err(), why);
+        assert_eq!(side.store.received(PEER, key(1)), Some(record));
+        assert_eq!(std::fs::read(&record_path).unwrap(), slots);
+        assert_eq!(std::fs::read(&path).ok(), before);
+    }
+
+    #[tokio::test]
+    async fn changed_prefix_stays() {
+        mismatch(ResumeError::PrefixChanged, "inspect-changed").await;
+    }
+
+    #[tokio::test]
+    async fn short_partial_stays() {
+        mismatch(ResumeError::WrongSize, "inspect-short").await;
+    }
+
+    #[tokio::test]
+    async fn missing_partial_keeps_its_record() {
+        mismatch(ResumeError::Gone, "inspect-gone").await;
+    }
+
+    #[tokio::test]
+    async fn discard_removes_only_the_claimed_receiving_record_and_partial() {
+        let side = side("inspect-discard", Limits::default());
+        let sent = source(&side, key(1), b"source");
+        kept_zeros(&side, PEER, key(1), "old", 1, 1);
+        kept_zeros(&side, OTHER, key(1), "other", 1, 1);
+        later(&side);
+        let claim = side.store.inspect(PEER, key(1)).await.unwrap();
+        let replacement = claim.discard().unwrap();
+        assert!(side.store.received(PEER, key(1)).is_none());
+        assert!(!side.place.join("old.part").exists());
+        let (new, file) = unwritten(&side, key(1), "new");
+        side.store.receiving(&new, &file).unwrap();
+        drop(file);
+        replacement.forget_received().unwrap();
+        assert!(!side.place.join("new.part").exists());
+        assert!(side.store.received(PEER, key(1)).is_none());
+        assert_eq!(side.store.sent(PEER, key(1)), Some(sent));
+        assert!(side.store.received(OTHER, key(1)).is_some());
+        assert!(side.place.join("other.part").exists());
+    }
+
+    async fn stale_act(n: u8, discard: bool, label: &str) {
+        let side = side(label, Limits::default());
+        let b = Store::open(&side.base.join("records"), Limits::default()).unwrap();
+        let name = format!("old{n}");
+        let old = kept_in(&side.store, &side, PEER, key(n), &name, 1, 1);
+        later(&side);
+        let path = side.place.join(&old.at.partial);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(C + 3)
+            .unwrap();
+        let claim = side.store.inspect(PEER, key(n)).await.unwrap();
+        assert_eq!(claim.status(), Ok(()));
+        let (new, file) = unwritten(&side, key(n), &format!("new{n}"));
+        assert_eq!(b.receiving(&new, &file), Err(ResumeError::Busy));
+        assert!(side.store.release(PEER, key(n)));
+        b.receiving(&new, &file).unwrap();
+        b.release(PEER, key(n));
+        // Even reacquiring the file in the original store cannot revive the claim.
+        side.store.receiving(&new, &file).unwrap();
+        let error = if discard {
+            claim.discard().unwrap_err()
+        } else {
+            claim.resume().unwrap_err()
+        };
+        assert_eq!(error, ResumeError::Busy);
+        assert_eq!(side.store.received(PEER, key(n)), Some(new.clone()));
+        assert_eq!(b.receiving(&new, &file), Err(ResumeError::Busy));
+        assert_eq!(std::fs::metadata(path).unwrap().len(), C + 3);
+    }
+
+    #[tokio::test]
+    async fn stale_resume_leaves_newer_record() {
+        stale_act(1, false, "inspect-newer-resume").await;
+    }
+
+    #[tokio::test]
+    async fn stale_discard_leaves_newer_record() {
+        stale_act(2, true, "inspect-newer-discard").await;
+    }
+
+    #[tokio::test]
+    async fn rewrite_under_same_lock_invalidates_the_inspection() {
+        let side = side("inspect-rewrite", Limits::default());
+        kept_zeros(&side, PEER, key(1), "old", 1, 1);
+        later(&side);
+        let claim = side.store.inspect(PEER, key(1)).await.unwrap();
+        let (new, file) = unwritten(&side, key(1), "new");
+        side.store.receiving(&new, &file).unwrap();
+        assert_eq!(claim.discard().unwrap_err(), ResumeError::Busy);
+        assert_eq!(side.store.received(PEER, key(1)), Some(new));
+        assert!(side.place.join("old.part").exists());
+    }
+
+    #[tokio::test]
+    async fn stale_saving_guard_leaves_newer_receiver() {
+        let side = side("inspect-stale-end", Limits::default());
+        kept_zeros(&side, PEER, key(1), "old", 1, 1);
+        later(&side);
+        let (guard, _, kept) = side
+            .store
+            .inspect(PEER, key(1))
+            .await
+            .unwrap()
+            .resume()
+            .unwrap();
+        drop(kept);
+        later(&side);
+        let b = Store::open(&side.base.join("records"), Limits::default()).unwrap();
+        let (new, file) = unwritten(&side, key(1), "new");
+        b.receiving(&new, &file).unwrap();
+        b.release(PEER, key(1));
+        assert_eq!(guard.forget_received(), Err(ResumeError::Busy));
+        assert_eq!(b.received(PEER, key(1)), Some(new));
+    }
+
+    #[tokio::test]
+    async fn stale_kept_cannot_update_a_replacement() {
+        let side = side("inspect-stale-kept", Limits::default());
+        kept_zeros(&side, PEER, key(1), "old", 1, 1);
+        later(&side);
+        let (guard, _, kept) = side
+            .store
+            .inspect(PEER, key(1))
+            .await
+            .unwrap()
+            .resume()
+            .unwrap();
+        let held = Held {
+            key: key(1),
+            have: kept.have(),
+            prefix: kept.prefix(),
+        };
+        later(&side);
+        let b = Store::open(&side.base.join("records"), Limits::default()).unwrap();
+        let (new, file) = unwritten(&side, key(1), "new");
+        b.receiving(&new, &file).unwrap();
+        b.release(PEER, key(1));
+        assert_eq!(guard.kept(&held, 100, &kept.file), Err(ResumeError::Busy));
+        assert_eq!(b.received(PEER, key(1)), Some(new));
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_cannot_release_a_later_inspection() {
+        use std::task::Poll;
+        let side = side("inspect-cancelled-read", Limits::default());
+        kept_zeros(&side, PEER, key(1), "old", 1, 1);
+        later(&side);
+        seams::STALL.set(true);
+        let mut old = Box::pin(side.store.reopen_hashed(PEER, key(1)));
+        assert!(std::future::poll_fn(|cx| Poll::Ready(old.as_mut().poll(cx).is_pending())).await);
+        later(&side);
+        seams::STALL.set(false);
+        let claim = side.store.inspect(PEER, key(1)).await.unwrap();
+        drop(old);
+        let b = Store::open(&side.base.join("records"), Limits::default()).unwrap();
+        let (new, file) = unwritten(&side, key(1), "new");
+        assert_eq!(b.receiving(&new, &file), Err(ResumeError::Busy));
+        drop(claim);
+        b.receiving(&new, &file).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_legacy_records_are_left_for_the_caller() {
+        let side = side("inspect-ambiguous", Limits::default());
+        kept_zeros(&side, PEER, key(1), "old", 1, 1);
+        later(&side);
+        let records = side.base.join("records");
+        let name = records.join(crate::store::file_name(true, PEER, key(1)));
+        std::fs::copy(name, records.join("earlier.resume")).unwrap();
+        assert_eq!(
+            side.store.inspect(PEER, key(1)).await.unwrap_err(),
+            ResumeError::Busy
+        );
+        assert_eq!(files_in(&records).len(), 2);
+    }
+
+    #[test]
+    fn stale_cleanup_leaves_the_reservation_and_first_replacement_slot() {
+        use std::sync::mpsc;
+        let side = side("inspect-stale-cleanup", Limits::default());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for written in [false, true] {
+            let n = u8::from(written);
+            kept_zeros(&side, PEER, key(n), &format!("old{n}"), 1, 1);
+            later(&side);
+            let (listed, listing) = mpsc::channel();
+            let store = &side.store;
+            std::thread::scope(|scope| {
+                let (act, wait) = mpsc::channel();
+                let cleanup = scope.spawn(move || {
+                    seams::REMOVING.set(Some(Box::new(move || {
+                        listed.send(()).unwrap();
+                        wait.recv().unwrap();
+                    })));
+                    store.remove_all(Some(PEER)).unwrap()
+                });
+                listing.recv().unwrap();
+                let guard = runtime
+                    .block_on(store.inspect(PEER, key(n)))
+                    .unwrap()
+                    .discard()
+                    .unwrap();
+                let (record, file) = unwritten(&side, key(n), &format!("new{n}"));
+                if written {
+                    store.receiving(&record, &file).unwrap();
+                }
+                act.send(()).unwrap();
+                assert_eq!(cleanup.join().unwrap(), 0);
+                let b = Store::open(&side.base.join("records"), Limits::default()).unwrap();
+                assert_eq!(b.receiving(&record, &file), Err(ResumeError::Busy));
+                drop(file);
+                guard.forget_received().unwrap();
+            });
+        }
+    }
+
+    async fn replacement(label: &str, end: &str, legacy: bool) {
+        let side = side(label, Limits::default());
+        kept_zeros(&side, PEER, key(1), "old", 1, 1);
+        later(&side);
+        let records = side.base.join("records");
+        if legacy {
+            std::fs::rename(
+                records.join(crate::store::file_name(true, PEER, key(1))),
+                records.join("earlier.resume"),
+            )
+            .unwrap();
+        }
+        let b = Store::open(&records, Limits::default()).unwrap();
+        let guard = side
+            .store
+            .inspect(PEER, key(1))
+            .await
+            .unwrap()
+            .discard()
+            .unwrap();
+        let (record, file) = unwritten(&side, key(1), "new");
+        assert_eq!(b.receiving(&record, &file), Err(ResumeError::Busy));
+        assert_eq!(b.expire(100, Duration::ZERO, &[]).unwrap().removed, 0);
+        match end {
+            "write" => {
+                side.store.receiving(&record, &file).unwrap();
+                assert_eq!(b.received(PEER, key(1)), Some(record.clone()));
+                assert_eq!(b.receiving(&record, &file), Err(ResumeError::Busy));
+                drop(guard);
+            }
+            "cancel" => guard.forget_received().unwrap(),
+            "torn" => {
+                seams::TEAR.set(true);
+                side.store.receiving(&record, &file).unwrap();
+                drop(guard);
+            }
+            "drop" => drop(guard),
+            "panic" => {
+                let result = std::panic::catch_unwind(move || {
+                    let _guard = guard;
+                    panic!("save stopped")
+                });
+                assert!(result.is_err());
+            }
+            _ => unreachable!(),
+        }
+        if end != "write" {
+            assert_eq!(std::fs::read_dir(&records).unwrap().count(), 0);
+        }
+        b.receiving(&record, &file).unwrap();
+        assert_eq!(b.received(PEER, key(1)), Some(record));
+    }
+
+    #[tokio::test]
+    async fn replacement_claim_spans_first_write() {
+        replacement("replacement-write", "write", false).await;
+    }
+
+    #[tokio::test]
+    async fn torn_first_slot_releases_replacement_key() {
+        replacement("replacement-torn", "torn", false).await;
+    }
+
+    #[tokio::test]
+    async fn replacement_cancel_releases_key() {
+        replacement("replacement-cancel", "cancel", false).await;
+    }
+
+    #[tokio::test]
+    async fn replacement_drop_releases_legacy_key() {
+        replacement("replacement-drop", "drop", true).await;
+    }
+
+    #[tokio::test]
+    async fn replacement_panic_releases_key() {
+        replacement("replacement-panic", "panic", false).await;
+    }
+
+    #[tokio::test]
+    async fn continue_matches_hashed_reopen() {
+        let side = side("inspect-continue", Limits::default());
+        let (record, file) = unwritten(&side, key(1), "old");
+        side.store.receiving(&record, &file).unwrap();
+        file.set_len(C + 7).unwrap();
+        drop(file);
+        later(&side);
+        let (_, mut old) = side.store.reopen_hashed(PEER, key(1)).await.unwrap();
+        let expected_position = old.file.stream_position().unwrap();
+        let expected_len = old.file.metadata().unwrap().len();
+        old.file.write_all(b"tail").unwrap();
+        old.hasher.update(b"tail");
+        let expected_hash = old.hasher.finish();
+        drop(old.file);
+        later(&side);
+        let path = side.place.join(&record.at.partial);
+        let expected_bytes = std::fs::read(&path).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(C + 7)
+            .unwrap();
+        let claim = side.store.inspect(PEER, key(1)).await.unwrap();
+        assert_eq!(claim.status(), Ok(()));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), C + 7);
+        #[cfg(unix)]
+        let path = {
+            let moved = side.place.join("moved.part");
+            std::fs::rename(&path, &moved).unwrap();
+            std::fs::write(path, b"another file").unwrap();
+            moved
+        };
+        let (_guard, _, mut kept) = claim.resume().unwrap();
+        assert_eq!(kept.file.stream_position().unwrap(), expected_position);
+        assert_eq!(kept.file.metadata().unwrap().len(), expected_len);
+        assert_eq!(kept.have(), record.have);
+        assert_eq!(kept.prefix(), record.prefix);
+        kept.file.write_all(b"tail").unwrap();
+        kept.hasher.update(b"tail");
+        assert_eq!(kept.hasher.finish(), expected_hash);
+        drop(kept.file);
+        assert_eq!(std::fs::read(path).unwrap(), expected_bytes);
+    }
 }

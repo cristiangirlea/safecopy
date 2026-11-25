@@ -89,7 +89,11 @@
 //!
 //! # A save's hooks, and how it ends
 //!
-//! A save takes its file first ([`Store::saving`]), before a check's
+//! A caller that decides whether to restart takes [`Store::inspect`].
+//! [`Reopening`] keeps the checked handle until the caller continues,
+//! discards the receiving generation or drops the claim.
+//!
+//! A save using automatic reopening takes its file first ([`Store::saving`]), before a check's
 //! answer is acted on, and holds that guard until it has ended.
 //!
 //! - **A first save** (`safecopy_chunks::Start::New`): its `whole` hook
@@ -119,7 +123,7 @@
 //! # Blocking
 //!
 //! Every function of [`Store`] that reads or changes records, but the
-//! three async ones, is synchronous and does file work, most of it under
+//! async ones, is synchronous and does file work, most of it under
 //! the store's lock: none belongs on a thread that must not wait for a
 //! disk. Each of them lists the store's folder at least once (some two
 //! or three times) and opens the record files a listing shows as new or
@@ -155,7 +159,7 @@
 //! runtime wrap it in `tokio::task::block_in_place`, or give the save a
 //! thread of its own.
 //!
-//! The three async functions ([`Store::reopen_hashed`],
+//! The async functions ([`Store::inspect`], [`Store::reopen_hashed`],
 //! [`Store::held_hashed`], [`Store::held_from`]) do the same file work
 //! on the thread that polls them, before, between and after their
 //! waits: the folder listed, a record taken, each partial opened, cut or
@@ -181,7 +185,7 @@ mod wire;
 
 pub use checks::{Next, Resent, Source, Take, receiver_takes, sender_checks};
 pub use record::{Receiving, Sending};
-pub use store::{Expired, Saving, Store};
+pub use store::{Expired, Reopening, Saving, Store};
 
 /// A transfer's key: 16 random bytes the sender chose for a file the first
 /// time it goes. It names the file to the receiver's record and grants

@@ -5,7 +5,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use safecopy_chunks::{CHUNK, Hasher, Kept};
@@ -79,16 +79,66 @@ struct Indexed {
     found: Option<Found>,
 }
 
+/// The lock identity survives rewrites. Its sequence counts the written slots.
+#[derive(Debug)]
+struct HeldFile {
+    file: File,
+    id: Arc<()>,
+    seq: u64,
+}
+
+impl HeldFile {
+    fn new(file: File, seq: u64) -> Self {
+        Self {
+            file,
+            seq,
+            id: Arc::new(()),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct State {
     /// The record files this store holds, as their only writer.
-    held: HashMap<String, File>,
+    held: HashMap<String, HeldFile>,
     /// What each record file held when it was last read.
     index: HashMap<String, Indexed>,
     /// The files being received that a save of this store is on
     /// ([`Saving`]), or a removal ([`Claimed`]): by the peer they come
     /// from. A file sent under the same key is not in it.
-    saving: HashSet<(PeerId, TransferKey)>,
+    saving: HashMap<(PeerId, TransferKey), Option<RecordLock>>,
+}
+
+/// The lock acquired for one save, independent of its later slot writes.
+#[derive(Debug, Clone)]
+struct RecordLock {
+    name: String,
+    id: Arc<()>,
+}
+
+impl State {
+    fn track(&mut self, peer: PeerId, key: TransferKey, name: &str) {
+        let Some(owner) = self.saving.get(&(peer, key)) else {
+            return;
+        };
+        if owner.as_ref().is_some_and(|old| self.owned(old).is_ok()) {
+            return;
+        }
+        self.saving.insert(
+            (peer, key),
+            Some(RecordLock {
+                name: name.to_owned(),
+                id: self.held[name].id.clone(),
+            }),
+        );
+    }
+
+    fn owned(&self, owner: &RecordLock) -> Result<&HeldFile, ResumeError> {
+        self.held
+            .get(&owner.name)
+            .filter(|held| Arc::ptr_eq(&held.id, &owner.id))
+            .ok_or(ResumeError::Busy)
+    }
 }
 
 /// The resume records of one program, one file per transfer in a folder
@@ -122,7 +172,7 @@ struct State {
 /// write was torn by a crash is such a file too, and its key has no
 /// record until then: run [`Self::expire`] at each start.
 ///
-/// **Blocking.** Every function here but the three async ones is
+/// **Blocking.** Every function here but the async ones is
 /// synchronous and does file work, most of it under the store's lock: on
 /// an async runtime, call them where blocking is allowed (see the
 /// [crate] docs). No async function holds the lock across a wait.
@@ -230,7 +280,7 @@ impl Store {
                 Some(was) => was.found.clone(),
                 None => {
                     let bytes = match held.get(name) {
-                        Some(file) => read_held(file),
+                        Some(held) => read_held(&held.file),
                         None => read_path(&path),
                     };
                     let found = bytes.and_then(|bytes| parse(name, &bytes));
@@ -282,6 +332,10 @@ impl Store {
     /// not named as a partial is not written:
     /// [`ResumeError::NotPartial`].
     fn write(&self, record: &Record) -> Result<(), ResumeError> {
+        self.write_owned(record, None)
+    }
+
+    fn write_owned(&self, record: &Record, owner: Option<&RecordLock>) -> Result<(), ResumeError> {
         let receiving = matches!(record, Record::Receiving(_));
         // Here, where every record passes: none is kept that would name
         // a file the store never opens, cuts or removes.
@@ -301,12 +355,32 @@ impl Store {
             hook();
         }
         let mut state = lock(&self.state);
+        if let Some(owner) = owner {
+            state.owned(owner)?;
+            if existing
+                .as_ref()
+                .is_none_or(|found| found.name != owner.name)
+            {
+                return Err(ResumeError::Busy);
+            }
+        }
         // Where the newest record of the file is: its name, sequence
         // number and slot.
         let mut place = None;
         if let Some(found) = existing {
             match self.hold(&mut state, &found.name)? {
-                Hold::Had => place = Some((found.name, found.seq, found.slot)),
+                Hold::Had => {
+                    let held = &state.held[&found.name];
+                    let current = if held.seq == found.seq {
+                        found
+                    } else {
+                        read_held(&held.file)
+                            .and_then(|bytes| parse(&found.name, &bytes))
+                            .filter(|now| same_record(&now.record, record))
+                            .ok_or(ResumeError::Busy)?
+                    };
+                    place = Some((current.name, current.seq, current.slot));
+                }
                 // Another store may have written it since it was read, or
                 // another file may be under its name: only one that still
                 // reads as this record is written.
@@ -321,14 +395,16 @@ impl Store {
                 Hold::Gone => {}
             }
         }
-        let (name, seq, newest, new) = match place {
+        let (name, seq, latest_slot, new) = match place {
             Some((name, seq, slot)) => (name, seq, slot, false),
             None => self.make(&mut state, record)?,
         };
-        let (seq, at) = (seq + 1, 1 - newest);
+        let seq = seq.checked_add(1).ok_or(ResumeError::Damaged)?;
+        let at = 1 - latest_slot;
         let bytes = slot(seq, &payload).ok_or(ResumeError::TooLarge { most: SLOT })?;
         let written = (|| -> Result<bool, ResumeError> {
-            let mut file = state.held.get(&name).expect("held above");
+            let held = &state.held[&name];
+            let mut file = &held.file;
             file.seek(SeekFrom::Start((at * SLOT) as u64))?;
             #[cfg(test)]
             if crate::tests::seams::FULL.replace(false) {
@@ -352,14 +428,23 @@ impl Store {
             }
             Ok(true)
         })();
+        if receiving && (written.is_ok() || !new) {
+            state.track(record.peer(), record.key(), &name);
+        }
         match written {
-            Ok(true) => {}
+            Ok(true) => state.held.get_mut(&name).expect("held above").seq = seq,
             Ok(false) => return Ok(()),
             Err(e) => {
                 // A new file that holds no record is not left: nothing
                 // would read it, and this store would hold it for good.
                 if new && let Some(file) = state.held.remove(&name) {
-                    let _ = files::delete(&file, &self.dir.join(&name));
+                    let _ = files::delete(&file.file, &self.dir.join(&name));
+                } else if let Some(held) = state.held.get_mut(&name) {
+                    // An unreadable slot cannot vouch for the earlier generation.
+                    held.seq = read_held(&held.file)
+                        .and_then(|b| newest(&b))
+                        .map_or(seq, |(_, current, _)| current);
+                    state.index.remove(&name);
                 }
                 return Err(e);
             }
@@ -404,7 +489,7 @@ impl Store {
         }
         let exists = match files::create(&self.dir.join(&name)) {
             Ok(file) => {
-                state.held.insert(name.clone(), file);
+                state.held.insert(name.clone(), HeldFile::new(file, 0));
                 return Ok((name, 0, 1, true));
             }
             Err(e) => e,
@@ -419,7 +504,7 @@ impl Store {
             // that was torn: what the file holds now is read, so this
             // record is the newer of the two.
             Hold::Had => {
-                let bytes = state.held.get(&name).and_then(read_held);
+                let bytes = state.held.get(&name).and_then(|held| read_held(&held.file));
                 (bytes.and_then(|bytes| parse(&name, &bytes)), true)
             }
             // Removed in this very moment: the caller's next write makes it.
@@ -430,7 +515,7 @@ impl Store {
             // One this store made, with its first write torn, is its own.
             // One it took just now is only when it is empty: a store made
             // it and has not written yet, and no byte is lost by a write.
-            None => had || state.held.get(&name).is_some_and(empty),
+            None => had || state.held.get(&name).is_some_and(|held| empty(&held.file)),
         };
         if !own {
             if !had {
@@ -438,7 +523,7 @@ impl Store {
             }
             return Err(ResumeError::Busy);
         }
-        let (seq, slot) = now.map_or((0, 1), |now| (now.seq, now.slot));
+        let (seq, slot) = now.map_or((state.held[&name].seq, 1), |now| (now.seq, now.slot));
         Ok((name, seq, slot, false))
     }
 
@@ -453,7 +538,10 @@ impl Store {
         match files::hold(&self.dir.join(name)) {
             Ok(file) => {
                 let now = read_held(&file).and_then(|bytes| parse(name, &bytes));
-                state.held.insert(name.to_string(), file);
+                let seq = now.as_ref().map_or(0, |found| found.seq);
+                state
+                    .held
+                    .insert(name.to_string(), HeldFile::new(file, seq));
                 if let Some(was) = state.index.get_mut(name) {
                     *was = Indexed {
                         stamp: None,
@@ -483,66 +571,84 @@ impl Store {
     /// reopen its partial: the only one that may then touch that file.
     /// One it holds already is in use, by a save it started or by an
     /// earlier reopening: [`ResumeError::Busy`], on every system.
-    fn take_received(&self, peer: PeerId, key: TransferKey) -> Result<Found, ResumeError> {
+    fn take_received(
+        &self,
+        peer: PeerId,
+        key: TransferKey,
+    ) -> Result<(Receiving, Generation<'_>), ResumeError> {
         let found = self.find(peer, key, true).ok_or(ResumeError::NotHeld)?;
+        self.take_found(found, peer, key)
+    }
+
+    fn take_found(
+        &self,
+        found: Found,
+        peer: PeerId,
+        key: TransferKey,
+    ) -> Result<(Receiving, Generation<'_>), ResumeError> {
         let mut state = lock(&self.state);
         let now = match self.hold(&mut state, &found.name)? {
             Hold::Had => return Err(ResumeError::Busy),
             Hold::Taken(now) => now.map(|now| *now),
             Hold::Gone => None,
         };
-        let now = now.filter(
-            |now| matches!(&now.record, Record::Receiving(r) if r.peer == peer && r.key == key),
-        );
-        if now.is_none() {
-            self.drop_hold(&mut state, &found.name);
+        if let Some(Found {
+            record: Record::Receiving(record),
+            seq,
+            ..
+        }) = now
+            && record.peer == peer
+            && record.key == key
+        {
+            let id = state.held[&found.name].id.clone();
+            let held = Generation {
+                store: self,
+                owner: RecordLock {
+                    name: found.name,
+                    id,
+                },
+                seq,
+                release: true,
+            };
+            return Ok((record, held));
         }
-        now.ok_or(ResumeError::NotHeld)
-    }
-
-    /// What a reopening that failed leaves: nothing held by this store.
-    /// The record goes, with its partial, when the partial is no longer
-    /// what it says ([`lost`]); otherwise it is let go as it is.
-    fn settle<T>(&self, found: &Found, opened: Result<T, ResumeError>) -> Result<T, ResumeError> {
-        match &opened {
-            Ok(_) => {}
-            Err(e) if lost(e) => {
-                self.remove(found);
-            }
-            Err(_) => self.drop_hold(&mut lock(&self.state), &found.name),
-        }
-        opened
+        self.drop_hold(&mut state, &found.name);
+        Err(ResumeError::NotHeld)
     }
 
     /// The record file `name`, for this store alone: the handle it holds,
     /// or taken whole, so one another store holds is left. `None` when it
     /// cannot be had, or when one taken no longer holds the record of
-    /// sequence number `seq` (`None`: no record that reads): it was judged
+    /// the previous reading (`None`: no record that reads): it was judged
     /// by an older reading, and is left for the next look.
     ///
     /// With `own`, one this store holds is given up to the claim: the
     /// caller's own word (a forget, an expiry past its `live` list).
     /// Without, it is left: a save of this store's may be using it.
-    fn claim(&self, name: &str, seq: Option<u64>, own: bool) -> Option<File> {
+    fn claim(&self, name: &str, expected: Option<&Found>, own: bool) -> Option<File> {
         let mut state = lock(&self.state);
-        if state.held.contains_key(name) {
-            if !own {
+        let matches = |bytes: &[u8]| match (newest(bytes), expected) {
+            (Some((record, seq, _)), Some(found)) => seq == found.seq && record == found.record,
+            (None, None) => true,
+            _ => false,
+        };
+        if let Some(held) = state.held.get(name) {
+            if !own || !read_held(&held.file).is_some_and(|bytes| matches(&bytes)) {
                 return None;
             }
             state.index.remove(name);
-            return state.held.remove(name);
+            return state.held.remove(name).map(|held| held.file);
         }
         let taken = files::take(&self.dir.join(name), MOST);
         state.index.remove(name);
         let (file, bytes) = taken.ok()?;
-        let now = newest(&bytes).map(|(_, seq, _)| seq);
-        (now == seq).then_some(file)
+        matches(&bytes).then_some(file)
     }
 
     /// Removes the record file `name`, which no slot of reads, claimed
     /// first.
     fn remove_file(&self, name: &str) -> bool {
-        match self.claim(name, None, true) {
+        match self.claim(name, None, false) {
             Some(file) => files::delete(&file, &self.dir.join(name)).is_ok(),
             None => false,
         }
@@ -562,7 +668,11 @@ impl Store {
     }
 
     fn remove_claimed(&self, found: &Found, own: bool) -> bool {
-        let Some(file) = self.claim(&found.name, Some(found.seq), own) else {
+        #[cfg(test)]
+        if let Some(hook) = crate::tests::seams::REMOVING.take() {
+            hook();
+        }
+        let Some(file) = self.claim(&found.name, Some(found), own) else {
             return false;
         };
         if let Record::Receiving(r) = &found.record {
@@ -662,6 +772,18 @@ impl Store {
         partial: &File,
         at_drop: bool,
     ) -> Result<bool, ResumeError> {
+        self.keep_owned(peer, held, now, partial, at_drop, None)
+    }
+
+    fn keep_owned(
+        &self,
+        peer: PeerId,
+        held: &Held,
+        now: u64,
+        partial: &File,
+        at_drop: bool,
+        owner: Option<&RecordLock>,
+    ) -> Result<bool, ResumeError> {
         let (key, have, prefix) = (held.key, held.have, held.prefix);
         let mut record = self.received(peer, key).ok_or(ResumeError::NotHeld)?;
         if !record.at.is_partial(&self.journal) {
@@ -682,7 +804,7 @@ impl Store {
         record.have = have;
         record.prefix = prefix;
         record.last = now;
-        self.write(&Record::Receiving(record))?;
+        self.write_owned(&Record::Receiving(record), owner)?;
         Ok(true)
     }
 
@@ -805,12 +927,48 @@ impl Store {
             .collect())
     }
 
+    /// Claims the current receiving record and checks its prefix without cutting
+    /// or removing anything. Inspect the claimed record before choosing an act.
+    /// A record in use gives `Busy`; a partial's error is on the returned claim.
+    /// Dropping the future or the claim releases this generation.
+    pub async fn inspect(
+        &self,
+        peer: PeerId,
+        key: TransferKey,
+    ) -> Result<Reopening<'_>, ResumeError> {
+        let claim = self.claim_received(peer, key)?;
+        let (record, held) = self.take_only_received(peer, key)?;
+        let checked = self.checked(&record).await;
+        Ok(Reopening {
+            claim,
+            held,
+            record,
+            checked,
+        })
+    }
+
+    fn take_only_received(
+        &self,
+        peer: PeerId,
+        key: TransferKey,
+    ) -> Result<(Receiving, Generation<'_>), ResumeError> {
+        let mut records = self.all()?.into_iter().filter_map(|(_, f)| f).filter(
+            |f| matches!(&f.record, Record::Receiving(r) if r.peer == peer && r.key == key),
+        );
+        let found = records.next().ok_or(ResumeError::NotHeld)?;
+        if records.next().is_some() {
+            return Err(ResumeError::Busy);
+        }
+        self.take_found(found, peer, key)
+    }
+
     /// The kept partial of `key` from `peer`, opened by identity for
     /// writing and cut to its `have`, to append the rest; with its folder.
     /// Its bytes are not read: [`Self::reopen_hashed`] checks them. The
     /// folder is opened by identity, which on Windows gives it no path: a
     /// file published into it reports its name alone.
     ///
+    /// Use [`Self::inspect`] when the caller decides whether to cut or discard.
     /// The record is taken first, and stays held while the file is
     /// continued. One in use is [`ResumeError::Busy`], and its partial is
     /// not touched: held by another store, held by this one (a save it
@@ -832,17 +990,9 @@ impl Store {
     /// It is synchronous and does file work: the folder listed, the
     /// record file taken, the partial found by identity, opened and cut.
     pub fn reopen(&self, peer: PeerId, key: TransferKey) -> Result<(Directory, File), ResumeError> {
-        let found = self.take_received(peer, key)?;
-        let opened = match &found.record {
-            Record::Receiving(record) => {
-                open_partial(record, &self.journal).and_then(|(dir, file)| {
-                    file.set_len(record.have)?;
-                    Ok((dir, file))
-                })
-            }
-            Record::Sending(_) => Err(ResumeError::NotHeld),
-        };
-        self.settle(&found, opened)
+        let (record, held) = self.take_received(peer, key)?;
+        let opened = open_partial(&record, &self.journal);
+        held.finish(&record, opened, |(_, file)| file, true)
     }
 
     /// [`Self::reopen`], with the partial's first `have` bytes read once
@@ -852,6 +1002,7 @@ impl Store {
     /// are [`ResumeError::PrefixChanged`], and the record and the partial
     /// are removed: nothing is appended, and the file comes from zero.
     /// Busy records and failures are as [`Self::reopen`] has them.
+    /// Use [`Self::inspect`] to keep a mismatching partial pending a decision.
     ///
     /// The bytes are read through the handle handed back, the one the
     /// save appends through, so no moment passes between the check and
@@ -862,25 +1013,13 @@ impl Store {
         peer: PeerId,
         key: TransferKey,
     ) -> Result<(Directory, Kept), ResumeError> {
-        let found = self.take_received(peer, key)?;
-        let Record::Receiving(record) = &found.record else {
-            return self.settle(&found, Err(ResumeError::NotHeld));
-        };
-        // The reading may be long, and its future dropped before it ends.
-        let mut reading = Reading {
-            store: self,
-            name: &found.name,
-            under_way: true,
-        };
-        let hashed = match hash_partial(record, &self.journal, &self.chunks).await {
-            Ok((dir, file, hasher)) => match file.set_len(record.have) {
-                Ok(()) => Ok((dir, file, hasher)),
-                Err(e) => Err(e.into()),
-            },
-            Err(e) => Err(e),
-        };
-        reading.under_way = false;
-        let (dir, file, hasher) = self.settle(&found, hashed)?;
+        let (record, held) = self.take_received(peer, key)?;
+        let checked = self.checked(&record).await;
+        held.finish(&record, checked, |(_, kept)| &kept.file, true)
+    }
+
+    async fn checked(&self, record: &Receiving) -> Result<(Directory, Kept), ResumeError> {
+        let (dir, file, hasher) = hash_partial(record, &self.journal, &self.chunks).await?;
         let partial = record.at.partial.clone().into();
         Ok((
             dir,
@@ -979,9 +1118,10 @@ impl Store {
                 && state.held.contains_key(&found.name)
         });
         // Looked up and taken under one lock: of two at once, one is told.
-        if held || !state.saving.insert((peer, key)) {
+        if held || state.saving.contains_key(&(peer, key)) {
             return Err(ResumeError::Busy);
         }
+        state.saving.insert((peer, key), None);
         Ok(())
     }
 
@@ -1012,11 +1152,9 @@ impl Store {
     /// work, to be called where blocking is allowed (see the [crate]
     /// docs).
     pub fn saving(&self, peer: PeerId, key: TransferKey) -> Result<Saving<'_>, ResumeError> {
-        self.enter(peer, key)?;
         Ok(Saving {
-            store: self,
-            peer,
-            key,
+            claim: self.claim_received(peer, key)?,
+            reserved: false,
         })
     }
 
@@ -1236,6 +1374,156 @@ impl Store {
     }
 }
 
+/// A hold can be released explicitly and its name taken again, even at slot one.
+#[derive(Debug)]
+struct Generation<'a> {
+    store: &'a Store,
+    owner: RecordLock,
+    seq: u64,
+    release: bool,
+}
+
+impl Generation<'_> {
+    fn current<'s>(&self, state: &'s State) -> Result<&'s File, ResumeError> {
+        let held = state.owned(&self.owner)?;
+        if held.seq != self.seq {
+            return Err(ResumeError::Busy);
+        }
+        Ok(&held.file)
+    }
+
+    fn finish<T>(
+        mut self,
+        record: &Receiving,
+        opened: Result<T, ResumeError>,
+        file: impl FnOnce(&T) -> &File,
+        remove_lost: bool,
+    ) -> Result<T, ResumeError> {
+        let mut state = lock(&self.store.state);
+        let slot = self.current(&state)?;
+        match opened {
+            Ok(opened) => {
+                file(&opened).set_len(record.have)?;
+                state.track(record.peer, record.key, &self.owner.name);
+                self.release = false;
+                Ok(opened)
+            }
+            Err(e) => {
+                if remove_lost && lost(&e) {
+                    record.at.remove(&self.store.journal);
+                    let _ = files::delete(slot, &self.store.dir.join(&self.owner.name));
+                    self.store.drop_hold(&mut state, &self.owner.name);
+                    self.release = false;
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+impl Drop for Generation<'_> {
+    fn drop(&mut self) {
+        if self.release {
+            let mut state = lock(&self.store.state);
+            if self.current(&state).is_ok() {
+                self.store.drop_hold(&mut state, &self.owner.name);
+            }
+        }
+    }
+}
+
+/// A checked receiving record. Dropping it keeps the record and partial as found.
+#[derive(Debug)]
+pub struct Reopening<'a> {
+    claim: Claimed<'a>,
+    held: Generation<'a>,
+    record: Receiving,
+    checked: Result<(Directory, Kept), ResumeError>,
+}
+
+impl<'a> Reopening<'a> {
+    /// The record read under the lock. Compare it with what the caller offered.
+    pub fn record(&self) -> &Receiving {
+        &self.record
+    }
+
+    /// Whether the prefix fits. A mismatch, short file, missing file or
+    /// temporary failure retains its [`ResumeError`] kind.
+    pub fn status(&self) -> Result<(), ResumeError> {
+        self.checked.as_ref().map(|_| ()).map_err(|e| *e)
+    }
+
+    /// Cuts the checked handle to `have` and hands it and its hasher to the save.
+    /// A released or rewritten generation gives [`ResumeError::Busy`].
+    pub fn resume(self) -> Result<(Saving<'a>, Directory, Kept), ResumeError> {
+        let (dir, kept) =
+            self.held
+                .finish(&self.record, self.checked, |(_, kept)| &kept.file, false)?;
+        Ok((
+            Saving {
+                claim: self.claim,
+                reserved: false,
+            },
+            dir,
+            kept,
+        ))
+    }
+
+    /// Discards this receiving record and its partial by identity. The returned
+    /// save holds the replacement key across its first [`Store::receiving`].
+    /// Drop it to leave the key free. A changed generation gives `Busy`.
+    pub fn discard(mut self) -> Result<Saving<'a>, ResumeError> {
+        let store = self.claim.store;
+        let mut state = lock(&store.state);
+        let file = self.held.current(&state)?;
+        drop(self.checked);
+        let name = file_name(true, self.record.peer, self.record.key);
+        // Older records have random names. Reserve the writer's name first.
+        let reserved = if self.held.owner.name != name {
+            Some(files::create(&store.dir.join(&name)).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists || files::busy(&e) {
+                    ResumeError::Busy
+                } else {
+                    e.into()
+                }
+            })?)
+        } else {
+            None
+        };
+        let discard = || -> Result<(), ResumeError> {
+            discard_partial(&self.record, &store.journal)?;
+            if reserved.is_some() {
+                files::delete(file, &store.dir.join(&self.held.owner.name))?;
+                files::sync_dir(&store.dir)?;
+            } else {
+                // Keep this same lock until the first replacement slot is written.
+                file.set_len(0)?;
+                file.sync_data()?;
+            }
+            Ok(())
+        };
+        if let Err(e) = discard() {
+            if let Some(file) = reserved {
+                let _ = files::delete(&file, &store.dir.join(&name));
+            }
+            return Err(e);
+        }
+        state.index.remove(&self.held.owner.name);
+        if let Some(file) = reserved {
+            state.held.remove(&self.held.owner.name);
+            state
+                .held
+                .insert(name.clone(), HeldFile::new(file, self.held.seq));
+        }
+        state.track(self.record.peer, self.record.key, &name);
+        self.held.release = false;
+        Ok(Saving {
+            claim: self.claim,
+            reserved: true,
+        })
+    }
+}
+
 /// One save's claim on a file being received, from [`Store::saving`]:
 /// while it lives, no other save of its store takes that file, and
 /// [`Store::forget`] leaves it.
@@ -1250,8 +1538,8 @@ impl Store {
 ///   later [`Store::reopen_hashed`] continues the file from what the
 ///   record last said.
 ///
-/// Dropping it writes nothing, and reads a record file only in a store
-/// with more of them than its index remembers ([`Limits::indexed`]).
+/// Dropping a replacement before its first write removes its empty reservation.
+/// It checks the held slots to distinguish a torn first write from a kept record.
 ///
 /// **A save dropped.** The guard lives outside the save's future, so that
 /// future is dropped first, and when its drop returns no write of the
@@ -1268,9 +1556,8 @@ impl Store {
 /// [`ResumeError::Busy`], and is tried again.
 #[derive(Debug)]
 pub struct Saving<'a> {
-    store: &'a Store,
-    peer: PeerId,
-    key: TransferKey,
+    claim: Claimed<'a>,
+    reserved: bool,
 }
 
 impl Saving<'_> {
@@ -1284,50 +1571,81 @@ impl Saving<'_> {
     /// where blocking is allowed (`tokio::task::block_in_place`; the guard
     /// borrows its store, so it does not move to the blocking pool).
     pub fn kept(self, held: &Held, now: u64, partial: &File) -> Result<(), ResumeError> {
-        self.store.keep(self.peer, held, now, partial, true)?;
+        let store = self.claim.store;
+        if held.key != self.claim.key {
+            return Err(ResumeError::NotHeld);
+        }
+        let owner = {
+            let state = lock(&store.state);
+            let owner = self.claim.owner(&state);
+            if let Some(owner) = &owner {
+                state.owned(owner)?;
+            }
+            owner
+        };
+        store.keep_owned(self.claim.peer, held, now, partial, true, owner.as_ref())?;
         Ok(())
     }
 
     /// The save published its file, or ended with nothing kept: the
     /// records of the file go, as [`Store::forget`] removes them, with
     /// what is left of a partial, by identity.
+    /// Use [`Self::forget_received`] to leave the sending record in place.
     pub fn forget(self) -> Result<(), ResumeError> {
-        self.store.forget_kind(self.peer, self.key, false, true)?;
-        self.store.forget_kind(self.peer, self.key, true, true)?;
+        self.claim
+            .store
+            .forget_kind(self.claim.peer, self.claim.key, false, true)?;
+        self.claim
+            .store
+            .forget_kind(self.claim.peer, self.claim.key, true, true)?;
+        Ok(())
+    }
+
+    /// Ends this save and forgets only what it received under the key.
+    pub fn forget_received(self) -> Result<(), ResumeError> {
+        let store = self.claim.store;
+        let acquired;
+        let mut state = lock(&store.state);
+        let owner = match self.claim.owner(&state) {
+            Some(owner) => owner,
+            None => {
+                drop(state);
+                (_, acquired) = store.take_only_received(self.claim.peer, self.claim.key)?;
+                state = lock(&store.state);
+                acquired.current(&state)?;
+                acquired.owner.clone()
+            }
+        };
+        let held = state.owned(&owner)?;
+        if self.reserved && empty(&held.file) {
+            return Ok(());
+        }
+        let bytes = read_held(&held.file).ok_or(ResumeError::Unreachable)?;
+        let Some((Record::Receiving(r), _, _)) = newest(&bytes) else {
+            return Err(ResumeError::Damaged);
+        };
+        if r.peer != self.claim.peer || r.key != self.claim.key {
+            return Err(ResumeError::Busy);
+        }
+        discard_partial(&r, &store.journal)?;
+        files::delete(&held.file, &store.dir.join(&owner.name))?;
+        store.drop_hold(&mut state, &owner.name);
         Ok(())
     }
 }
 
 impl Drop for Saving<'_> {
     fn drop(&mut self) {
-        let (peer, key) = (self.peer, self.key);
-        let mut state = lock(&self.store.state);
-        let State { held, index, .. } = &mut *state;
-        // Only the record of the file received: a sending one has no save.
-        // From what the store holds, with no folder listed: this must not
-        // fail. One whose first write was torn is known by its name.
-        let own = file_name(true, peer, key);
-        let received =
-            |r: &Record| matches!(r, Record::Receiving(r) if r.peer == peer && r.key == key);
-        let names: Vec<String> = held
-            .iter()
-            .filter(|(name, file)| {
-                **name == own
-                    || match index.get(*name) {
-                        Some(was) => was.found.as_ref().is_some_and(|f| received(&f.record)),
-                        None => read_held(file)
-                            .and_then(|bytes| parse(name, &bytes))
-                            .is_some_and(|f| received(&f.record)),
-                    }
-            })
-            .map(|(name, _)| name.clone())
-            .collect();
-        for name in names {
-            held.remove(&name);
-            // No longer its only writer: read again when next looked up.
-            index.remove(&name);
+        let store = self.claim.store;
+        let mut state = lock(&store.state);
+        if let Some(owner) = self.claim.owner(&state)
+            && let Ok(held) = state.owned(&owner)
+        {
+            if self.reserved && read_held(&held.file).is_some_and(|b| newest(&b).is_none()) {
+                let _ = files::delete(&held.file, &store.dir.join(&owner.name));
+            }
+            store.drop_hold(&mut state, &owner.name);
         }
-        state.saving.remove(&(peer, key));
     }
 }
 
@@ -1345,10 +1663,17 @@ struct Forgotten {
 /// it. It only stands in the way of a save: ended, it lets go of no
 /// record, since it took none, and one a reopening took meanwhile is
 /// that reopening's to keep.
+#[derive(Debug)]
 struct Claimed<'a> {
     store: &'a Store,
     peer: PeerId,
     key: TransferKey,
+}
+
+impl Claimed<'_> {
+    fn owner(&self, state: &State) -> Option<RecordLock> {
+        state.saving.get(&(self.peer, self.key))?.clone()
+    }
 }
 
 impl Drop for Claimed<'_> {
@@ -1356,24 +1681,6 @@ impl Drop for Claimed<'_> {
         lock(&self.store.state)
             .saving
             .remove(&(self.peer, self.key));
-    }
-}
-
-/// A record taken to reopen its partial, while the prefix is read: let go
-/// when that reading's future is dropped, so a reopening that was
-/// cancelled does not leave the file in use for good.
-struct Reading<'a> {
-    store: &'a Store,
-    name: &'a str,
-    under_way: bool,
-}
-
-impl Drop for Reading<'_> {
-    fn drop(&mut self) {
-        if self.under_way {
-            self.store
-                .drop_hold(&mut lock(&self.store.state), self.name);
-        }
     }
 }
 
@@ -1448,6 +1755,16 @@ fn not_reopened(left: Left) -> ResumeError {
         Left::Volume | Left::Unreachable | Left::Io => ResumeError::Unreachable,
         // A reason added since: nothing is removed until it has a line here.
         _ => ResumeError::Unreachable,
+    }
+}
+
+fn discard_partial(
+    record: &Receiving,
+    settings: &safecopy_journal::Settings,
+) -> Result<(), ResumeError> {
+    match record.at.remove_checked(settings) {
+        Ok(()) | Err(Left::Gone | Left::Replaced | Left::Name) => Ok(()),
+        Err(left) => Err(not_reopened(left)),
     }
 }
 
