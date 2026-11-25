@@ -80,7 +80,7 @@ fn the_framing_constants_and_defaults_are_the_designed_ones() {
     assert_eq!(settings.sender_keep, 4);
     assert_eq!(settings.meta_bytes, 4096);
     let options = SaveOptions::default();
-    assert_eq!(*options.publish, PublishRules::default());
+    assert_eq!(options.publish, Publish::default());
     assert_eq!(options.meta_rules, MetaRules::default());
     assert!(options.sync);
     assert_eq!(options.partial_tries, 10_001);
@@ -213,16 +213,16 @@ async fn a_whole_file_carries_its_hash_and_is_published() {
         }
     }
     let progress = Count(&counted);
-    let rules = PublishRules {
+    let rules = Publish {
         mark: true,
-        ..PublishRules::default()
+        ..Publish::default()
     };
     let sent = Time {
         secs: 1_000_000_000,
         nanos: 0,
     };
     let options = SaveOptions {
-        publish: &rules,
+        publish: rules,
         meta: Meta {
             modified: Some(sent),
             executable: true,
@@ -308,12 +308,12 @@ async fn a_wrong_hash_removes_the_file_before_it_gets_a_name() {
     let mut stream = framed(&bytes).await;
     // One bit of the file flipped on the way.
     stream[50_000] ^= 1;
-    let rules = PublishRules {
+    let rules = Publish {
         mark: true,
-        ..PublishRules::default()
+        ..Publish::default()
     };
     let options = SaveOptions {
-        publish: &rules,
+        publish: rules,
         meta: Meta {
             modified: Some(Time { secs: 1, nanos: 0 }),
             executable: true,
@@ -639,12 +639,12 @@ async fn hooks_run_in_order_and_an_error_in_any_removes_the_partial() {
         secs: 1_000_000_000,
         nanos: 0,
     };
-    let rules = PublishRules {
+    let rules = Publish {
         mark: true,
-        ..PublishRules::default()
+        ..Publish::default()
     };
     let options = SaveOptions {
-        publish: &rules,
+        publish: rules,
         meta: Meta {
             modified: Some(sent),
             executable: false,
@@ -1231,12 +1231,12 @@ async fn a_save_whose_names_are_all_taken_says_how_many_it_tried() {
         std::fs::write(to.join("a.txt"), b"theirs").unwrap();
         std::fs::write(to.join("a (2).txt"), b"theirs").unwrap();
         let dir = Directory::open(&to).unwrap();
-        let rules = PublishRules {
+        let rules = Publish {
             name_tries: 2,
-            ..PublishRules::default()
+            ..Publish::default()
         };
         let options = SaveOptions {
-            publish: &rules,
+            publish: rules,
             ..SaveOptions::default()
         };
         let hooks = Recorder::default();
@@ -1361,9 +1361,9 @@ async fn the_mark_comes_after_the_hash_and_before_the_time() {
         secs: 1_000_000_000,
         nanos: 0,
     };
-    let rules = PublishRules {
+    let rules = Publish {
         mark: true,
-        ..PublishRules::default()
+        ..Publish::default()
     };
     struct Unmarked(PathBuf, Mutex<Option<bool>>);
     impl Hooks for Unmarked {
@@ -1376,7 +1376,7 @@ async fn the_mark_comes_after_the_hash_and_before_the_time() {
     }
     let hooks = Unmarked(to.clone(), Mutex::new(None));
     let options = SaveOptions {
-        publish: &rules,
+        publish: rules,
         meta: Meta {
             modified: Some(sent),
             executable: false,
@@ -1859,16 +1859,16 @@ async fn a_cut_stream_keeps_whole_chunks_and_a_later_save_appends_and_publishes(
     );
 
     // Later: the sender continues from what is kept.
-    let rules = PublishRules {
+    let rules = Publish {
         mark: true,
-        ..PublishRules::default()
+        ..Publish::default()
     };
     let sent = Time {
         secs: 1_000_000_000,
         nanos: 0,
     };
     let options = SaveOptions {
-        publish: &rules,
+        publish: rules,
         meta: Meta {
             modified: Some(sent),
             executable: true,
@@ -2830,6 +2830,128 @@ async fn a_write_under_way_when_its_save_is_dropped_is_whole_when_the_drop_retur
     assert!(std::fs::read(to.join("a.bin.part")).unwrap() == bytes[..SLICE]);
     assert_eq!(steps.recv().unwrap(), Step::Closing);
     assert_eq!(steps.recv().unwrap(), Step::Ended);
+    drop(dir);
+    std::fs::remove_dir_all(&to).unwrap();
+}
+
+/// The handles this process has open of the file at `path`, where the
+/// system lists them (Linux and Android): by the file itself, since a
+/// handle opened under the partial name still says that name.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn handles_of(path: &Path) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let file = std::fs::metadata(path).unwrap();
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        // One of another test, closed since, is not this file's.
+        .filter_map(|fd| std::fs::metadata(fd.ok()?.path()).ok())
+        .filter(|open| open.dev() == file.dev() && open.ino() == file.ino())
+        .count()
+}
+
+/// A save's rules are the folder crate's, each field passed on as it is,
+/// and never ask for the published file to be held.
+#[test]
+fn a_save_s_publish_rules_are_the_folder_s_and_hold_nothing() {
+    assert_eq!(Publish::default().rules(), PublishRules::default());
+    let rules = Publish {
+        mark: true,
+        retries: 7,
+        retry_wait: std::time::Duration::from_millis(3),
+        name_tries: 2,
+    };
+    assert_eq!(
+        rules.rules(),
+        PublishRules {
+            mark: true,
+            retries: 7,
+            retry_wait: std::time::Duration::from_millis(3),
+            name_tries: 2,
+            hold: false,
+        }
+    );
+}
+
+/// When a save returns, the published file is open through nothing of
+/// the save: it and its folder can be renamed and removed at once.
+#[tokio::test]
+async fn a_saved_file_is_held_open_by_nothing_when_the_save_returns() {
+    let to = temp("nothing-held");
+    std::fs::create_dir(to.join("in")).unwrap();
+    let dir = Directory::open(&to.join("in")).unwrap();
+    let bytes = data(100_000);
+    let stream = framed(&bytes).await;
+    for (name, kind) in [("a.bin", 0), ("b.bin", 1), ("c.bin", 2)] {
+        let target = Target {
+            dir: &dir,
+            name,
+            size: bytes.len() as u64,
+        };
+        let options = SaveOptions {
+            publish: Publish::default(),
+            ..SaveOptions::default()
+        };
+        let saved = match kind {
+            0 => save_verified(
+                &mut &stream[..],
+                &dir,
+                name,
+                target.size,
+                &options,
+                &(),
+                std::future::pending(),
+            )
+            .await
+            .unwrap(),
+            // The second and third through the resumable save, new and resumed.
+            1 => {
+                let keep = |_: &ChunkError| true;
+                save_resumable(
+                    &mut &stream[..],
+                    target,
+                    Start::New,
+                    &keep,
+                    &options,
+                    &(),
+                    std::future::pending(),
+                )
+                .await
+                .unwrap()
+            }
+            _ => {
+                let partial = std::ffi::OsString::from("c.bin.part");
+                let kept = Box::new(Kept {
+                    file: dir.create(&partial).unwrap(),
+                    partial,
+                    hasher: Settings::default().receiving(),
+                });
+                let keep = |_: &ChunkError| true;
+                save_resumable(
+                    &mut &stream[..],
+                    target,
+                    Start::Resume(kept),
+                    &keep,
+                    &options,
+                    &(),
+                    std::future::pending(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(saved.path, to.join("in").join(name));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(handles_of(&saved.path), 0);
+    }
+    // Windows renames no folder with a file open below it, and removes
+    // no file open without delete sharing, as a save's partial is.
+    std::fs::rename(to.join("in"), to.join("moved")).unwrap();
+    assert_eq!(files_in(&to.join("moved")), ["a.bin", "b.bin", "c.bin"]);
+    for name in ["a.bin", "b.bin", "c.bin"] {
+        assert!(std::fs::read(to.join("moved").join(name)).unwrap() == bytes);
+        std::fs::remove_file(to.join("moved").join(name)).unwrap();
+    }
+    assert!(files_in(&to.join("moved")).is_empty());
     drop(dir);
     std::fs::remove_dir_all(&to).unwrap();
 }

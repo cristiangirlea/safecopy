@@ -5,10 +5,11 @@ use std::fs::File;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::LazyLock;
 
-use safecopy_chunks::{DIGEST_LEN, Digest, Hasher, Pace, Progress, SLICE, Saved, read_version};
-use safecopy_folder::{Directory, Finish, Meta, MetaRules, NAME_TRIES, PublishError, PublishRules};
+use safecopy_chunks::{
+    DIGEST_LEN, Digest, Hasher, Pace, Progress, Publish, SLICE, Saved, read_version,
+};
+use safecopy_folder::{Directory, Finish, Meta, MetaRules, NAME_TRIES, PublishError};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::placed::Placed;
@@ -171,11 +172,71 @@ pub trait BundleHooks: Send + Sync {
 /// No hooks.
 impl BundleHooks for () {}
 
-/// How [`Table::read`] saves.
+/// How [`Table::read`] saves. Every field is used for every entry
+/// saved; none is taken and then left unused.
 #[derive(Clone, Copy)]
 pub struct ReadOptions<'a> {
-    /// The downloaded-file mark and the publish's retries.
-    pub publish: &'a PublishRules,
+    /// How each checked entry is published: marked as downloaded when
+    /// [`Publish::mark`] asks, a publish something else holds a moment
+    /// tried again [`Publish::retries`] times, [`Publish::retry_wait`]
+    /// apart, and at most [`Publish::name_tries`] names tried
+    /// ([`Outcome::NoNameLeft`] past them).
+    ///
+    /// No published file is held open: [`Publish`] has no `hold`, the
+    /// field of `safecopy_folder::PublishRules` that asks for it, so it
+    /// cannot be set here and then not given. Each file held is a handle
+    /// kept open, and on Unix a second one of its folder; a peer decides
+    /// how many files a bundle has, up to [`BundleLimits::files`], and a
+    /// [`Report`] is a value a program keeps. So an entry is published
+    /// and closed, and [`Outcome::Saved`] says where it is.
+    ///
+    /// ```
+    /// use safecopy_bundle::{Publish, ReadOptions};
+    ///
+    /// let publish = Publish {
+    ///     mark: true,
+    ///     ..Publish::default()
+    /// };
+    /// let options = ReadOptions {
+    ///     publish,
+    ///     ..ReadOptions::default()
+    /// };
+    /// assert!(!options.publish.rules().hold);
+    /// ```
+    ///
+    /// There is no `hold` to set:
+    ///
+    /// ```compile_fail,E0560
+    /// use safecopy_bundle::{Publish, ReadOptions};
+    ///
+    /// let publish = Publish {
+    ///     mark: true,
+    ///     hold: true,
+    ///     ..Publish::default()
+    /// };
+    /// let options = ReadOptions {
+    ///     publish,
+    ///     ..ReadOptions::default()
+    /// };
+    /// ```
+    ///
+    /// and the folder crate's rules, which have one, are not taken:
+    ///
+    /// ```compile_fail,E0308
+    /// use safecopy_bundle::ReadOptions;
+    ///
+    /// let publish = safecopy_folder::PublishRules {
+    ///     mark: true,
+    ///     ..Default::default()
+    /// };
+    /// let options = ReadOptions {
+    ///     publish: &publish,
+    ///     ..ReadOptions::default()
+    /// };
+    /// ```
+    ///
+    /// [`BundleLimits::files`]: crate::BundleLimits::files
+    pub publish: Publish,
     /// Which of each file's time and execute bit are set.
     pub meta_rules: MetaRules,
     /// Hears of every slice written to a partial file.
@@ -194,12 +255,10 @@ pub struct ReadOptions<'a> {
     pub partial_tries: usize,
 }
 
-static DEFAULT_PUBLISH: LazyLock<PublishRules> = LazyLock::new(PublishRules::default);
-
 impl Default for ReadOptions<'_> {
     fn default() -> Self {
         Self {
-            publish: &DEFAULT_PUBLISH,
+            publish: Publish::default(),
             meta_rules: MetaRules::default(),
             progress: &(),
             pace: &(),
@@ -311,9 +370,10 @@ impl<R: AsyncRead + Unpin> Table<R> {
     /// as long as it stalls. A write that had not started writes nothing.
     /// So when this returns or is dropped, nothing of it is still being
     /// written and no handle of the read's to a partial file is still
-    /// open: on Windows, where a file's name goes only with its last
-    /// handle, a removed partial file is gone from its folder by then,
-    /// unless a hook kept a clone of its handle
+    /// open, and none to a published file either
+    /// ([`ReadOptions::publish`]): on Windows, where a file's name goes
+    /// only with its last handle, a removed partial file is gone from
+    /// its folder by then, unless a hook kept a clone of its handle
     /// ([`BundleHooks::admitted`]). A flush
     /// ([`ReadOptions::sync`], and the flush of a copy a publish made) is
     /// not behind the gate: one still on the pool when `cancel` came or
@@ -730,7 +790,7 @@ async fn publish(
             file,
             partial,
             &target.name,
-            options.publish,
+            &options.publish.rules(),
             &finish,
             cancel.as_mut(),
         )

@@ -15,6 +15,7 @@
 //! - [`BundleReader::open`] reads and checks the whole table;
 //!   [`Table::read`] saves the files with one [`Take`] per entry, each
 //!   verified before it is published, and reports one [`Outcome`] each.
+//!   No published file is held open ([`ReadOptions::publish`]).
 //! - [`Gate`]: at most [`BundleLimits::at_once`] bundles of one transfer
 //!   read at a time.
 //! - With the `quic` feature, `quic`: stopping a quinn stream with a
@@ -43,7 +44,7 @@ use std::fmt;
 use std::io;
 use std::sync::Arc;
 
-pub use safecopy_chunks::Saved;
+pub use safecopy_chunks::{Publish, Saved};
 use safecopy_folder::Refusal;
 pub use safecopy_resume::TransferKey;
 
@@ -203,7 +204,7 @@ pub enum Outcome {
         tried: usize,
     },
     /// Its hash matched, and every name tried for it was taken
-    /// (`safecopy_folder::PublishRules::name_tries`): it got none, and
+    /// ([`Publish::name_tries`]): it got none, and
     /// its partial file was removed.
     NoNameLeft {
         /// The names tried.

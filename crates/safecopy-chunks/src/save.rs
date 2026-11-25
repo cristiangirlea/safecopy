@@ -5,8 +5,9 @@ use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use safecopy_folder::{
     Applied, Directory, Finish, Marked, Meta, MetaRules, NAME_TRIES, PublishError, PublishRules,
@@ -140,13 +141,126 @@ impl PartialFate {
 /// No hooks.
 impl Hooks for () {}
 
-/// How [`save_verified`] and [`save_resumable`] save.
+/// How a save gives its checked file a name: the fields of
+/// [`PublishRules`] that a save honours, each passed on as it is.
+///
+/// [`PublishRules::hold`] is not among them, so it cannot be asked for
+/// and then not given: a save hands back a [`Saved`], a value to keep,
+/// copy and compare, with no open file in it. A file held open is kept
+/// from other programs for as long as the value that holds it lives
+/// (`safecopy_folder::Held` says how, on each system). A caller that
+/// must take a file back with proof publishes it itself, with
+/// [`Directory::publish_with`], and gets the held file from there.
+///
+/// ```
+/// use safecopy_chunks::{Publish, SaveOptions};
+///
+/// let publish = Publish {
+///     mark: true,
+///     ..Publish::default()
+/// };
+/// let options = SaveOptions {
+///     publish,
+///     ..SaveOptions::default()
+/// };
+/// assert!(options.publish.rules().mark);
+/// assert!(!options.publish.rules().hold);
+/// ```
+///
+/// There is no `hold` to set:
+///
+/// ```compile_fail,E0560
+/// use safecopy_chunks::{Publish, SaveOptions};
+///
+/// let publish = Publish {
+///     mark: true,
+///     hold: true,
+///     ..Publish::default()
+/// };
+/// let options = SaveOptions {
+///     publish,
+///     ..SaveOptions::default()
+/// };
+/// ```
+///
+/// and the folder crate's rules, which have one, are not taken:
+///
+/// ```compile_fail,E0308
+/// use safecopy_chunks::SaveOptions;
+///
+/// let publish = safecopy_folder::PublishRules {
+///     mark: true,
+///     ..Default::default()
+/// };
+/// let options = SaveOptions {
+///     publish: &publish,
+///     ..SaveOptions::default()
+/// };
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Publish {
+    /// Mark the file as downloaded before it gets its name
+    /// ([`PublishRules::mark`]). Off by default.
+    pub mark: bool,
+    /// How often a publish refused because something else holds the file
+    /// a moment is tried again ([`PublishRules::retries`]).
+    pub retries: u32,
+    /// How long to wait before each of those tries
+    /// ([`PublishRules::retry_wait`]).
+    pub retry_wait: Duration,
+    /// The most names tried for the file, the one asked for and its
+    /// numbers ([`PublishRules::name_tries`]): when every one is taken
+    /// the file gets none.
+    pub name_tries: usize,
+}
+
+impl Default for Publish {
+    /// The defaults of [`PublishRules`].
+    fn default() -> Self {
+        // Every field named: a new one there is decided on here, taken
+        // or left out, before this builds again.
+        let PublishRules {
+            mark,
+            retries,
+            retry_wait,
+            name_tries,
+            hold: _,
+        } = PublishRules::default();
+        Self {
+            mark,
+            retries,
+            retry_wait,
+            name_tries,
+        }
+    }
+}
+
+impl Publish {
+    /// The folder crate's rules for a publish by these: every field as it
+    /// is here, and nothing held.
+    pub fn rules(&self) -> PublishRules {
+        PublishRules {
+            mark: self.mark,
+            retries: self.retries,
+            retry_wait: self.retry_wait,
+            name_tries: self.name_tries,
+            hold: false,
+        }
+    }
+}
+
+/// How [`save_verified`] and [`save_resumable`] save. Every field is
+/// used by every save, but for [`Self::settings`] and
+/// [`Self::partial_tries`], which a save from [`Start::Resume`] has no
+/// use for: its hasher and its partial file are handed in.
 #[derive(Clone, Copy)]
 pub struct SaveOptions<'a> {
-    /// How many boundaries the hasher keeps.
+    /// How many boundaries the hasher of a new save keeps.
     pub settings: Settings,
-    /// The downloaded-file mark and the publish's retries.
-    pub publish: &'a PublishRules,
+    /// The downloaded-file mark, the publish's retries and how many names
+    /// it tries. Nothing here holds the published file open: see
+    /// [`Publish`].
+    pub publish: Publish,
     /// The sender's modified time and execute bit.
     pub meta: Meta,
     /// Which of them are set.
@@ -171,13 +285,11 @@ pub struct SaveOptions<'a> {
     pub partial_tries: usize,
 }
 
-static DEFAULT_PUBLISH: LazyLock<PublishRules> = LazyLock::new(PublishRules::default);
-
 impl Default for SaveOptions<'_> {
     fn default() -> Self {
         Self {
             settings: Settings::default(),
-            publish: &*DEFAULT_PUBLISH,
+            publish: Publish::default(),
             meta: Meta::default(),
             meta_rules: MetaRules::default(),
             progress: &(),
@@ -188,7 +300,8 @@ impl Default for SaveOptions<'_> {
     }
 }
 
-/// A file saved.
+/// A file saved. No handle of it is open when a save returns this, but
+/// one a hook kept a clone of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Saved {
     /// Where it is: the name asked for, or a numbered one.
@@ -687,7 +800,7 @@ async fn fill<R: AsyncRead + Unpin + ?Sized>(
             file,
             partial,
             name,
-            options.publish,
+            &options.publish.rules(),
             &Finish {
                 meta: options.meta,
                 meta_rules: options.meta_rules,
