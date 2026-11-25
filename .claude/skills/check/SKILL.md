@@ -25,7 +25,8 @@ Then the fuzz job, once per target in `fuzz/fuzz_targets/`, with the
 nightly that `FUZZ_NIGHTLY` in `.github/workflows/ci.yml` names:
 
 ```sh
-cargo +<FUZZ_NIGHTLY> fuzz run <target> -- -max_total_time=60 -rss_limit_mb=2048
+mkdir -p fuzz/corpus/<target>
+cargo +<FUZZ_NIGHTLY> fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- -max_total_time=60 -rss_limit_mb=2048
 ```
 
 Notes:

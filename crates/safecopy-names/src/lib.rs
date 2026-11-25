@@ -20,6 +20,9 @@
 //! know which system a name is for, so both limits hold everywhere and a
 //! safe name fits either kind.
 
+// What the fuzz target runs: for the fuzzer's build and the tests alone.
+#[cfg(any(test, fuzzing))]
+pub mod fuzzing;
 mod path;
 mod siblings;
 

@@ -24,3 +24,5 @@ safecopy-bundle = { path = "crates/safecopy-bundle", version = "0.1.0" }
 
 [workspace.lints.rust]
 missing_docs = "warn"
+# The fuzzer's build sets it; each crate keeps what its fuzz target runs behind it.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

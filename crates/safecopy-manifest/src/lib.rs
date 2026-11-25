@@ -47,6 +47,9 @@
 //!   inside a kept-out folder is found by the identity of everything in the
 //!   kept-out folders, and by the path the folder was opened at.
 
+// What the fuzz target runs: for the fuzzer's build and the tests alone.
+#[cfg(any(test, fuzzing))]
+pub mod fuzzing;
 mod groups;
 mod listing;
 mod sources;

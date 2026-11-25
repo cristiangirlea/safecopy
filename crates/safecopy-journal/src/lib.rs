@@ -343,6 +343,9 @@ use safecopy_manifest::{Group, GroupLimits, Progress, ProgressError};
 use safecopy_names::NameRules;
 
 pub mod files;
+// What the fuzz targets run: for the fuzzer's build and the tests alone.
+#[cfg(any(test, fuzzing))]
+pub mod fuzzing;
 mod location;
 mod log;
 mod record;

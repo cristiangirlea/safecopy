@@ -2,3 +2,6 @@
 * text=auto eol=lf
 *.sh text eol=lf
 *.ps1 text eol=lf
+# Fuzz inputs are bytes: a line ending changed in one makes it another input.
+fuzz/seeds/** binary
+fuzz/regressions/** binary

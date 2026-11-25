@@ -56,6 +56,55 @@ streams in `safecopy-bundle`; nothing else needs a transport.
 - Permissive dependency licences only, checked by `cargo deny`.
 - Parsers of bytes from the other side are fuzzed.
 
+## Fuzzing
+
+Each parser has a target in `fuzz/fuzz_targets/` (cargo-fuzz, a nightly
+pinned by date as `FUZZ_NIGHTLY` in the workflows). A target is one call
+into the `fuzzing` module of the crate that owns the format. That module
+is built only for the crate's tests and under `cfg(fuzzing)`, which a
+fuzzer's build sets: the tests run what the fuzzer runs, and an ordinary
+build has none of it.
+
+- `fuzz/seeds/<target>/`: valid inputs, written by the formats' own
+  encoders. A test in each crate fails when a seed no longer decodes or
+  is not what the format writes now. Write them again with
+  `cargo test --workspace write_fuzz_seeds -- --ignored` and commit them.
+- `fuzz/regressions/<target>/`: inputs that once made a target fail. The
+  ordinary tests run every seed and every regression input through the
+  target's function, on Linux, Windows and macOS.
+- `fuzz/corpus/<target>/`: what the fuzzer found, not in git. CI keeps it
+  in a cache between runs.
+
+To run a target from its seeds (Linux or macOS, `cargo install
+cargo-fuzz@0.13.2 --locked`):
+
+```sh
+mkdir -p fuzz/corpus/journal_log
+cargo +nightly fuzz run journal_log fuzz/corpus/journal_log fuzz/seeds/journal_log -- -max_total_time=60 -rss_limit_mb=2048
+```
+
+When a run fails, libFuzzer leaves the input in `fuzz/artifacts/<target>/`
+(in CI: the failed run's artifact `fuzz-artifacts-<target>`). Keep it:
+
+```sh
+cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<input>    # fails again
+cp fuzz/artifacts/<target>/<input> fuzz/regressions/<target>/<what-it-shows>
+cargo test --workspace fuzzing                                      # fails until it is fixed
+```
+
+For a smaller input, `cargo +nightly fuzz tmin <target>
+fuzz/artifacts/<target>/<input>` writes `minimized-from-<hash>` beside
+it: copy that one instead. Commit the input with the fix.
+
+In CI every pull request runs each target for a minute, from its seeds
+and the newest cached corpus, and saves what it found as a new cache. A
+pull request's cache belongs to that pull request alone; only a run on
+`main` adds to the corpus the others start from. Once a week
+(`.github/workflows/fuzz-weekly.yml`, Mondays, or started by hand on
+`main`) each target runs for 30 minutes, the corpus is minimised and
+saved. A crash fails that run and its input is the run's artifact
+`fuzz-artifacts-<target>`, kept 14 days; nothing else is posted.
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
