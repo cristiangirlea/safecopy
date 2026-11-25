@@ -2,9 +2,12 @@ use super::*;
 use crate::listing::{add_size, taken};
 use crate::seams::{
     ATTRIBUTES, FINAL_PATH_FAILS, GONE_BEFORE_INSPECT, GONE_BEFORE_OPEN, INSPECT_FAILS, NO_VOLUME,
+    REFUSED,
 };
-use crate::sources::{Kept, OFFLINE, RECALL_ON_DATA_ACCESS, RECALL_ON_OPEN, online_only};
-use safecopy_folder::{Directory, Meta, Time, is_link};
+use crate::sources::{
+    Kept, OFFLINE, RECALL_ON_DATA_ACCESS, RECALL_ON_OPEN, online_only, unreadable,
+};
+use safecopy_folder::{Directory, Meta, Refusal, Time, is_link};
 use safecopy_names::{PathRules, Siblings, check_path, safe_name};
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
@@ -1978,7 +1981,14 @@ fn a_picked_path_naming_a_stream_is_refused() {
     let (_scratch, dir) = scratch("stream");
     write(&dir.join("f.txt"), b"file");
     std::fs::write(dir.join("f.txt:hidden"), b"stream").unwrap();
-    assert!(list(&[dir.join("f.txt:hidden")]).is_err());
+    assert_eq!(
+        why(list(&[dir.join("f.txt"), dir.join("f.txt:hidden")])),
+        ManifestError::Refused {
+            why: Refusal::Stream,
+            root: 1,
+            part: 1,
+        }
+    );
     assert!(list(&[dir.join("f.txt")]).is_ok());
 }
 
@@ -2447,5 +2457,284 @@ fn a_picked_special_file_is_refused_as_one() {
         ManifestError::NotFileOrFolder {
             at: dir.join("Work/pipe")
         }
+    );
+}
+
+/// Every refusal of the folder crate's, as this crate knows them.
+const REFUSALS: [Refusal; 13] = [
+    Refusal::Link,
+    Refusal::NotFileOrFolder,
+    Refusal::NotFolder,
+    Refusal::LeavesFolder,
+    Refusal::Stream,
+    Refusal::Nul,
+    Refusal::TooLong,
+    Refusal::BadListing,
+    Refusal::NoVolume,
+    Refusal::Replaced,
+    Refusal::NoNameLeft { tried: 7 },
+    Refusal::Unproven,
+    Refusal::OtherFolder,
+];
+
+/// No refusal becomes an unreadable entry of no kind: a link and a special
+/// file keep their kinds, and each of the rest is carried as it is, with
+/// where it was in numbers.
+#[test]
+fn every_refusal_keeps_its_kind_when_it_is_mapped() {
+    let at = Path::new("somewhere");
+    for why in REFUSALS {
+        let mapped = unreadable(at, (3, 2), &io::Error::other(why));
+        let expected = match why {
+            Refusal::Link => ManifestError::Link { at: at.into() },
+            Refusal::NotFileOrFolder => ManifestError::NotFileOrFolder { at: at.into() },
+            why => ManifestError::Refused {
+                why,
+                root: 3,
+                part: 2,
+            },
+        };
+        assert_eq!(mapped, expected);
+    }
+}
+
+/// What the system itself said is still unreadable, with its kind and code;
+/// so is an error of another crate's that only looks like a refusal.
+#[test]
+fn a_system_error_is_still_unreadable_with_its_kind_and_code() {
+    let at = Path::new("somewhere");
+    // ERROR_FILE_NOT_FOUND, ENOENT.
+    assert_eq!(
+        unreadable(at, (0, 1), &io::Error::from_raw_os_error(2)),
+        ManifestError::Unreadable {
+            at: at.into(),
+            kind: io::ErrorKind::NotFound,
+            raw: Some(2),
+        }
+    );
+    assert_eq!(
+        unreadable(at, (0, 1), &io::Error::other("not a refusal")),
+        ManifestError::Unreadable {
+            at: at.into(),
+            kind: io::ErrorKind::Other,
+            raw: None,
+        }
+    );
+}
+
+/// Refuses `name` as the folder crate would while the guard lasts.
+struct Refuse(&'static str);
+
+fn refuse(name: &'static str, why: Refusal) -> Refuse {
+    REFUSED.with_borrow_mut(|refused| refused.insert(name.into(), why));
+    Refuse(name)
+}
+
+impl Drop for Refuse {
+    fn drop(&mut self) {
+        REFUSED.with_borrow_mut(|refused| refused.remove(OsStr::new(self.0)));
+    }
+}
+
+/// A listed entry opened again: whatever the folder crate refuses, for a
+/// folder on the way, the entry's own folder or the file itself, reaches
+/// the caller as that refusal with the count of parts that lead to it. No
+/// system refuses a name it listed for these reasons, so the test does.
+#[test]
+fn a_listed_entry_refused_when_opened_again_says_the_refusal_and_the_part() {
+    let (_scratch, dir) = scratch("refused-again");
+    let root = dir.join("Photos");
+    write(&root.join("sub/deep/b.txt"), b"b");
+    std::fs::create_dir_all(root.join("sub/empty")).unwrap();
+    let listing = Listing::list(&root, &limits()).unwrap();
+    assert_eq!(
+        names_of(&listing),
+        ["Photos/sub/deep/b.txt", "Photos/sub/empty/"]
+    );
+    let (file, folder) = (&listing.entries[0], &listing.entries[1]);
+    for refusal in REFUSALS {
+        if matches!(refusal, Refusal::Link | Refusal::NotFileOrFolder) {
+            continue;
+        }
+        let refused = |part| ManifestError::Refused {
+            why: refusal,
+            root: 0,
+            part,
+        };
+        for (name, entry, part) in [
+            ("sub", file, 1),
+            ("deep", file, 2),
+            ("b.txt", file, 3),
+            ("sub", folder, 1),
+            ("empty", folder, 2),
+        ] {
+            let _refused = refuse(name, refusal);
+            assert_eq!(why(listing.open_entry(entry)), refused(part));
+        }
+    }
+    // The two with kinds of their own keep them, with the part as a path.
+    {
+        let _refused = refuse("deep", Refusal::Link);
+        assert_eq!(
+            why(listing.open_entry(file)),
+            ManifestError::Link {
+                at: root.join("sub/deep")
+            }
+        );
+    }
+    {
+        let _refused = refuse("deep", Refusal::NotFileOrFolder);
+        assert_eq!(
+            why(listing.open_entry(file)),
+            ManifestError::NotFileOrFolder {
+                at: root.join("sub/deep")
+            }
+        );
+    }
+    {
+        let _refused = refuse("b.txt", Refusal::NotFileOrFolder);
+        assert_eq!(
+            why(listing.open_entry(file)),
+            ManifestError::NotAFile {
+                at: root.join("sub/deep/b.txt")
+            }
+        );
+    }
+    // Nothing refused: both open.
+    assert!(listing.open_entry(file).unwrap().is_some());
+    assert!(listing.open_entry(folder).unwrap().is_none());
+}
+
+/// A file where a listed folder was is the system's own refusal on every
+/// system: unreadable, with its kind and code and the part that failed.
+#[test]
+fn a_listed_folder_that_became_a_file_is_unreadable_with_the_system_s_code() {
+    let (_scratch, dir) = scratch("became-file");
+    let root = dir.join("Photos");
+    write(&root.join("sub/b.txt"), b"b");
+    std::fs::create_dir_all(root.join("empty")).unwrap();
+    let listing = Listing::list(&root, &limits()).unwrap();
+    assert_eq!(names_of(&listing), ["Photos/empty/", "Photos/sub/b.txt"]);
+    std::fs::remove_dir_all(root.join("sub")).unwrap();
+    std::fs::remove_dir(root.join("empty")).unwrap();
+    write(&root.join("sub"), b"a file now");
+    write(&root.join("empty"), b"a file now");
+    // ERROR_DIRECTORY, ENOTDIR.
+    let code = if cfg!(windows) { 267 } else { 20 };
+    for (entry, part) in [(&listing.entries[1], "sub"), (&listing.entries[0], "empty")] {
+        assert_eq!(
+            why(listing.open_entry(entry)),
+            ManifestError::Unreadable {
+                at: root.join(part),
+                kind: io::ErrorKind::NotADirectory,
+                raw: Some(code),
+            }
+        );
+    }
+}
+
+/// A file given as the folder to list: Windows opens it, and the folder
+/// crate refuses it as no folder; elsewhere the system refuses the open.
+#[test]
+fn a_file_listed_as_a_folder_is_refused_as_no_folder() {
+    let (_scratch, dir) = scratch("file-as-folder");
+    write(&dir.join("f.txt"), b"file");
+    let listed = why(Listing::list(&dir.join("f.txt"), &limits()));
+    write(&dir.join("ok.txt"), b"file");
+    let picked = why(list(&[dir.join("ok.txt"), dir.join("f.txt/inside.txt")]));
+    if cfg!(windows) {
+        let refused = |root| ManifestError::Refused {
+            why: Refusal::NotFolder,
+            root,
+            part: 0,
+        };
+        assert_eq!(listed, refused(0));
+        // The folder the second picked path is in.
+        assert_eq!(picked, refused(1));
+    } else {
+        for error in [listed, picked] {
+            assert!(matches!(
+                error,
+                ManifestError::Unreadable {
+                    kind: io::ErrorKind::NotADirectory,
+                    raw: Some(20),
+                    ..
+                }
+            ));
+        }
+    }
+}
+
+/// A picked name with a NUL in it cannot be passed to the system: the
+/// folder crate refuses it, on every system, as the picked path itself.
+#[test]
+fn a_picked_name_with_a_nul_is_refused_as_one() {
+    let (_scratch, dir) = scratch("nul");
+    write(&dir.join("ok.txt"), b"file");
+    assert_eq!(
+        why(list(&[dir.join("ok.txt"), dir.join("a\0b.txt")])),
+        ManifestError::Refused {
+            why: Refusal::Nul,
+            root: 1,
+            part: 1,
+        }
+    );
+}
+
+/// A picked name longer than Windows passes in one call is refused by the
+/// folder crate before the system is asked.
+#[cfg(windows)]
+#[test]
+fn a_picked_name_too_long_to_pass_is_refused_as_one() {
+    let (_scratch, dir) = scratch("too-long");
+    assert_eq!(
+        why(list(&[dir.join("n".repeat(40_000))])),
+        ManifestError::Refused {
+            why: Refusal::TooLong,
+            root: 0,
+            part: 1,
+        }
+    );
+}
+
+/// Below a picked folder the count goes on: the picked path is 1, a name
+/// in it 2, one below that 3; and the root is the pick it was walked for.
+#[test]
+fn a_name_refused_below_a_picked_folder_counts_the_names_to_it() {
+    let (_scratch, dir) = scratch("refused-below");
+    write(&dir.join("ok.txt"), b"file");
+    write(&dir.join("r/sub/x.txt"), b"x");
+    let picks = [dir.join("ok.txt"), dir.join("r")];
+    for (name, part) in [("r", 1), ("sub", 2), ("x.txt", 3)] {
+        let _refused = refuse(name, Refusal::NotFolder);
+        assert_eq!(
+            why(list(&picks)),
+            ManifestError::Refused {
+                why: Refusal::NotFolder,
+                root: 1,
+                part,
+            }
+        );
+    }
+    assert!(list(&picks).is_ok());
+}
+
+/// What a listing skips has no kind for a refusal, as it has none for a
+/// system error: the folder is skipped as unreadable and still goes, empty.
+#[test]
+fn a_folder_refused_inside_a_listed_folder_is_skipped_as_unreadable() {
+    let (_scratch, dir) = scratch("refused-skip");
+    let root = dir.join("Photos");
+    write(&root.join("a.txt"), b"a");
+    write(&root.join("sub/b.txt"), b"b");
+    let _refused = refuse("sub", Refusal::BadListing);
+    let listing = Listing::list(&root, &limits()).unwrap();
+    assert_eq!(names_of(&listing), ["Photos/a.txt", "Photos/sub/"]);
+    assert_eq!(
+        listing.skipped,
+        [Skipped {
+            path: "Photos/sub/".into(),
+            why: Skip::Unreadable
+        }]
     );
 }

@@ -26,6 +26,12 @@ A bounded list of files to send.
   listed file again from the held folder and refuses one that grew or
   whose execute bit changed (`Changed`), or is no longer a regular file
   (`NotAFile`); an error's `at` is the part of the path that failed.
+- What `safecopy-folder` refuses to open reaches the caller as that
+  refusal: a link as `Link`, a device, pipe or socket as
+  `NotFileOrFolder` or `NotAFile`, and every other
+  `safecopy_folder::Refusal` as `ManifestError::Refused { why, root,
+  part }`. What the system itself refused is `Unreadable`, with its kind
+  and code.
 
 - `groups` cuts a list into groups, in order, as a pure function of the
   list, so both sides compute the same: a group ends where the parent
@@ -77,6 +83,55 @@ original code behaved as below, this crate does not:
 
 ## Changes
 
+- **`ManifestError::Refused { why, root, part }`** is new: a refusal of
+  `safecopy-folder`'s that has no kind of its own here. `Sources::list`,
+  `Sources::list_keeping_out`, `Listing::list` and `Listing::open_entry`
+  gave `Unreadable { kind: Other, raw: None }` for it before, whatever
+  the refusal was. A caller sees:
+  - `Unreadable` is now only what the system said. An arm for
+    `Unreadable { kind: ErrorKind::Other, .. }` that stood for these
+    refusals no longer gets them: match `Refused { why, .. }`.
+  - `why` is the `safecopy_folder::Refusal`, itself `#[non_exhaustive]`.
+    It is never `Link` (still `ManifestError::Link`) nor
+    `NotFileOrFolder` (still `ManifestError::NotFileOrFolder`, or
+    `NotAFile` from `open_entry` for the entry itself): those are
+    unchanged.
+  - Where it was is two numbers, not a path: `root` is which picked path
+    it was for, from 0 (always 0 for a `Listing`), and `part` is how many
+    names lead to what was refused from the folder held open, which is
+    the listed folder for a `Listing` (0 is the folder itself, otherwise
+    that many of `Listed::parts`) and the folder a picked path is in for
+    `Sources` (0 is that folder, 1 the picked path, 2 a name in it).
+  - `ManifestError` was `#[non_exhaustive]` already, so a `match` on it
+    has a wildcard arm and still builds; the new kind lands in that arm
+    until it is given one.
+  - Met in practice: on Windows a file given as the folder to list, or
+    as the folder a picked path is in (`NotFolder`; other systems refuse
+    that open themselves, and so does Windows for a folder below the one
+    held, which stays `Unreadable` with `NotADirectory`); a picked name
+    with a NUL (`Nul`); on Windows one naming a stream (`Stream`) or
+    longer than one call passes (`TooLong`), and a folder whose listing
+    the system returns damaged (`BadListing`, from `Listing::list` for
+    the listed folder and from `Sources` for any folder it walks). An
+    entry a `Listing` listed is not refused for these when opened again,
+    since its names were opened once already; the mapping holds for it
+    all the same.
+  - Not changed: `Sources::open` gives `Changed` for whatever is refused
+    there, the kept-out folders `KeptOut`, and what a `Listing` skips
+    inside the listed folder `Skip::Unreadable` (or `Skip::Link`,
+    `Skip::NotFileOrFolder`), which carries no kind for a system error
+    either.
+
+  (`every_refusal_keeps_its_kind_when_it_is_mapped`,
+  `a_listed_entry_refused_when_opened_again_says_the_refusal_and_the_part`,
+  `a_name_refused_below_a_picked_folder_counts_the_names_to_it`,
+  `a_folder_refused_inside_a_listed_folder_is_skipped_as_unreadable`,
+  `a_file_listed_as_a_folder_is_refused_as_no_folder`,
+  `a_picked_name_with_a_nul_is_refused_as_one`,
+  `a_picked_path_naming_a_stream_is_refused`,
+  `a_picked_name_too_long_to_pass_is_refused_as_one`,
+  `a_listed_folder_that_became_a_file_is_unreadable_with_the_system_s_code`,
+  `a_system_error_is_still_unreadable_with_its_kind_and_code`).
 - **A listing keeps the extension of a name it cuts.** `Limits::names`
   follows `safecopy-names`, which now cuts a long name in its stem: 250
   letters and `.txt` are listed as 196 letters and `.txt`, where an
