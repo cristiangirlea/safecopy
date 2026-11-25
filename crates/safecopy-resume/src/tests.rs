@@ -3757,6 +3757,94 @@ fn the_store_leaves_a_file_with_the_inode_and_another_second_identity() {
 mod reopening {
     use super::*;
 
+    #[test]
+    fn saving_releases_a_receiving_record_it_took_again() {
+        let side = side("saving-retaken", Limits::default());
+        let guard = side.store.saving(PEER, key(1)).unwrap();
+        let (record, file) = unwritten(&side, key(1), "kept");
+        side.store.receiving(&record, &file).unwrap();
+        assert!(side.store.release(PEER, key(1)));
+        side.store.receiving(&record, &file).unwrap();
+        drop(guard);
+        assert!(side.store.saving(PEER, key(1)).is_ok());
+    }
+
+    #[test]
+    fn saving_forgets_only_the_receiver_before_its_first_write() {
+        let side = side("saving-forget-kept", Limits::default());
+        let sent = source(&side, key(1), b"source");
+        let other = Store::open(&side.base.join("records"), Limits::default()).unwrap();
+        kept_in(&other, &side, PEER, key(1), "kept", 1, 1);
+        assert!(other.release(PEER, key(1)));
+        let guard = side.store.saving(PEER, key(1)).unwrap();
+        guard.forget_received().unwrap();
+        assert!(other.received(PEER, key(1)).is_none());
+        assert!(!side.place.join("kept.part").try_exists().unwrap());
+        assert_eq!(other.sent(PEER, key(1)), Some(sent));
+    }
+
+    #[tokio::test]
+    async fn inspect_refuses_an_active_save() {
+        let side = side("inspect-active-save", Limits::default());
+        let _guard = side.store.saving(PEER, key(1)).unwrap();
+        kept_zeros(&side, PEER, key(1), "kept", 1, 1);
+        assert_eq!(
+            side.store.inspect(PEER, key(1)).await.unwrap_err(),
+            ResumeError::Busy
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_a_missing_receiving_record() {
+        let side = side("inspect-no-record", Limits::default());
+        assert_eq!(
+            side.store.inspect(PEER, key(1)).await.unwrap_err(),
+            ResumeError::NotHeld
+        );
+    }
+
+    #[tokio::test]
+    async fn discard_keeps_an_unreachable_partial_for_inspection() {
+        use safecopy_journal::Root;
+
+        let side = side("discard-unreachable", Limits::default());
+        let (mut record, file) = unwritten(&side, key(1), "kept");
+        // The recorded disk is no longer the one mounted here.
+        match &mut record.at.location.root {
+            Root::Windows { serial, .. } => *serial ^= 1,
+            Root::Unix { device, .. } => *device ^= 1,
+        }
+        side.store.receiving(&record, &file).unwrap();
+        drop(file);
+        later(&side);
+        let claim = side.store.inspect(PEER, key(1)).await.unwrap();
+        assert_eq!(claim.discard().unwrap_err(), ResumeError::Unreachable);
+        let again = side.store.inspect(PEER, key(1)).await.unwrap();
+        assert_eq!(again.record(), &record);
+        assert_eq!(again.status(), Err(ResumeError::Unreachable));
+        assert_eq!(side.place.join("kept.part").metadata().unwrap().len(), C);
+    }
+
+    #[tokio::test]
+    async fn discard_leaves_a_file_replaced_after_inspection() {
+        let side = side("discard-replaced", Limits::default());
+        let (record, file) = unwritten(&side, key(1), "old");
+        side.store.receiving(&record, &file).unwrap();
+        file.set_len(C - 1).unwrap();
+        drop(file);
+        later(&side);
+        let claim = side.store.inspect(PEER, key(1)).await.unwrap();
+        assert_eq!(claim.status(), Err(ResumeError::WrongSize));
+        let path = side.place.join("old.part");
+        let moved = side.place.join("moved.part");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        drop(claim.discard().unwrap());
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+        assert_eq!(moved.metadata().unwrap().len(), C - 1);
+        assert!(side.store.received(PEER, key(1)).is_none());
+    }
+
     async fn mismatch(why: ResumeError, label: &str) {
         let side = side(label, Limits::default());
         let (record, mut file) = unwritten(&side, key(1), "old");
@@ -3787,12 +3875,13 @@ mod reopening {
         assert_eq!(claim.record(), &record);
         assert_eq!(std::fs::read(&record_path).unwrap(), slots);
         drop(claim);
-        assert_eq!(side.store.received(PEER, key(1)), Some(record));
+        assert_eq!(side.store.received(PEER, key(1)), Some(record.clone()));
         assert_eq!(std::fs::read(&path).ok(), before);
-        assert_eq!(
-            side.store.inspect(PEER, key(1)).await.unwrap().status(),
-            Err(why)
-        );
+        let claim = side.store.inspect(PEER, key(1)).await.unwrap();
+        assert_eq!(claim.resume().unwrap_err(), why);
+        assert_eq!(side.store.received(PEER, key(1)), Some(record));
+        assert_eq!(std::fs::read(&record_path).unwrap(), slots);
+        assert_eq!(std::fs::read(&path).ok(), before);
     }
 
     #[tokio::test]

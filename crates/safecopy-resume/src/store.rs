@@ -118,12 +118,19 @@ struct RecordLock {
 
 impl State {
     fn track(&mut self, peer: PeerId, key: TransferKey, name: &str) {
-        if let Some(owner @ None) = self.saving.get_mut(&(peer, key)) {
-            *owner = Some(RecordLock {
+        let Some(owner) = self.saving.get(&(peer, key)) else {
+            return;
+        };
+        if owner.as_ref().is_some_and(|old| self.owned(old).is_ok()) {
+            return;
+        }
+        self.saving.insert(
+            (peer, key),
+            Some(RecordLock {
                 name: name.to_owned(),
                 id: self.held[name].id.clone(),
-            });
-        }
+            }),
+        );
     }
 
     fn owned(&self, owner: &RecordLock) -> Result<&HeldFile, ResumeError> {
@@ -930,14 +937,7 @@ impl Store {
         key: TransferKey,
     ) -> Result<Reopening<'_>, ResumeError> {
         let claim = self.claim_received(peer, key)?;
-        let mut records = self.all()?.into_iter().filter_map(|(_, f)| f).filter(
-            |f| matches!(&f.record, Record::Receiving(r) if r.peer == peer && r.key == key),
-        );
-        let found = records.next().ok_or(ResumeError::NotHeld)?;
-        if records.next().is_some() {
-            return Err(ResumeError::Busy);
-        }
-        let (record, held) = self.take_found(found, peer, key)?;
+        let (record, held) = self.take_only_received(peer, key)?;
         let checked = self.checked(&record).await;
         Ok(Reopening {
             claim,
@@ -945,6 +945,21 @@ impl Store {
             record,
             checked,
         })
+    }
+
+    fn take_only_received(
+        &self,
+        peer: PeerId,
+        key: TransferKey,
+    ) -> Result<(Receiving, Generation<'_>), ResumeError> {
+        let mut records = self.all()?.into_iter().filter_map(|(_, f)| f).filter(
+            |f| matches!(&f.record, Record::Receiving(r) if r.peer == peer && r.key == key),
+        );
+        let found = records.next().ok_or(ResumeError::NotHeld)?;
+        if records.next().is_some() {
+            return Err(ResumeError::Busy);
+        }
+        self.take_found(found, peer, key)
     }
 
     /// The kept partial of `key` from `peer`, opened by identity for
@@ -1589,9 +1604,17 @@ impl Saving<'_> {
     /// Ends this save and forgets only what it received under the key.
     pub fn forget_received(self) -> Result<(), ResumeError> {
         let store = self.claim.store;
+        let acquired;
         let mut state = lock(&store.state);
-        let Some(owner) = self.claim.owner(&state) else {
-            return Ok(());
+        let owner = match self.claim.owner(&state) {
+            Some(owner) => owner,
+            None => {
+                drop(state);
+                (_, acquired) = store.take_only_received(self.claim.peer, self.claim.key)?;
+                state = lock(&store.state);
+                acquired.current(&state)?;
+                acquired.owner.clone()
+            }
         };
         let held = state.owned(&owner)?;
         if self.reserved && empty(&held.file) {

@@ -433,6 +433,10 @@ The handshake and the checks are fuzzed: `fuzz/fuzz_targets/resume_handshake.rs`
 
 ## Changes
 
+- Dropping a `Saving` guard releases its current receiving record lock, including one the store released and took again during that save.
+- Before its first write or reopen, `Saving::forget_received` takes the kept receiving record and removes it and its partial by identity, preserving the sending record. A missing receiver gives `NotHeld` and a competing holder or ambiguous receiver gives `Busy`.
+- When a forget or expiry claims a record this store holds, its current slot's sequence and contents must still match the listing before the record can be removed.
+
 - Added `Store::inspect`, `Reopening` and `Saving::forget_received` for
   callers that decide whether a kept file continues, starts again or
   stays as it is. The claim identifies the newest checksummed slot's

@@ -266,8 +266,8 @@ segment to fit fails with the system's error for the removal.
   takes it with no journal running under its name.
 
 `files::create`, which `safecopy-resume` makes its records with, still
-names a file and then locks it on Unix, and fails with the error `busy`
-tells when another had it in between; its caller handles that.
+names a file and then locks it on Unix. It reports a busy file if another
+holder has the lock, or if the file once locked has bytes or has lost its name.
 **A child process started just as a journal is let go** (Unix) holds
 that journal for a moment. The lock is the open file's, and a child a
 program starts has a copy of every open file of that program from the
@@ -439,6 +439,10 @@ itself is of another volume and lets the journal go, and a folder the
 system gives no volume for says nothing of the record.
 
 ## Changes
+
+- Callers can use `PartialAt::remove_checked` to learn why a partial was left as a `Left` error.
+- On Windows, failure to read the folder's identity during checked removal gives `Left::Io` in place of `Left::Replaced`, so cleanup keeps the journal for another attempt.
+- On Unix, `files::create` reports busy if the file has bytes or is no longer under the requested name once locked. The caller can retry without overwriting another writer's data.
 
 - **A refusal of `safecopy-folder` says the file is another only when
   it looked.** Finding a recorded folder or partial again took every
