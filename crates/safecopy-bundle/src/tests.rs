@@ -1760,6 +1760,235 @@ async fn a_hook_that_moves_a_partial_files_position_moves_no_byte() {
     assert_eq!(files_in(&path), ["a", "b"]);
 }
 
+/// Clones of the partial files kept from `admitted`, every one read and
+/// moved by another thread before each slice is written, while the bytes
+/// come.
+#[derive(Default)]
+struct Meddling {
+    kept: Mutex<Vec<File>>,
+    moved: AtomicUsize,
+}
+
+impl BundleHooks for Meddling {
+    fn admitted(&self, partials: &[Partial<'_>]) -> io::Result<()> {
+        let kept: io::Result<Vec<File>> = partials.iter().map(|p| p.file.try_clone()).collect();
+        *self.kept.lock().unwrap() = kept?;
+        Ok(())
+    }
+}
+
+impl safecopy_chunks::Pace for Meddling {
+    fn before_write(&self, _: usize) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let kept: io::Result<Vec<File>> =
+            (self.kept.lock().unwrap().iter().map(File::try_clone)).collect();
+        let kept = kept.unwrap();
+        assert!(!kept.is_empty(), "admitted");
+        // Joined, so every position is moved before the slice is written.
+        let moved = std::thread::spawn(move || {
+            for mut file in kept {
+                let mut some = [0; 16];
+                file.seek(SeekFrom::Start(0))?;
+                let _ = file.read(&mut some)?;
+                // Left where no slice of any entry starts.
+                file.seek(SeekFrom::Start(3))?;
+            }
+            io::Result::Ok(())
+        });
+        moved.join().unwrap().unwrap();
+        self.moved.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::ready(()))
+    }
+}
+
+/// The hash is of the stream, so only the file's bytes show a slice that
+/// landed in the wrong place.
+#[tokio::test]
+async fn a_clone_of_an_entrys_file_moved_on_another_thread_moves_no_byte() {
+    const SLICE: usize = safecopy_chunks::SLICE;
+    let path = temp("meddling");
+    let dir = Directory::open(&path).unwrap();
+    let files = [data(3 * SLICE + 9, 1), data(100, 2), data(2 * SLICE + 5, 3)];
+    let refs: Vec<&[u8]> = files.iter().map(|f| &f[..]).collect();
+    // The whole bundle is at hand: every read gives a full slice.
+    let bytes = bundle(&refs).await;
+    let table = BundleReader::open(&bytes[..], &BundleLimits::default())
+        .await
+        .unwrap();
+    let meddling = Meddling::default();
+    let options = ReadOptions {
+        pace: &meddling,
+        ..quick()
+    };
+    let names = names(3);
+    let decisions = names.iter().map(|n| save(&dir, n)).collect();
+    let report = table
+        .read(decisions, &options, &meddling, std::future::pending())
+        .await;
+    assert_eq!(report.error, None);
+    // Before each slice of each entry: four, one and three.
+    assert_eq!(meddling.moved.load(Ordering::SeqCst), 8);
+    for (file, outcome) in files.iter().zip(&report.outcomes) {
+        let Outcome::Saved(saved) = outcome else {
+            panic!("not saved: {outcome:?}")
+        };
+        let disk = std::fs::read(&saved.path).unwrap();
+        assert!(disk == *file);
+        assert_eq!(saved.digest, sha(&disk));
+    }
+    assert_eq!(files_in(&path), names);
+    drop((meddling, dir));
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+/// `before_publish` is given the entry with every byte in it, and where
+/// it leaves the handle is nothing to the publish.
+#[tokio::test]
+async fn before_publish_reads_the_whole_entry_and_leaves_its_handle_anywhere() {
+    use std::io::{Read, Seek, SeekFrom};
+    #[derive(Default)]
+    struct Reads(Mutex<Vec<Vec<u8>>>);
+    impl BundleHooks for Reads {
+        fn before_publish(&self, _: usize, mut file: &File, _: &OsStr) -> io::Result<()> {
+            let mut all = Vec::new();
+            file.seek(SeekFrom::Start(0))?;
+            file.read_to_end(&mut all)?;
+            self.0.lock().unwrap().push(all);
+            file.seek(SeekFrom::Start(5)).map(|_| ())
+        }
+    }
+    let path = temp("read-before-publish");
+    let dir = Directory::open(&path).unwrap();
+    let files = [data(2 * safecopy_chunks::SLICE + 5, 1), data(100, 2)];
+    let refs: Vec<&[u8]> = files.iter().map(|f| &f[..]).collect();
+    let hooks = Reads::default();
+    let report = read_all(
+        bundle(&refs).await,
+        || vec![save(&dir, "a"), save(&dir, "b")],
+        &hooks,
+    )
+    .await;
+    assert_eq!(report.error, None);
+    assert!(*hooks.0.lock().unwrap() == files);
+    assert!(std::fs::read(path.join("a")).unwrap() == files[0]);
+    assert!(std::fs::read(path.join("b")).unwrap() == files[1]);
+    assert_eq!(files_in(&path), ["a", "b"]);
+    drop(dir);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+/// The read checks the stream's bytes and never reads the file back:
+/// what a hook writes to the file, or cuts from it, is published, and
+/// the hash reported is still the stream's.
+#[tokio::test]
+async fn what_a_hook_writes_through_its_handle_is_published_under_the_streams_hash() {
+    use std::io::{Seek, SeekFrom, Write};
+    struct Writes(u64);
+    impl BundleHooks for Writes {
+        fn admitted(&self, partials: &[Partial<'_>]) -> io::Result<()> {
+            // Past the end of the first entry, before any byte of it.
+            let mut file = partials[0].file;
+            file.seek(SeekFrom::Start(self.0))?;
+            file.write_all(b"tail")
+        }
+        fn before_publish(&self, entry: usize, mut file: &File, _: &OsStr) -> io::Result<()> {
+            match entry {
+                1 => {
+                    file.seek(SeekFrom::Start(0))?;
+                    file.write_all(b"hook")
+                }
+                2 => file.set_len(1),
+                _ => Ok(()),
+            }
+        }
+    }
+    let path = temp("hook-writes");
+    let dir = Directory::open(&path).unwrap();
+    let files = [
+        data(safecopy_chunks::SLICE + 7, 1),
+        data(100, 2),
+        data(50, 3),
+    ];
+    let refs: Vec<&[u8]> = files.iter().map(|f| &f[..]).collect();
+    let bytes = bundle(&refs).await;
+    let table = BundleReader::open(&bytes[..], &BundleLimits::default())
+        .await
+        .unwrap();
+    // Flushed as by default: the flush comes before the hook's writes.
+    let report = table
+        .read(
+            vec![save(&dir, "a"), save(&dir, "b"), save(&dir, "c")],
+            &ReadOptions::default(),
+            &Writes(files[0].len() as u64),
+            std::future::pending(),
+        )
+        .await;
+    assert_eq!(report.error, None);
+    let published = [
+        [&files[0][..], b"tail"].concat(),
+        [b"hook", &files[1][4..]].concat(),
+        files[2][..1].to_vec(),
+    ];
+    for ((name, file), (disk, outcome)) in ["a", "b", "c"]
+        .iter()
+        .zip(&files)
+        .zip(published.iter().zip(&report.outcomes))
+    {
+        let Outcome::Saved(saved) = outcome else {
+            panic!("not saved: {outcome:?}")
+        };
+        assert!(std::fs::read(path.join(name)).unwrap() == *disk, "{name}");
+        assert_eq!(saved.digest, sha(file), "{name}");
+        assert_ne!(saved.digest, sha(disk), "{name}");
+    }
+    drop(dir);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+/// A clone a hook keeps is a handle the read does not close: it reads
+/// the published file after the read, and on Windows, where a name goes
+/// only with its file's last handle, it keeps a removed partial file in
+/// its folder until it is closed.
+#[tokio::test]
+async fn a_clone_a_hook_keeps_stays_open_after_the_read() {
+    use std::io::{Read, Seek, SeekFrom};
+    #[derive(Default)]
+    struct Keeps(Mutex<Vec<File>>);
+    impl BundleHooks for Keeps {
+        fn admitted(&self, partials: &[Partial<'_>]) -> io::Result<()> {
+            let kept: io::Result<Vec<File>> = partials.iter().map(|p| p.file.try_clone()).collect();
+            *self.0.lock().unwrap() = kept?;
+            Ok(())
+        }
+    }
+    let path = temp("kept-clone");
+    let dir = Directory::open(&path).unwrap();
+    let files = [data(100, 1), data(200, 2)];
+    let refs: Vec<&[u8]> = files.iter().map(|f| &f[..]).collect();
+    let mut bytes = bundle(&refs).await;
+    // The second file is damaged on the way: its partial is removed.
+    bytes[offsets(&refs)[1] + 9] ^= 0xff;
+    let hooks = Keeps::default();
+    let report = read_all(bytes, || vec![save(&dir, "a"), save(&dir, "b")], &hooks).await;
+    assert_eq!(report.error, None);
+    assert!(matches!(report.outcomes[0], Outcome::Saved(_)));
+    assert_eq!(report.outcomes[1], Outcome::Damaged);
+    let mut kept = std::mem::take(&mut *hooks.0.lock().unwrap());
+    let mut all = Vec::new();
+    kept[0].seek(SeekFrom::Start(0)).unwrap();
+    kept[0].read_to_end(&mut all).unwrap();
+    assert!(all == files[0]);
+    if cfg!(windows) {
+        assert_eq!(files_in(&path), ["a", "b.part"]);
+    } else {
+        assert_eq!(files_in(&path), ["a"]);
+    }
+    drop(kept);
+    assert_eq!(files_in(&path), ["a"]);
+    drop(dir);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
 // The search for a free partial name.
 
 /// A bundle of two small files read into `dir` as `first` and `second`.

@@ -88,16 +88,18 @@ pub enum Take<'a> {
 pub struct Partial<'a> {
     /// The entry's place in the table.
     pub entry: usize,
-    /// The folder it is in.
+    /// The folder it is in: the one its [`Target`] named.
     pub dir: &'a Directory,
-    /// The file.
+    /// The file, empty: the read's own handle. See
+    /// [`BundleHooks::admitted`] for what a hook may do with it.
     pub file: &'a File,
     /// Its name there.
     pub name: &'a OsStr,
 }
 
 /// The caller's steps around [`Table::read`], each with a default that
-/// does nothing.
+/// does nothing. [`Self::admitted`] and [`Self::before_publish`] are given
+/// a partial file's handle; the other two are given none.
 pub trait BundleHooks: Send + Sync {
     /// Before any partial file is created, with the entries taken: the last
     /// moment to refuse with nothing on the disk (room, an intake place).
@@ -110,6 +112,31 @@ pub trait BundleHooks: Send + Sync {
     /// Every taken entry's partial file was created, before any byte of
     /// any file is read: journal them in one write. An error removes them
     /// all and ends the bundle with [`BundleError::Hook`].
+    ///
+    /// Each [`Partial::file`] is the read's own handle: reading or
+    /// seeking it, here or later through a clone kept, on any thread,
+    /// moves no byte the read writes or publishes, since every byte is
+    /// written at its own offset in the file and never at the handle's
+    /// position, and a file that is copied into its name is read the
+    /// same way. Where that position stands is promised by nothing.
+    ///
+    /// Writing is another matter. What a hook writes through the handle
+    /// or a clone of it, or cuts from the file, is in the file, and the
+    /// read does not see it: an entry's hash is of the bytes as they came
+    /// off the stream, never read back from the disk, and the read writes
+    /// only those bytes, each at its offset, over whatever is there. So
+    /// the file is published as the hook left it, under the stream's
+    /// hash.
+    ///
+    /// A hook cannot close the read's handle. A clone it keeps is a
+    /// handle the read never closes: the file stays open while the clone
+    /// is, past the end of [`Table::read`]. On Windows, where a file's
+    /// name goes only with its last handle, a partial file the read
+    /// removed then stays in its folder until the clone is closed, and a
+    /// published one stays as [`safecopy_folder::Held`] says a held file
+    /// does. Where the disk makes the file be copied into its name, the
+    /// published file is the copy: the clone is then of the partial file,
+    /// which the publish removed.
     fn admitted(&self, partials: &[Partial<'_>]) -> io::Result<()> {
         let _ = partials;
         Ok(())
@@ -117,6 +144,16 @@ pub trait BundleHooks: Send + Sync {
 
     /// The entry's hash matched; it is not yet marked and has no name. An
     /// error removes it ([`Outcome::Failed`]) and the bundle reads on.
+    ///
+    /// `file` is the read's own handle, as in [`Self::admitted`], with
+    /// every byte of the entry in it and no write of the read still to
+    /// come; flushed to the disk when [`ReadOptions::sync`] is on. Its
+    /// position is nothing to the publish. A clone kept is a handle of
+    /// the published file, or, where the disk makes the file be copied
+    /// into its name, of the partial file the publish removed. What the
+    /// hook writes through it here is published, since the hash was
+    /// compared before the call, and is not flushed by the read: a hook
+    /// that writes flushes it itself.
     fn before_publish(&self, entry: usize, file: &File, partial: &OsStr) -> io::Result<()> {
         let _ = (entry, file, partial);
         Ok(())
@@ -273,9 +310,11 @@ impl<R: AsyncRead + Unpin> Table<R> {
     /// ([`safecopy_chunks::SLICE`]) at most, and on a disk that stalls,
     /// as long as it stalls. A write that had not started writes nothing.
     /// So when this returns or is dropped, nothing of it is still being
-    /// written and no handle of a partial file is still open: on Windows,
-    /// where a file's name goes only with its last handle, a removed
-    /// partial file is gone from its folder by then. A flush
+    /// written and no handle of the read's to a partial file is still
+    /// open: on Windows, where a file's name goes only with its last
+    /// handle, a removed partial file is gone from its folder by then,
+    /// unless a hook kept a clone of its handle
+    /// ([`BundleHooks::admitted`]). A flush
     /// ([`ReadOptions::sync`], and the flush of a copy a publish made) is
     /// not behind the gate: one still on the pool when `cancel` came or
     /// the read was dropped ends there, and holds its file open until it

@@ -22,6 +22,20 @@ key and hash, so one bad file never spoils the others.
   file. `SaveUnlessSame` gives a candidate's hash (a file already at the
   destination): an equal file's partial is removed and it is
   `AlreadyThere`.
+- `BundleHooks::admitted` and `before_publish` get the read's own handle
+  of a partial file: reading or seeking it, there or later through a
+  clone kept, on any thread, moves no byte, since every byte is written
+  at its own offset in the file (a positioned write) and never at the
+  handle's position; where the disk makes the file be copied into its
+  name, that copy reads at its own offsets too. Writing is another
+  matter: an entry's hash is of the bytes as they came off the stream,
+  never read back from the disk, so what a hook writes through the
+  handle, or cuts from the file, is published as the hook left it, and
+  what `before_publish` writes is not flushed by the read. A clone kept
+  is a handle the read never closes: the file stays open past the read,
+  and on Windows a partial file that was removed (by the read, or by a
+  publish that copied it into its name) stays in its folder until the
+  clone is closed. `before_create` and `ended` are given no handle.
 - `Outcome` per file: `Saved`, `AlreadyThere`, `Damaged`, `Refused`,
   `GivenUp`, `NotReceived`, `Failed(kind)`, `Folder(Refusal)` (the
   folder crate refused its partial or its name), `NoPartialName { tried }`
@@ -161,7 +175,8 @@ The table and a whole bundle read are fuzzed:
   a clone of it and moved that while the file was written, moved where
   the bytes landed, under a hash that still matched. Nothing done to the
   handle's position does now
-  (`a_hook_that_moves_a_partial_files_position_moves_no_byte`). Where
+  (`a_hook_that_moves_a_partial_files_position_moves_no_byte`,
+  `a_clone_of_an_entrys_file_moved_on_another_thread_moves_no_byte`). Where
   that position stands when a hook is called is promised by nothing: it
   stood after the last byte written, and now differs by system.
 
