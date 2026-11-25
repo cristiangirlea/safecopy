@@ -2150,6 +2150,41 @@ mod windows {
         assert_eq!(std::fs::read(place.join("report.docx")).unwrap(), b"theirs");
     }
 
+    /// A journal of the format of before whose partial's name the folder
+    /// crate does not open: nothing says the file is another, so the
+    /// journal stays for another try.
+    #[test]
+    fn a_recorded_name_the_folder_crate_refuses_keeps_its_journal() {
+        let (_scratch, place, journal_dir) = scratch("refused-record");
+        let root = Directory::destination(&place).unwrap();
+        std::fs::write(place.join("a.part"), b"half").unwrap();
+        let file = File::open(place.join("a.part")).unwrap();
+        let record = Record {
+            volume: root.volume_path().unwrap(),
+            serial: root.identity().unwrap().volume,
+            partials: vec![Partial {
+                folder: root.identity().unwrap().file,
+                name: "a\0.part".into(),
+                file: safecopy_folder::identity(&file).unwrap().file,
+            }],
+        };
+        drop(file);
+        assert_eq!(
+            win::remove(&record, &record.partials[0], &settings()),
+            Err(location::Left::Io)
+        );
+        let path = journal_dir.join(format!("1-1.{EXTENSION}"));
+        std::fs::write(&path, record.encode(&settings()).unwrap()).unwrap();
+        let kept = Cleaned {
+            removed: 0,
+            left: 1,
+            kept: 1,
+        };
+        assert_eq!(clean_up(&journal_dir, &settings()).unwrap(), kept);
+        assert!(path.exists(), "kept for another try");
+        assert_eq!(std::fs::read(place.join("a.part")).unwrap(), b"half");
+    }
+
     #[test]
     fn a_junction_named_as_a_journal_is_never_followed() {
         let (_scratch, place, journal_dir) = scratch("junction-journal");
@@ -2854,5 +2889,136 @@ mod mounted {
         assert!(!before.remove(&s));
         drop(over);
         assert_eq!(before.present(&s), Some(4));
+    }
+}
+
+/// Every refusal the folder crate has, as an error of an open.
+fn refusals() -> ([Refusal; 4], [Refusal; 9]) {
+    (
+        [
+            Refusal::Link,
+            Refusal::NotFileOrFolder,
+            Refusal::NotFolder,
+            Refusal::Replaced,
+        ],
+        [
+            Refusal::LeavesFolder,
+            Refusal::Stream,
+            Refusal::Nul,
+            Refusal::TooLong,
+            Refusal::BadListing,
+            Refusal::NoVolume,
+            Refusal::NoNameLeft { tried: 3 },
+            Refusal::Unproven,
+            Refusal::OtherFolder,
+        ],
+    )
+}
+
+#[test]
+fn every_refusal_reads_as_the_left_its_table_says() {
+    let (another, unknown) = refusals();
+    for why in another {
+        let left = Left::of(&io::Error::other(why));
+        assert_eq!(left, Left::Replaced, "{why:?}");
+        assert!(!left.may_change(), "{why:?} lets the journal go");
+    }
+    for why in unknown {
+        let left = Left::of(&io::Error::other(why));
+        assert_eq!(left, Left::Io, "{why:?}");
+        assert!(left.may_change(), "{why:?} keeps the journal");
+    }
+    // The system's own errors read as before.
+    for (kind, left) in [
+        (io::ErrorKind::NotFound, Left::Gone),
+        (io::ErrorKind::NotADirectory, Left::Gone),
+        (io::ErrorKind::InvalidInput, Left::Gone),
+        (io::ErrorKind::IsADirectory, Left::Replaced),
+        (io::ErrorKind::PermissionDenied, Left::Io),
+        (io::ErrorKind::Other, Left::Io),
+    ] {
+        assert_eq!(Left::of(&kind.into()), left, "{kind:?}");
+    }
+}
+
+/// A journal left by a crash with one partial of four bytes, and where
+/// that partial is.
+fn crashed_with_a_partial(place: &Path, journal_dir: &Path) -> PartialAt {
+    let root = Directory::destination(place).unwrap();
+    let journal = Journal::start(journal_dir, &root, &settings()).unwrap();
+    let file = partial(&root, &journal, 0, "a.txt.part", b"half");
+    let at = PartialAt::of(&root, &root, &file, OsStr::new("a.txt.part")).unwrap();
+    drop(file);
+    journal.crash();
+    at
+}
+
+#[test]
+fn a_refusal_that_says_nothing_of_the_file_removes_nothing_and_keeps_the_journal() {
+    let (_scratch, place, journal_dir) = scratch("refused-unknown");
+    let at = crashed_with_a_partial(&place, &journal_dir);
+    let s = settings();
+    for why in refusals().1 {
+        seams::REFUSED.set(Some(why));
+        let kept = Cleaned {
+            removed: 0,
+            left: 1,
+            kept: 1,
+        };
+        assert_eq!(clean_up(&journal_dir, &s).unwrap(), kept, "{why:?}");
+        assert_eq!(journals(&journal_dir), 1, "{why:?}: kept for another try");
+        assert_eq!(at.present(&s), None, "{why:?}");
+        assert_eq!(at.try_reopen(&s).err(), Some(Left::Io), "{why:?}");
+        assert!(at.reopen(&s).is_none(), "{why:?}");
+        assert!(!at.remove(&s), "{why:?}");
+        assert_eq!(std::fs::read(place.join("a.txt.part")).unwrap(), b"half");
+    }
+    seams::REFUSED.set(None);
+    // With no switch: a recorded name with a NUL in it, which the folder
+    // crate refuses before it opens anything.
+    let mut nul = at.clone();
+    nul.partial = "a\0.txt.part".to_string();
+    assert!(nul.is_partial(&s));
+    assert_eq!(nul.try_reopen(&s).err(), Some(Left::Io));
+    assert_eq!(nul.present(&s), None);
+    assert!(!nul.remove(&s));
+    // And a recorded folder whose name is not one part of a path. Unix
+    // opens each level by its name; Windows opens the folder by its ID.
+    #[cfg(unix)]
+    {
+        let Root::Unix { device, .. } = at.location.root else {
+            panic!("a root recorded on Unix");
+        };
+        let mut below = at.clone();
+        below.location.levels = vec![Level {
+            name: "no/such".to_string(),
+            device,
+            id: 1,
+        }];
+        assert_eq!(below.try_reopen(&s).err(), Some(Left::Io));
+        assert!(!below.remove(&s));
+    }
+    // The refusal gone, the same journal still removes its partial.
+    assert_eq!(at.present(&s), Some(4));
+    assert_eq!(clean_up(&journal_dir, &s).unwrap(), cleaned(1, 0));
+    assert!(!place.join("a.txt.part").exists());
+    assert_eq!(journals(&journal_dir), 0);
+}
+
+#[test]
+fn a_refusal_that_says_the_file_is_another_lets_the_journal_go() {
+    for (n, why) in refusals().0.into_iter().enumerate() {
+        let (_scratch, place, journal_dir) = scratch(&format!("refused-another-{n}"));
+        let at = crashed_with_a_partial(&place, &journal_dir);
+        let s = settings();
+        seams::REFUSED.set(Some(why));
+        assert_eq!(at.try_reopen(&s).err(), Some(Left::Replaced), "{why:?}");
+        assert_eq!(at.present(&s), None, "{why:?}");
+        assert!(!at.remove(&s), "{why:?}");
+        assert_eq!(clean_up(&journal_dir, &s).unwrap(), cleaned(0, 1));
+        assert_eq!(journals(&journal_dir), 0, "{why:?}: no later try finds it");
+        // What is under the name is never removed for a refusal.
+        assert_eq!(std::fs::read(place.join("a.txt.part")).unwrap(), b"half");
+        seams::REFUSED.set(None);
     }
 }

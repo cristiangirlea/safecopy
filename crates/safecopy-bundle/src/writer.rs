@@ -242,6 +242,7 @@ impl<'a, W: AsyncWrite + Unpin> BundleWriter<'a, W> {
 pub(crate) fn chunk_error(e: safecopy_chunks::ChunkError) -> BundleError {
     match e {
         safecopy_chunks::ChunkError::Io(kind) => BundleError::Io(kind),
+        safecopy_chunks::ChunkError::Folder(why) => BundleError::Folder(why),
         safecopy_chunks::ChunkError::Version { got } => BundleError::Version { got },
         safecopy_chunks::ChunkError::CutShort { .. } => BundleError::TableCutShort,
         safecopy_chunks::ChunkError::Cancelled => BundleError::Cancelled,

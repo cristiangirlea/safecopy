@@ -112,7 +112,8 @@ store's index. Only what both sides must agree on is fixed: the chunk
 
 Errors are `ResumeError` kinds (`PastSize`, `OffChunk`, `NotHeld`,
 `WrongSize`, `Gone`, `Unreachable`, `PrefixChanged`, `Busy`, `Damaged`,
-`TooMany`, `NotPartial`, ...);
+`TooMany`, `NotPartial`, `Folder(Refusal)` for a refusal of
+`safecopy-folder`'s own, ...);
 each program words them, and maps each `Verdict` to its own codes.
 
 ## How to resume a file
@@ -397,6 +398,40 @@ The handshake and the checks are fuzzed: `fuzz/fuzz_targets/resume_handshake.rs`
 
 ## Changes
 
+- **A refusal of `safecopy-folder` keeps its kind, and removes a record
+  only when it says the file is another.**
+  - `ResumeError::Folder(Refusal)` is new: the folder crate refused,
+    itself and not the system. A save's error brings one
+    (`safecopy_chunks::ChunkError::Folder` becomes it), and so does any
+    error that carries a refusal. The store's own record files are
+    opened by the system alone, so no call of the store gives one
+    today. It was
+    `Io(ErrorKind::Other)`. An arm for `Io(ErrorKind::Other)` that
+    stood for a refusal no longer gets it: match `Folder(why)`; `why` is
+    `safecopy_folder::Refusal`, itself `#[non_exhaustive]`.
+    `ResumeError` was `#[non_exhaustive]` already, so a `match` on it
+    has a wildcard arm and still builds. An error of the system is
+    still `Io(kind)`.
+  - `reopen`, `reopen_hashed`, `held_from` and `held_hashed`: a kept
+    partial that the folder crate
+    refuses to open is `Gone`, and its record removed with it, only for
+    a refusal that says what is under its name (`Link`,
+    `NotFileOrFolder`, `NotFolder`, `Replaced`). Every other refusal,
+    and any added later, is `Unreachable`: the record and the partial
+    stay, not held, and the next reopening tries again (`held_from`
+    and `held_hashed` pass the record by, not listed). They were all
+    `Gone` before. `safecopy-journal` has the table (`Left::of`).
+    `kept_by`, `expire` and `forget` are unchanged.
+  - Met in practice only through a record that names something the
+    folder crate does not open, such as a partial's name with a NUL in
+    it. Such a record stayed until its reopening before and now stays
+    until `expire` takes it for its age.
+
+  Tests: `a_refusal_that_says_nothing_of_the_file_leaves_its_record_to_be_tried_again`,
+  `a_refusal_that_says_the_file_is_another_removes_its_record`,
+  `an_error_that_carries_a_refusal_keeps_its_kind_through_the_store` (each through a
+  test-only switch: no system gives these refusals for a name it
+  recorded itself).
 - **A kept partial is known by a second identity too (Unix).** A
   receiving record's place (`PartialAt`) now holds the partial's birth
   time and its inode's generation, each where the system gives it

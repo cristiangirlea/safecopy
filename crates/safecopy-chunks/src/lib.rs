@@ -54,6 +54,7 @@ use std::num::NonZeroU64;
 use std::pin::Pin;
 
 use ring::digest::{Context, SHA256};
+use safecopy_folder::Refusal;
 
 mod candidate;
 mod copy;
@@ -343,6 +344,13 @@ pub enum ChunkError {
     },
     /// One of the caller's [`Hooks`] refused, with its error's kind.
     Hook(io::ErrorKind),
+    /// `safecopy-folder` refused, itself and not the system: the partial
+    /// file's name when it was created, or the file on its way to its
+    /// name. A name that is not one part of a path or names a stream, a
+    /// link in the way, and the rest of its `Refusal`. The two searches
+    /// that run out of names are not here: [`ChunkError::NoPartialName`]
+    /// is this crate's own, and [`ChunkError::NoNameLeft`] the publish's.
+    Folder(Refusal),
     /// The system refused.
     Io(io::ErrorKind),
 }
@@ -356,9 +364,14 @@ impl fmt::Display for ChunkError {
 
 impl std::error::Error for ChunkError {}
 
+/// The one place an error of a file, a folder or a stream becomes this
+/// crate's: a refusal of `safecopy-folder` keeps its kind.
 impl From<io::Error> for ChunkError {
     fn from(e: io::Error) -> Self {
-        Self::Io(e.kind())
+        match safecopy_folder::refusal(&e) {
+            Some(why) => Self::Folder(why),
+            None => Self::Io(e.kind()),
+        }
     }
 }
 
@@ -382,6 +395,12 @@ mod seams {
         pub static SYNC_ERROR: Cell<bool> = const { Cell::new(false) };
         /// The next publish of a checked file fails.
         pub static PUBLISH_ERROR: Cell<bool> = const { Cell::new(false) };
+        /// The next publish of a checked file is refused so, at its name.
+        pub static PUBLISH_REFUSAL: Cell<Option<safecopy_folder::Refusal>> =
+            const { Cell::new(None) };
+        /// The next removal of a partial file is refused so.
+        pub static DISCARD_REFUSAL: Cell<Option<safecopy_folder::Refusal>> =
+            const { Cell::new(None) };
         /// Told how many partial names a save of this thread found taken
         /// so far, after each, before its cancel is looked at.
         pub static NAME_TAKEN: RefCell<Option<Taken>> = const { RefCell::new(None) };

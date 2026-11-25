@@ -23,7 +23,8 @@ key and hash, so one bad file never spoils the others.
   destination): an equal file's partial is removed and it is
   `AlreadyThere`.
 - `Outcome` per file: `Saved`, `AlreadyThere`, `Damaged`, `Refused`,
-  `GivenUp`, `NotReceived`, `Failed(kind)`, `NoPartialName { tried }`
+  `GivenUp`, `NotReceived`, `Failed(kind)`, `Folder(Refusal)` (the
+  folder crate refused its partial or its name), `NoPartialName { tried }`
   (every partial name tried for it was taken), `NoNameLeft { tried }`
   (every name tried for the checked file was taken). A damaged, skipped,
   given-up or failed file, or one left without a name, is read past and
@@ -37,7 +38,7 @@ key and hash, so one bad file never spoils the others.
   dropped write) refuses every later call (`Torn`), so the stream only
   ever ends short, never misframed.
 - In a cut bundle, an entry the receiver skipped stays `Refused` and one
-  whose partial file could not be made stays `Failed` or
+  whose partial file could not be made stays `Failed`, `Folder` or
   `NoPartialName`, where the design
   note calls every entry not published `NotReceived`: the sender resends
   only the `NotReceived` ones, never what was refused.
@@ -77,6 +78,32 @@ The table and a whole bundle read are fuzzed:
 
 ## Changes
 
+- **A refusal of `safecopy-folder` keeps its kind.** The folder crate
+  refuses some names and opens itself, with a `Refusal`. An entry so
+  refused was `Outcome::Failed(ErrorKind::Other)`, whatever the refusal.
+  - `Outcome::Folder(Refusal)` is new: the folder crate refused the
+    entry's partial file at its creation, or the checked file on its way
+    to its name. The bundle reads on as after any failed entry, and in a
+    cut bundle an entry refused at its creation stays `Folder`, as one
+    that is `Failed` does. An arm for `Failed(ErrorKind::Other)` that
+    stood for a refusal no longer gets it: match `Folder(why)`; `why` is
+    `safecopy_folder::Refusal`, itself `#[non_exhaustive]`. The name is
+    `Folder` because `Outcome::Refused` is an entry the receiver
+    skipped. `Failed(kind)` is still the system's error, and a hook's
+    (its error's kind, whatever it carries).
+  - `BundleError::Folder(Refusal)` is new, for an error that carries a
+    refusal where `Io(kind)` took its kind. No call of this crate ends
+    a bundle so today: its errors are the stream's.
+  - `Outcome` and `BundleError` were `#[non_exhaustive]` already, so a
+    `match` on either has a wildcard arm and still builds.
+    `NoPartialName` and `NoNameLeft` are as they were.
+  - Met in practice: a `Target::name` with a separator in it
+    (`LeavesFolder`) or a colon on Windows (`Stream`).
+
+  Tests: `an_entry_the_folder_crate_refuses_says_the_refusal_and_the_others_are_saved`
+  (the publish through a test-only switch),
+  `a_hook_refusing_one_publish_or_one_partial_that_cannot_be_made_fails_only_that_file`,
+  `an_error_of_the_system_keeps_its_kind_and_a_refusal_its_own`.
 - **The search for a free partial name has a limit and sees a cancel.**
   Admission claims `name.part`, then `name.2.part` and so on for each
   taken entry; it tried them without end, and looked at the cancel only

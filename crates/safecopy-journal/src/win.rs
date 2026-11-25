@@ -15,7 +15,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, OpenFileById,
 };
 
-use crate::location::{Left, left};
+use crate::location::Left;
 use crate::{Partial, Record, Settings, removable};
 
 fn open_volume(volume: &str) -> io::Result<File> {
@@ -93,10 +93,10 @@ pub(crate) fn remove(record: &Record, partial: &Partial, settings: &Settings) ->
         return Err(Left::Name);
     }
     let volume = checked_volume(&record.volume, record.serial)?;
-    let folder = open_folder(&volume, partial.folder).map_err(|e| left(&e))?;
+    let folder = open_folder(&volume, partial.folder).map_err(|e| Left::of(&e))?;
     let file = folder
         .open_for_delete(OsStr::new(&partial.name))
-        .map_err(|e| left(&e))?;
+        .map_err(|e| Left::of(&e))?;
     // Opened by its recorded name, so the name still has the ending.
     let id = identity(&file).map_err(|_| Left::Io)?;
     if id.volume != record.serial || id.file != partial.file {

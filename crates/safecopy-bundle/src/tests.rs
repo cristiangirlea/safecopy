@@ -1237,7 +1237,11 @@ async fn a_hook_refusing_one_publish_or_one_partial_that_cannot_be_made_fails_on
         report.outcomes[1],
         Outcome::Failed(io::ErrorKind::PermissionDenied)
     );
-    assert!(matches!(report.outcomes[2], Outcome::Failed(_)));
+    assert_eq!(
+        report.outcomes[2],
+        Outcome::Folder(Refusal::LeavesFolder),
+        "the folder crate's refusal, as the refusal it was"
+    );
     assert!(matches!(report.outcomes[3], Outcome::Saved(_)));
     assert_eq!(*hooks.0.lock().unwrap(), vec![0, 1, 3]);
     assert_eq!(files_in(&path), ["a", "e"]);
@@ -1263,9 +1267,83 @@ async fn a_hook_refusing_one_publish_or_one_partial_that_cannot_be_made_fails_on
     .await;
     assert_eq!(report.error, Some(BundleError::CutShort { entry: 1 }));
     assert_eq!(report.outcomes[1], Outcome::NotReceived);
-    assert!(matches!(report.outcomes[2], Outcome::Failed(_)));
+    assert_eq!(report.outcomes[2], Outcome::Folder(Refusal::LeavesFolder));
     assert_eq!(report.outcomes[3], Outcome::NotReceived);
     assert_eq!(files_in(&path), ["a"]);
+}
+
+/// One entry refused by the folder crate when its partial is created and
+/// one when it is published: each says its refusal, and the rest are saved.
+#[tokio::test]
+async fn an_entry_the_folder_crate_refuses_says_the_refusal_and_the_others_are_saved() {
+    let path = temp("refused");
+    let dir = Directory::open(&path).unwrap();
+    let files = [data(10, 1), data(20, 2), data(30, 3), data(40, 4)];
+    let refs: Vec<&[u8]> = files.iter().map(|f| &f[..]).collect();
+    crate::seams::PUBLISH_REFUSAL.set(Some((2, Refusal::Unproven)));
+    let report = read_all(
+        bundle(&refs).await,
+        || {
+            vec![
+                save(&dir, "a"),
+                save(&dir, "no/b"),
+                save(&dir, "c"),
+                save(&dir, "d"),
+            ]
+        },
+        &(),
+    )
+    .await;
+    crate::seams::PUBLISH_REFUSAL.set(None);
+    assert_eq!(report.error, None);
+    assert_eq!(saved_path(&report.outcomes[0]), path.join("a"));
+    assert_eq!(report.outcomes[1], Outcome::Folder(Refusal::LeavesFolder));
+    assert_eq!(report.outcomes[2], Outcome::Folder(Refusal::Unproven));
+    assert_eq!(saved_path(&report.outcomes[3]), path.join("d"));
+    // The refused entry's partial is removed, and the bundle read on.
+    assert_eq!(files_in(&path), ["a", "d"]);
+    assert_eq!(std::fs::read(path.join("d")).unwrap(), files[3]);
+}
+
+#[test]
+fn an_error_of_the_system_keeps_its_kind_and_a_refusal_its_own() {
+    let denied = || io::Error::from(io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        Outcome::failed(&denied()),
+        Outcome::Failed(io::ErrorKind::PermissionDenied)
+    );
+    assert_eq!(
+        BundleError::from(denied()),
+        BundleError::Io(io::ErrorKind::PermissionDenied)
+    );
+    // `Other` with no refusal in it stays the system's.
+    assert_eq!(
+        Outcome::failed(&io::Error::other("not a refusal")),
+        Outcome::Failed(io::ErrorKind::Other)
+    );
+    for why in [
+        Refusal::Link,
+        Refusal::NotFileOrFolder,
+        Refusal::NotFolder,
+        Refusal::LeavesFolder,
+        Refusal::Stream,
+        Refusal::Nul,
+        Refusal::TooLong,
+        Refusal::BadListing,
+        Refusal::NoVolume,
+        Refusal::Replaced,
+        Refusal::NoNameLeft { tried: 3 },
+        Refusal::Unproven,
+        Refusal::OtherFolder,
+    ] {
+        let refused = || io::Error::other(why);
+        assert_eq!(Outcome::failed(&refused()), Outcome::Folder(why));
+        assert_eq!(BundleError::from(refused()), BundleError::Folder(why));
+        assert_eq!(
+            crate::writer::chunk_error(safecopy_chunks::ChunkError::from(refused())),
+            BundleError::Folder(why)
+        );
+    }
 }
 
 #[tokio::test]

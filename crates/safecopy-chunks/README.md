@@ -88,7 +88,8 @@ rest as written.
 
 Errors are `ChunkError` kinds (`CutShort { got, size }` for the file's
 bytes, `TrailerCutShort { got }` for the trailer's, `TooLong`,
-`Damaged`, `Cancelled`, `PartialShort { have, len }`, ...) and
+`Damaged`, `Cancelled`, `PartialShort { have, len }`,
+`Folder(Refusal)` for a refusal of `safecopy-folder`'s own, ...) and
 `CandidateError { Changed, Unreadable }`, never sentences.
 
 What both sides must agree on is fixed by the framing: the framing version
@@ -100,6 +101,41 @@ The framing is fuzzed: `fuzz/fuzz_targets/framing.rs`.
 
 ## Changes
 
+- **A refusal of `safecopy-folder` keeps its kind.** The folder crate
+  refuses some names and opens itself, with a `Refusal` (a name that is
+  not one part of a path or names a stream, a link in the way, and the
+  rest). A save gave `ChunkError::Io(ErrorKind::Other)` for every one,
+  and `PartialFate::Left { kind: Other, raw: None }` for a removal so
+  refused.
+  - `ChunkError::Folder(Refusal)` is new: what `save_verified` and
+    `save_resumable` fail with when the folder crate refuses the
+    partial file's name at its creation, or the checked file on its way
+    to its name. An arm for `Io(ErrorKind::Other)` that stood for a
+    refusal no longer gets it: match `Folder(why)`; `why` is
+    `safecopy_folder::Refusal`, itself `#[non_exhaustive]`.
+    `ChunkError` was `#[non_exhaustive]` already, so a `match` on it has
+    a wildcard arm and still builds. An error of the system is still
+    `Io(kind)`.
+  - `NoPartialName { tried }` and `NoNameLeft { tried }` are as they
+    were. Neither comes from a `Refusal`: the first is this crate's own
+    search for a partial name, the second the publish's
+    (`PublishError::NoNameLeft`). `Refusal::NoNameLeft` is the folder
+    crate's search for a new folder's name, which no save makes.
+  - `PartialFate::Left` has a new field, `refused: Option<Refusal>`:
+    what the folder crate refused the removal with, `None` when the
+    system did. **Breaking** for a caller that names every field of
+    `Left` in a pattern or builds one: add `refused`, or end the pattern
+    with `..`. `Refusal::Replaced` is still `PartialFate::Replaced`.
+    The partial is still there either way.
+  - Met in practice: a `Target::name` with a separator in it
+    (`LeavesFolder`, at the creation) or a colon on Windows (`Stream`),
+    and a `Kept::partial` handed to `Start::Resume` that is not one part
+    of a path (`LeavesFolder` at the publish, and again at the removal).
+
+  Tests: `a_save_that_cannot_create_its_partial_says_none_was_created`,
+  `a_refused_publish_and_a_refused_removal_say_the_refusal` (a
+  test-only switch for the refusals no name gives),
+  `an_error_of_the_system_keeps_its_kind_and_a_refusal_its_own`.
 - **The search for a free partial name has a limit and sees a cancel.**
   A new save claims `name.part`, then `name.2.part` and so on; it tried
   them without end and looked at its cancel only once a name was found,
@@ -192,8 +228,8 @@ The framing is fuzzed: `fuzz/fuzz_targets/framing.rs`.
 - **`Hooks::ended` is told what became of the partial file.** It takes a
   second argument, `PartialFate`: `NotCreated`, `Published`, `Removed`,
   `Replaced` (Linux and macOS: another file had its name, and was left),
-  or `Left { kind, raw }` when the save failed and the system refused to
-  remove the partial, so a caller keeps its record of it without looking
+  or `Left { kind, raw, refused }` when the save failed and the system
+  or `safecopy-folder` refused to remove the partial, so a caller keeps its record of it without looking
   for the file by name. `save_verified` still returns the error that
   stopped the save. `Published` says the file has its name, not that the
   partial name is gone: one the system would not remove after the file

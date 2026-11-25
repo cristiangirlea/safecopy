@@ -44,6 +44,7 @@ use std::io;
 use std::sync::Arc;
 
 pub use safecopy_chunks::Saved;
+use safecopy_folder::Refusal;
 pub use safecopy_resume::TransferKey;
 
 mod placed;
@@ -184,6 +185,13 @@ pub enum Outcome {
     /// the publish, or a hook refused (its error's kind). Its bytes were
     /// read past; nothing of it is kept.
     Failed(io::ErrorKind),
+    /// This side failed it, and `safecopy-folder` was the one that
+    /// refused, itself and not the system: its partial file's name when
+    /// it was created, or the checked file on its way to its name. A name
+    /// that is not one part of a path or names a stream, a link in the
+    /// way, and the rest of its `Refusal`. Its bytes were read past;
+    /// nothing of it is kept.
+    Folder(Refusal),
     /// Every name tried for its partial file was taken
     /// ([`ReadOptions::partial_tries`]): none was created. Its bytes were
     /// read past.
@@ -287,6 +295,12 @@ pub enum BundleError {
     Hook(io::ErrorKind),
     /// The caller's cancel finished first.
     Cancelled,
+    /// `safecopy-folder` refused, itself and not the system. No call of
+    /// this crate ends a bundle so today: a file its folder refuses is
+    /// that entry's [`Outcome::Folder`], and the bundle reads on. It is
+    /// here so that an error which carries a refusal never reads as
+    /// [`BundleError::Io`].
+    Folder(Refusal),
     /// The stream failed.
     Io(io::ErrorKind),
 }
@@ -302,7 +316,22 @@ impl std::error::Error for BundleError {}
 
 impl From<io::Error> for BundleError {
     fn from(e: io::Error) -> Self {
-        Self::Io(e.kind())
+        match safecopy_folder::refusal(&e) {
+            Some(why) => Self::Folder(why),
+            None => Self::Io(e.kind()),
+        }
+    }
+}
+
+impl Outcome {
+    /// What an error creating or publishing an entry's file makes of the
+    /// entry: the one place it is read, so a refusal of
+    /// `safecopy-folder` keeps its kind.
+    pub(crate) fn failed(e: &io::Error) -> Self {
+        match safecopy_folder::refusal(e) {
+            Some(why) => Self::Folder(why),
+            None => Self::Failed(e.kind()),
+        }
     }
 }
 
@@ -359,6 +388,10 @@ pub(crate) mod seams {
         /// Told how many partial names of an entry a read of this thread
         /// found taken so far, after each, before its cancel is looked at.
         pub static NAME_TAKEN: RefCell<Option<Taken>> = const { RefCell::new(None) };
+        /// The publish of this entry, in every read of this thread, is
+        /// refused so at its name.
+        pub static PUBLISH_REFUSAL: Cell<Option<(usize, safecopy_folder::Refusal)>> =
+            const { Cell::new(None) };
     }
 
     /// What hears of each taken partial name.

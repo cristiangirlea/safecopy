@@ -105,16 +105,36 @@ pub enum PartialFate {
     /// (Linux and macOS, which remove by name): that file is not the
     /// partial and was left untouched.
     Replaced,
-    /// The save failed, and the system refused to remove it: what
-    /// [`Hooks::created`] was given is still there, unless the kind says
-    /// otherwise (one already gone is `NotFound`).
+    /// The save failed, and the system or `safecopy-folder` refused to
+    /// remove it: what [`Hooks::created`] was given is still there,
+    /// unless the kind says otherwise (one already gone is `NotFound`).
     Left {
-        /// What the system said.
+        /// What the system said; `Other` when `safecopy-folder` refused.
         kind: io::ErrorKind,
         /// The system's own code for it (`errno`, a Windows error code),
         /// when it has one.
         raw: Option<i32>,
+        /// What `safecopy-folder` refused with, when it was the one: a
+        /// partial name that is not one part of a path, and the rest of
+        /// its `Refusal`. Never `Replaced`, which is
+        /// [`PartialFate::Replaced`].
+        refused: Option<Refusal>,
     },
+}
+
+impl PartialFate {
+    /// What a removal that failed leaves: the one place its error becomes
+    /// a fate, so a refusal keeps its kind.
+    fn left(e: &io::Error) -> Self {
+        match refusal(e) {
+            Some(Refusal::Replaced) => Self::Replaced,
+            refused => Self::Left {
+                kind: e.kind(),
+                raw: e.raw_os_error(),
+                refused,
+            },
+        }
+    }
 }
 
 /// No hooks.
@@ -436,11 +456,7 @@ pub async fn save_resumable<R: AsyncRead + Unpin + ?Sized>(
     // error that stopped the save is still the one returned.
     let fate = match discard(dir, &file, &partial) {
         Ok(()) => PartialFate::Removed,
-        Err(e) if refusal(&e) == Some(Refusal::Replaced) => PartialFate::Replaced,
-        Err(e) => PartialFate::Left {
-            kind: e.kind(),
-            raw: e.raw_os_error(),
-        },
+        Err(e) => PartialFate::left(&e),
     };
     hooks.ended(Err(&error), fate);
     Err(Stopped { error, kept: None })
@@ -459,6 +475,10 @@ fn discard(dir: &Directory, file: &File, partial: &OsStr) -> io::Result<()> {
     #[cfg(test)]
     if let Some(error) = crate::seams::DISCARD_ERROR.take() {
         return Err(io::Error::from_raw_os_error(error));
+    }
+    #[cfg(test)]
+    if let Some(why) = crate::seams::DISCARD_REFUSAL.take() {
+        return Err(io::Error::other(why));
     }
     dir.discard(file, partial)
 }
@@ -655,6 +675,13 @@ async fn fill<R: AsyncRead + Unpin + ?Sized>(
     if crate::seams::PUBLISH_ERROR.replace(false) {
         return Err(ChunkError::Io(io::ErrorKind::PermissionDenied));
     }
+    #[cfg(test)]
+    if let Some(why) = crate::seams::PUBLISH_REFUSAL.take() {
+        return Err(unpublished(PublishError::Name {
+            path: dir.path().join(name),
+            error: io::Error::other(why),
+        }));
+    }
     let (published, applied) = dir
         .publish_with(
             file,
@@ -669,18 +696,25 @@ async fn fill<R: AsyncRead + Unpin + ?Sized>(
             cancel.as_mut(),
         )
         .await
-        .map_err(|e| match e {
-            PublishError::Cancelled => ChunkError::Cancelled,
-            PublishError::Io(e) | PublishError::Name { error: e, .. } => e.into(),
-            PublishError::NoNameLeft { tried } => ChunkError::NoNameLeft { tried },
-            _ => ChunkError::Io(io::ErrorKind::Other),
-        })?;
+        .map_err(unpublished)?;
     Ok(Saved {
         path: published.path,
         marked: published.marked,
         applied,
         digest,
     })
+}
+
+/// Why a checked file got no name. An error of the system or a refusal of
+/// `safecopy-folder` goes through [`ChunkError`]'s one conversion.
+fn unpublished(e: PublishError) -> ChunkError {
+    match e {
+        PublishError::Cancelled => ChunkError::Cancelled,
+        PublishError::Io(e) | PublishError::Name { error: e, .. } => e.into(),
+        PublishError::NoNameLeft { tried } => ChunkError::NoNameLeft { tried },
+        // A way to fail added since: it carries no error to read.
+        _ => ChunkError::Io(io::ErrorKind::Other),
+    }
 }
 
 /// Writes a file at offsets it keeps itself, never at the handle's
