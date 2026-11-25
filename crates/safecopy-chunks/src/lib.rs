@@ -58,6 +58,9 @@ use safecopy_folder::Refusal;
 
 mod candidate;
 mod copy;
+// What the fuzz target runs: for the fuzzer's build and the tests alone.
+#[cfg(any(test, fuzzing))]
+pub mod fuzzing;
 mod save;
 
 pub use candidate::{CandidateError, CandidateHash};

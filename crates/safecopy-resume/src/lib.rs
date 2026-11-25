@@ -170,6 +170,9 @@ use std::time::Duration;
 pub use safecopy_chunks::{CHUNK, Digest};
 
 mod checks;
+// What the fuzz target runs: for the fuzzer's build and the tests alone.
+#[cfg(any(test, fuzzing))]
+pub mod fuzzing;
 pub mod handshake;
 mod record;
 mod space;

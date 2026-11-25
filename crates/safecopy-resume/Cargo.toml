@@ -18,6 +18,10 @@ safecopy-journal.workspace = true
 ring = { version = "0.17.14", default-features = false }
 tokio = { version = "1.53.3", features = ["fs", "io-util"] }
 
+# The fuzz target's own runtime, in the fuzzer's build alone.
+[target.'cfg(fuzzing)'.dependencies]
+tokio = { version = "1.53.3", features = ["rt"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
 

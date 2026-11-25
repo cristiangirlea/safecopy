@@ -15,10 +15,12 @@ software. A Cargo workspace of small crates with one job each. See
   inheriting from the workspace). `crates/safecopy` re-exports the rest.
 - `Cargo.toml`: the workspace: edition 2024, `rust-version = "1.89"`,
   shared metadata and path dependencies. `Cargo.lock` is committed.
-- `fuzz/`: cargo-fuzz targets, its own workspace, nightly only.
+- `fuzz/`: cargo-fuzz targets, its own workspace, nightly only. Each
+  calls its crate's `fuzzing` module (built for tests and `cfg(fuzzing)`
+  alone). `seeds/` and `regressions/` are committed, `corpus/` is not.
 - `deny.toml`: licence, advisory, ban and source rules for `cargo deny`.
 - `.github/workflows/ci.yml`: CI on GitHub's runners (the repository is
-  public): Linux, Windows and macOS.
+  public): Linux, Windows and macOS. `fuzz-weekly.yml`: the long fuzz run.
 
 ## What CI runs
 
@@ -35,7 +37,7 @@ cargo deny check
 cargo +1.89 check --locked --workspace --all-targets        # minimum Rust version
 cargo +1.89 check --locked --workspace --all-targets --features quic
 cargo check --locked --target aarch64-linux-android --workspace
-cargo +nightly fuzz run <target> -- -max_total_time=60 -rss_limit_mb=2048   # Linux, per target
+cargo +nightly fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- -max_total_time=60 -rss_limit_mb=2048   # Linux, per target
 ```
 
 fmt, clippy, test and the minimum Rust version run on Linux, Windows and
@@ -52,8 +54,16 @@ is on ext4, xfs, btrfs or f2fs.
 The Android check compiles `ring`'s C with the NDK: point
 `CC_aarch64_linux_android` and `AR_aarch64_linux_android` at the NDK's
 `aarch64-linux-android24-clang` and `llvm-ar` (CI uses the runner's NDK).
-The fuzz nightly is pinned by date in the workflow. Run the same before
+The fuzz nightly is pinned by date in both workflows. Run the same before
 every push.
+
+Fuzzing (commands in the README's section): `cargo test` runs every seed
+and every input of `fuzz/regressions/<target>/` through the target's
+function, and fails when a seed is not what the format writes now
+(`cargo test --workspace write_fuzz_seeds -- --ignored` writes them
+again). A crash's input is committed there with its fix. CI caches each
+target's corpus; `fuzz-weekly.yml` runs 30 minutes per target on `main`,
+and a crash is the failed run's artifact `fuzz-artifacts-<target>`.
 
 ## Working rules
 
@@ -90,7 +100,8 @@ every push.
   default.
 - **Dependencies run one way**, as the README's graph says; no crate
   depends on a program that uses it.
-- Every parser of bytes from the other side has a fuzz target in `fuzz/`.
+- Every parser of bytes from the other side has a fuzz target in `fuzz/`,
+  with seeds, and its body in the crate's `fuzzing` module.
 - Where a system lacks a guarantee, the crate's docs say what it does
   instead.
 - New dependencies carry permissive licences only (see `deny.toml`).

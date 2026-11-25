@@ -14,6 +14,10 @@ pub use safecopy_manifest as manifest;
 pub use safecopy_names as names;
 pub use safecopy_resume as resume;
 
+// What the fuzz target runs: for the fuzzer's build and the tests alone.
+#[cfg(any(test, fuzzing))]
+pub mod fuzzing;
+
 #[cfg(test)]
 mod tests {
     #[test]
