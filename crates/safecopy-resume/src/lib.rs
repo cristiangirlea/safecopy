@@ -185,7 +185,7 @@ mod wire;
 
 pub use checks::{Next, Resent, Source, Take, receiver_takes, sender_checks};
 pub use record::{Receiving, Sending};
-pub use store::{Expired, Reopening, Saving, Store};
+pub use store::{Expired, Parked, Reopening, Saving, Store};
 
 /// A transfer's key: 16 random bytes the sender chose for a file the first
 /// time it goes. It names the file to the receiver's record and grants

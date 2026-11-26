@@ -4256,4 +4256,250 @@ mod reopening {
         drop(kept.file);
         assert_eq!(std::fs::read(path).unwrap(), expected_bytes);
     }
+
+    /// A save of two chunks cut after its first record: its checkpoint kept and still held.
+    fn parked<'a>(side: &'a Side, name: &str) -> (Parked<'a>, Receiving) {
+        let guard = side.store.saving(PEER, key(1)).unwrap();
+        let (mut record, file) = unwritten(side, key(1), name);
+        record.size = 2 * C;
+        side.store.receiving(&record, &file).unwrap();
+        file.set_len(2 * C).unwrap();
+        let held = Held {
+            key: key(1),
+            have: 2 * C,
+            prefix: hash(&vec![0; 2 * C as usize]),
+        };
+        let parked = guard.kept_held(&held, 9, &file).unwrap();
+        drop(file);
+        record.have = held.have;
+        record.prefix = held.prefix;
+        record.last = 9;
+        (parked, record)
+    }
+
+    #[tokio::test]
+    async fn a_parked_checkpoint_is_held_until_it_is_dropped() {
+        let side = side("parked-held", Limits::default());
+        let b = Store::open(&side.base.join("records"), Limits::default()).unwrap();
+        let (parked, record) = parked(&side, "old");
+        assert_eq!(b.received(PEER, key(1)), Some(record.clone()));
+        assert_eq!(
+            b.inspect(PEER, key(1)).await.map(|_| ()),
+            Err(ResumeError::Busy)
+        );
+        let (new, file) = unwritten(&side, key(1), "new");
+        assert_eq!(b.receiving(&new, &file), Err(ResumeError::Busy));
+        assert_eq!(b.expire(100, Duration::ZERO, &[]).unwrap().removed, 0);
+        assert_eq!(
+            side.store.saving(PEER, key(1)).map(|_| ()),
+            Err(ResumeError::Busy)
+        );
+        drop(parked);
+        assert!(side.place.join("old.part").exists());
+        assert_eq!(b.received(PEER, key(1)), Some(record));
+        assert_eq!(b.inspect(PEER, key(1)).await.unwrap().status(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_parked_checkpoint_continues_from_its_held_record() {
+        let side = side("parked-continue", Limits::default());
+        let (parked, record) = parked(&side, "old");
+        let claim = parked.reopen().await.unwrap();
+        assert_eq!(claim.status(), Ok(()));
+        assert_eq!(claim.record(), &record);
+        let (guard, _, mut kept) = claim.resume().unwrap();
+        assert_eq!(kept.file.stream_position().unwrap(), 2 * C);
+        assert_eq!(kept.file.metadata().unwrap().len(), 2 * C);
+        assert_eq!((kept.have(), kept.prefix()), (record.have, record.prefix));
+        kept.file.write_all(b"tail").unwrap();
+        kept.hasher.update(b"tail");
+        let mut whole = vec![0; 2 * C as usize];
+        whole.extend_from_slice(b"tail");
+        assert_eq!(kept.hasher.finish(), hash(&whole));
+        drop(kept.file);
+        assert_eq!(std::fs::read(side.place.join("old.part")).unwrap(), whole);
+        // The continuing save holds the key as any save does.
+        let b = Store::open(&side.base.join("records"), Limits::default()).unwrap();
+        assert_eq!(
+            b.inspect(PEER, key(1)).await.map(|_| ()),
+            Err(ResumeError::Busy)
+        );
+        drop(guard);
+        assert!(b.inspect(PEER, key(1)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_parked_partial_changed_meanwhile_is_reported_and_discarded_by_the_caller() {
+        let side = side("parked-changed", Limits::default());
+        let sent = source(&side, key(1), b"source");
+        let (parked, record) = parked(&side, "old");
+        let path = side.place.join("old.part");
+        let mut edit = File::options().write(true).open(&path).unwrap();
+        edit.write_all(b"x").unwrap();
+        drop(edit);
+        let before = std::fs::read(&path).unwrap();
+        let claim = parked.reopen().await.unwrap();
+        assert_eq!(claim.status(), Err(ResumeError::PrefixChanged));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(side.store.received(PEER, key(1)), Some(record));
+        let replacement = claim.discard().unwrap();
+        assert!(side.store.received(PEER, key(1)).is_none());
+        assert!(!path.exists());
+        assert_eq!(side.store.sent(PEER, key(1)), Some(sent));
+        drop(replacement);
+    }
+
+    async fn parked_end(label: &str, end: &str) {
+        use std::task::Poll;
+        let side = side(label, Limits::default());
+        let b = Store::open(&side.base.join("records"), Limits::default()).unwrap();
+        let (parked, record) = parked(&side, "old");
+        match end {
+            "drop" => drop(parked),
+            "cancel" => {
+                seams::STALL.set(true);
+                let mut reading = Box::pin(parked.reopen());
+                assert!(
+                    std::future::poll_fn(|cx| Poll::Ready(reading.as_mut().poll(cx).is_pending()))
+                        .await
+                );
+                seams::STALL.set(false);
+                drop(reading);
+            }
+            "panic" => {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let _parked = parked;
+                    panic!("save stopped")
+                }));
+                assert!(result.is_err());
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(b.received(PEER, key(1)), Some(record));
+        assert!(side.place.join("old.part").exists());
+        assert_eq!(b.inspect(PEER, key(1)).await.unwrap().status(), Ok(()));
+    }
+
+    /// What this store's own calls do to a parked record, and what `reopen` then says.
+    async fn parked_and(label: &str, act: &str) {
+        let side = side(label, Limits::default());
+        let b = Store::open(&side.base.join("records"), Limits::default()).unwrap();
+        let (parked, record) = parked(&side, "old");
+        let (last, past) = (record.last, Duration::from_secs(1));
+        match act {
+            "live" => {
+                let expired = side
+                    .store
+                    .expire(last + 100, past, &[(PEER, key(1))])
+                    .unwrap();
+                assert_eq!(expired.removed, 0);
+                assert_eq!(parked.reopen().await.unwrap().status(), Ok(()));
+                return;
+            }
+            "expire" => {
+                assert_eq!(side.store.expire(last + 100, past, &[]).unwrap().removed, 1);
+                assert!(!side.place.join("old.part").exists());
+            }
+            "remove_all" => {
+                assert_eq!(side.store.remove_all(Some(PEER)).unwrap(), 1);
+                assert!(!side.place.join("old.part").exists());
+            }
+            "release" => {
+                assert!(side.store.release(PEER, key(1)));
+                // No longer held: another store takes it.
+                let taken = b.inspect(PEER, key(1)).await.unwrap();
+                assert_eq!(parked.reopen().await.map(|_| ()), Err(ResumeError::Busy));
+                drop(taken);
+                return;
+            }
+            _ => unreachable!(),
+        }
+        assert!(b.received(PEER, key(1)).is_none());
+        assert_eq!(parked.reopen().await.map(|_| ()), Err(ResumeError::Busy));
+    }
+
+    #[tokio::test]
+    async fn a_parked_record_listed_live_is_not_expired() {
+        parked_and("parked-live", "live").await;
+    }
+
+    #[tokio::test]
+    async fn a_parked_record_not_listed_live_expires_after_keep_for() {
+        parked_and("parked-expire", "expire").await;
+    }
+
+    #[tokio::test]
+    async fn the_persons_remove_all_removes_a_parked_record() {
+        parked_and("parked-remove-all", "remove_all").await;
+    }
+
+    #[tokio::test]
+    async fn a_released_parked_record_can_be_taken_elsewhere() {
+        parked_and("parked-release", "release").await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_kept_held_lets_the_record_go_as_last_written() {
+        let side = side("parked-failed", Limits::default());
+        let b = Store::open(&side.base.join("records"), Limits::default()).unwrap();
+        let guard = side.store.saving(PEER, key(1)).unwrap();
+        let (mut record, file) = unwritten(&side, key(1), "old");
+        record.size = 2 * C;
+        side.store.receiving(&record, &file).unwrap();
+        file.set_len(2 * C).unwrap();
+        let held = Held {
+            key: key(1),
+            have: 2 * C,
+            prefix: hash(&vec![0; 2 * C as usize]),
+        };
+        seams::FULL.set(true);
+        let failed = guard.kept_held(&held, 9, &file).map(|_| ());
+        seams::FULL.set(false);
+        assert_eq!(
+            failed,
+            Err(ResumeError::Io(std::io::ErrorKind::StorageFull))
+        );
+        drop(file);
+        assert_eq!(b.received(PEER, key(1)), Some(record));
+        assert_eq!(b.inspect(PEER, key(1)).await.unwrap().status(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn letting_go_of_a_parked_reopening_frees_the_key_everywhere() {
+        let side = side("parked-let-go", Limits::default());
+        let b = Store::open(&side.base.join("records"), Limits::default()).unwrap();
+        let (parked, record) = parked(&side, "old");
+        let claim = parked.reopen().await.unwrap();
+        assert_eq!(
+            b.inspect(PEER, key(1)).await.map(|_| ()),
+            Err(ResumeError::Busy)
+        );
+        drop(claim);
+        assert_eq!(b.received(PEER, key(1)), Some(record.clone()));
+        assert!(side.place.join("old.part").exists());
+        // Free in this store too: a new save starts, and then the other store may continue it.
+        drop(side.store.saving(PEER, key(1)).unwrap());
+        assert_eq!(b.inspect(PEER, key(1)).await.unwrap().status(), Ok(()));
+        assert_eq!(
+            b.expire(record.last + 100, Duration::from_secs(1), &[])
+                .unwrap()
+                .removed,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_parked_checkpoint_lets_its_record_go() {
+        parked_end("parked-drop", "drop").await;
+    }
+
+    #[tokio::test]
+    async fn a_parked_checkpoint_whose_reopening_is_cancelled_lets_its_record_go() {
+        parked_end("parked-cancel", "cancel").await;
+    }
+
+    #[tokio::test]
+    async fn a_parked_checkpoint_lets_its_record_go_on_a_panic() {
+        parked_end("parked-panic", "panic").await;
+    }
 }

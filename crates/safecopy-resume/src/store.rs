@@ -936,11 +936,16 @@ impl Store {
         peer: PeerId,
         key: TransferKey,
     ) -> Result<Reopening<'_>, ResumeError> {
-        let claim = self.claim_received(peer, key)?;
+        let saving = Saving {
+            claim: self.claim_received(peer, key)?,
+            reserved: false,
+            // The generation holds the record until the caller acts.
+            hold: false,
+        };
         let (record, held) = self.take_only_received(peer, key)?;
         let checked = self.checked(&record).await;
         Ok(Reopening {
-            claim,
+            saving,
             held,
             record,
             checked,
@@ -1155,6 +1160,7 @@ impl Store {
         Ok(Saving {
             claim: self.claim_received(peer, key)?,
             reserved: false,
+            hold: true,
         })
     }
 
@@ -1435,7 +1441,7 @@ impl Drop for Generation<'_> {
 /// A checked receiving record. Dropping it keeps the record and partial as found.
 #[derive(Debug)]
 pub struct Reopening<'a> {
-    claim: Claimed<'a>,
+    saving: Saving<'a>,
     held: Generation<'a>,
     record: Receiving,
     checked: Result<(Directory, Kept), ResumeError>,
@@ -1459,21 +1465,16 @@ impl<'a> Reopening<'a> {
         let (dir, kept) =
             self.held
                 .finish(&self.record, self.checked, |(_, kept)| &kept.file, false)?;
-        Ok((
-            Saving {
-                claim: self.claim,
-                reserved: false,
-            },
-            dir,
-            kept,
-        ))
+        let mut saving = self.saving;
+        saving.hold = true;
+        Ok((saving, dir, kept))
     }
 
     /// Discards this receiving record and its partial by identity. The returned
     /// save holds the replacement key across its first [`Store::receiving`].
     /// Drop it to leave the key free. A changed generation gives `Busy`.
     pub fn discard(mut self) -> Result<Saving<'a>, ResumeError> {
-        let store = self.claim.store;
+        let store = self.saving.claim.store;
         let mut state = lock(&store.state);
         let file = self.held.current(&state)?;
         drop(self.checked);
@@ -1517,10 +1518,11 @@ impl<'a> Reopening<'a> {
         }
         state.track(self.record.peer, self.record.key, &name);
         self.held.release = false;
-        Ok(Saving {
-            claim: self.claim,
-            reserved: true,
-        })
+        drop(state);
+        let mut saving = self.saving;
+        saving.reserved = true;
+        saving.hold = true;
+        Ok(saving)
     }
 }
 
@@ -1558,9 +1560,57 @@ impl<'a> Reopening<'a> {
 pub struct Saving<'a> {
     claim: Claimed<'a>,
     reserved: bool,
+    /// Whether dropping it lets the record go; a [`Reopening`]'s generation holds it instead.
+    hold: bool,
 }
 
-impl Saving<'_> {
+impl<'a> Saving<'a> {
+    /// [`Self::kept`], with the record still held afterwards: the save was
+    /// cut by a lost connection, and the program waits for the other side
+    /// to come back and continue it. Until the returned [`Parked`] is
+    /// continued or dropped, no other store can take, write or expire the
+    /// record or reopen its partial ([`ResumeError::Busy`] there), and no
+    /// other save of this store can start under the key. This store's own
+    /// [`Store::expire`] passes it by only when the caller lists the key
+    /// in `live`, as for a running save; [`Store::remove_all`], the
+    /// person's word, still removes it; [`Store::release`] and
+    /// [`Store::release_peer`] let it go. After any of these,
+    /// [`Parked::reopen`] is [`ResumeError::Busy`].
+    ///
+    /// The store sets no limit on how long a record stays parked: the
+    /// program does, by dropping the guard when its wait ends. Its `last`
+    /// is the moment of parking, so this store's [`Store::expire`] without
+    /// the key in `live` removes it as any kept record: once `keep_for` has
+    /// passed since then, or by its caps ([`Limits::per_peer`],
+    /// [`Limits::total`], [`Limits::disk_share`]).
+    ///
+    /// An error leaves the record as it was last written and lets it go,
+    /// as [`Self::kept`] does. It flushes a file and writes a record: call
+    /// it where blocking is allowed.
+    pub fn kept_held(
+        mut self,
+        held: &Held,
+        now: u64,
+        partial: &File,
+    ) -> Result<Parked<'a>, ResumeError> {
+        let store = self.claim.store;
+        if held.key != self.claim.key {
+            return Err(ResumeError::NotHeld);
+        }
+        let owner = {
+            let state = lock(&store.state);
+            let owner = self.claim.owner(&state);
+            if let Some(owner) = &owner {
+                state.owned(owner)?;
+            }
+            owner
+        };
+        store.keep_owned(self.claim.peer, held, now, partial, true, owner.as_ref())?;
+        // A record is written now: nothing of a reservation is left to clear.
+        self.reserved = false;
+        Ok(Parked { saving: self })
+    }
+
     /// The save stopped and kept its partial, now `held.have` whole bytes
     /// hashing to `held.prefix`, its last byte come at `now`: the record
     /// is written at once, after `partial` is flushed
@@ -1636,6 +1686,9 @@ impl Saving<'_> {
 
 impl Drop for Saving<'_> {
     fn drop(&mut self) {
+        if !self.hold {
+            return;
+        }
         let store = self.claim.store;
         let mut state = lock(&store.state);
         if let Some(owner) = self.claim.owner(&state)
@@ -1646,6 +1699,59 @@ impl Drop for Saving<'_> {
             }
             store.drop_hold(&mut state, &owner.name);
         }
+    }
+}
+
+/// A save's kept checkpoint, its record still held, from
+/// [`Saving::kept_held`]: the file waits here for its connection to come
+/// back. Continue it with [`Self::reopen`]; dropping it lets the record
+/// go, removing nothing, as [`Saving::kept`] does, and so do a panic and
+/// the end of the process (the lock goes with it).
+#[derive(Debug)]
+pub struct Parked<'a> {
+    saving: Saving<'a>,
+}
+
+impl<'a> Parked<'a> {
+    /// The held record, checked as [`Store::inspect`] checks one, with no
+    /// moment in which it is not held: the partial opened by identity and
+    /// its first `have` bytes hashed through the handle a continuation
+    /// appends through. Nothing is cut or removed; the [`Reopening`] says
+    /// what was found, and its acts continue, discard or let go. A record
+    /// this store no longer holds as it wrote it is [`ResumeError::Busy`];
+    /// dropping the future lets the record go, as dropping the guard does.
+    pub async fn reopen(self) -> Result<Reopening<'a>, ResumeError> {
+        let mut saving = self.saving;
+        let store = saving.claim.store;
+        let (record, held) = {
+            let state = lock(&store.state);
+            let owner = saving.claim.owner(&state).ok_or(ResumeError::NotHeld)?;
+            let file = state.owned(&owner)?;
+            let bytes = read_held(&file.file).ok_or(ResumeError::Unreachable)?;
+            let Some((Record::Receiving(record), seq, _)) = newest(&bytes) else {
+                return Err(ResumeError::Damaged);
+            };
+            if record.peer != saving.claim.peer || record.key != saving.claim.key || seq != file.seq
+            {
+                return Err(ResumeError::Busy);
+            }
+            let held = Generation {
+                store,
+                owner,
+                seq,
+                release: true,
+            };
+            (record, held)
+        };
+        // From here the generation holds the record, as an inspection's does.
+        saving.hold = false;
+        let checked = store.checked(&record).await;
+        Ok(Reopening {
+            saving,
+            held,
+            record,
+            checked,
+        })
     }
 }
 

@@ -252,6 +252,23 @@ of taking `saving` and calling `reopen_hashed` in step 6:
      its error before clearing the record.
    - Refuse or defer by dropping the claim. Everything stays as found.
 
+**When the program waits for a dropped connection to come back**, end
+the cut save with `let parked = saving.kept_held(&held, now, &partial)?`
+in place of `saving.kept(..)`. The checkpoint is written as `kept` writes
+it, and the record stays held: no other store can take, write or expire
+it, nor reopen its partial, and no other save of this store starts under
+the key. When the other side is back and asks to continue, call
+`parked.reopen().await`: it checks the held record as `inspect` does,
+with no moment in which the record is not held, and gives the same
+`Reopening`, so step 2 and step 3 above follow as written. When the wait
+ends without a reconnect, drop `parked`: the record is let go as `kept`
+leaves it, and the file can be continued later as any kept file.
+The store sets no limit on the wait: the program ends it by dropping
+`parked`. List the key in `live` for this store's own `expire` while it
+waits (without it, `expire` removes the record as any kept record: once
+`keep_for` has passed since the parking, or by its caps). `remove_all`, `release` and `release_peer`
+still act on a parked record; `parked.reopen()` is then `Busy`.
+
 For either save, finish with `saving.kept(..)` for a kept partial or
 `saving.forget_received()` on publication or cancellation. The sending
 record under the same key stays. Dropping the guard on an early return
@@ -432,6 +449,13 @@ send.
 The handshake and the checks are fuzzed: `fuzz/fuzz_targets/resume_handshake.rs`.
 
 ## Changes
+
+- Added `Saving::kept_held` and `Parked` for a program that waits for a
+  dropped connection to come back: the checkpoint is written as `kept`
+  writes it and the record stays held until `Parked::reopen` hands it to
+  a `Reopening`, or the guard is dropped (as on a panic or the end of the
+  process), which lets it go as `kept` does. Nothing existing changes;
+  no public signature or on-disk format changed.
 
 - Dropping a `Saving` guard releases its current receiving record lock, including one the store released and took again during that save.
 - Before its first write or reopen, `Saving::forget_received` takes the kept receiving record and removes it and its partial by identity, preserving the sending record. A missing receiver gives `NotHeld` and a competing holder or ambiguous receiver gives `Busy`.
